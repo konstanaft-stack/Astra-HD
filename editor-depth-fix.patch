@@ -1,0 +1,45 @@
+diff --git a/src/Runtimes/OpenXRFrameLoop.cpp b/src/Runtimes/OpenXRFrameLoop.cpp
+index cf7b4ab..cd364a9 100644
+--- a/src/Runtimes/OpenXRFrameLoop.cpp
++++ b/src/Runtimes/OpenXRFrameLoop.cpp
+@@ -2683,7 +2683,10 @@ DWORD OpenXRManager::FrameThreadMain() {
+                     allocatorReady && menuScaleReady && resetSubmitCommands()) {
+                     auto gpuProfile = cvr::gpu::profile::Begin(m_cmdList);
+                     bool copyReady = true;
+-                    bool useDepthLayer = monoHasDepth && m_depthLayerSupported;
++                    // Menu quads have no projection-depth consumer. A stale world
++                    // depth image may also have different calibrated dimensions;
++                    // copying it here poisons the submit list before UI arrives.
++                    bool useDepthLayer = !menuRectActive && monoHasDepth && m_depthLayerSupported;
+                     std::vector<bool> acquiredEyes(viewCountOutput, false);
+                     std::vector<bool> acquiredDepthEyes(viewCountOutput, false);
+                     std::vector<XrCompositionLayerProjectionView> projectionViews(viewCountOutput);
+@@ -3094,6 +3097,19 @@ DWORD OpenXRManager::FrameThreadMain() {
+                                 break;
+                             }
+ 
++                            const D3D12_RESOURCE_DESC depthSrcDesc = monoDepthSource->GetDesc();
++                            const D3D12_RESOURCE_DESC depthDstDesc = depthTexture->GetDesc();
++                            // Depth must describe the same pixels as the projection.
++                            // Never crop/scale it implicitly or record an out-of-bounds copy.
++                            if (depthSrcDesc.Dimension != depthDstDesc.Dimension ||
++                                depthSrcDesc.Width != depthDstDesc.Width || depthSrcDesc.Height != depthDstDesc.Height ||
++                                depthSrcDesc.DepthOrArraySize != depthDstDesc.DepthOrArraySize ||
++                                depthSrcDesc.MipLevels != depthDstDesc.MipLevels ||
++                                depthSrcDesc.SampleDesc.Count != depthDstDesc.SampleDesc.Count ||
++                                depthSrcDesc.SampleDesc.Quality != depthDstDesc.SampleDesc.Quality) {
++                                useDepthLayer = false;
++                                break;
++                            }
+                             if (!cvr::gpu::KeepCommandResources(m_cmdList, {monoDepthSource, depthTexture})) {
+                                 useDepthLayer = false;
+                                 break;
+@@ -3108,8 +3124,6 @@ DWORD OpenXRManager::FrameThreadMain() {
+                             toCopyDest.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                             m_cmdList->ResourceBarrier(1, &toCopyDest);
+ 
+-                            const D3D12_RESOURCE_DESC depthSrcDesc = monoDepthSource->GetDesc();
+-                            const D3D12_RESOURCE_DESC depthDstDesc = depthTexture->GetDesc();
+                             if (depthSrcDesc.Format == depthDstDesc.Format) {
+                                 m_cmdList->CopyResource(depthTexture, monoDepthSource);
+                             } else {
