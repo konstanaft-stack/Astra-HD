@@ -1,57 +1,42 @@
-# Astra HD
+# Astra HD + VR-CENTR
 
-这是一套尚未完成的实验性组合，不是已经完成的稳定 VR 移植。Astra HD 将游戏画面送入头显，VR-CENTR 管理安装内容和配置档。之所以开发配置档，是因为反复测试 VR、模组和图形库后，曾留下混杂且无法工作的文件组合。它们用于重复测试并恢复选定状态，避免每次测试后手动删除多个游戏目录、通过 Steam 重新下载或重装。
+**Cyberpunk 2077 的实验性 VR 移植；当前安装包为 r29 / Center04（2026 年 10 月 18 日）。** Astra HD 将游戏画面送入头显，VR-CENTR 负责安装、启动和独立配置档。项目还远未完成，功能与操作可能继续改变。
 
-没有任何模式被宣布为已完成。功能、操作和架构可能根据测试改变或移除；这里不是承诺的路线图或完整功能清单。
+| 下载同一版本的两个安装包 | 内容 |
+|---|---|
+| [Astra HD r29 native-base ZIP](https://github.com/konstanaft-stack/Astra-HD/releases/download/astra-hd-r29-experimental-20261018/Astra-HD-r29-native-base-20261018-experimental.zip) | VR 移植、编辑器资源、必需框架和 NVIDIA SR/RR/G 310.9.16.0 |
+| [VR-CENTR Center04 Windows x64 ZIP](https://github.com/konstanaft-stack/Astra-HD/releases/download/astra-hd-r29-experimental-20261018/VR-CENTR-public-win-x64-20261018-experimental04.zip) | 可运行的管理器、runtime 和配置档管理脚本 |
 
-### 开发目标
+[安装说明](INSTALL.md) · [实际验证范围与限制](STATUS.md) · [校验和](https://github.com/konstanaft-stack/Astra-HD/releases/download/astra-hd-r29-experimental-20261018/SHA256SUMS.txt) · [发布页面](https://github.com/konstanaft-stack/Astra-HD/releases/tag/astra-hd-r29-experimental-20261018) · [Русский](README.md)
 
-我们希望让Cyberpunk 2077成为完整的VR体验：从空间菜单和角色编辑器，到舒适易读的HUD及与游戏世界的交互。基础是优质立体画面、稳定帧率，以及神经渲染与帧生成的协调工作。界面应适合头显和VR控制器。这是开发目标，不是已经完成的功能清单。
+GitHub 自动生成的 Source code ZIP 只包含源代码，不能替代上面的两个安装包。游戏本体、个人存档和模组合集不包含在内。
 
-[![Русский](https://img.shields.io/badge/Русский-2563eb?style=for-the-badge)](README.ru.md)
-[![English](https://img.shields.io/badge/English-2563eb?style=for-the-badge)](README.md)
-[![中文](https://img.shields.io/badge/中文-2563eb?style=for-the-badge)](README.zh-CN.md)
+## 为什么配合配置档使用
 
-## VR-CENTR 与 Astra HD：配合安装和使用
+反复测试 VR 模组和图形库可能留下混杂的文件。管理器保存所选组合与独立状态，帮助恢复已保存的基础，减少手动删除目录、通过 Steam 重新下载和反复重装。新的干净配置档需要预先保存首次启动到主菜单后的干净游戏。
 
-**目前尚无可直接安装的组合压缩包。** [Astra HD Releases](https://github.com/konstanaft-stack/Astra-HD/releases) 是今后的下载位置。自动生成的 Source ZIP 只是源代码，不是安装程序；仅克隆源码不能恢复可用安装。
+## 新电脑上的基本顺序
 
-经过验证的安装包发布后，请按以下顺序操作：
+1. 安装自己的 Cyberpunk 2077，先以干净状态启动到主菜单，然后退出。
+2. 下载并解压两个安装包；native ZIP 根目录包含 bundle.json，管理器 ZIP 包含 VR-CENTR 文件夹。需要 PowerShell 7，管理器自带 .NET runtime。
+3. 在管理器保存干净基础，创建并保留 Flat 配置档，再创建单独的配置档并应用 r29。
+4. 返回干净状态时切换到已保存的 Flat 配置档。Native Apply 不会自动替你建立干净备份；请按 [INSTALL](INSTALL.md) 操作。
 
-1. 通过 Steam 安装您拥有的 Cyberpunk 2077。公开安装包不包含游戏本体、付费第三方移植或个人存档。
-2. 从 Releases 下载已准备好的安装包，解压，运行包内安装程序并选择自己的游戏目录。
-3. 在 VR-CENTR 中先保存经过验证的干净基线，创建干净配置档，再选择模组集合和 Astra HD VR 移植，应用该组合。
-4. 从管理中心启动游戏。关闭游戏后才能切换配置档、移植或图形库；先保存需要保留的当前状态。
+**首次 Native Apply 在该版本尚无已保存模式时，会一次性应用推荐图形预设，即使 UserSettings.json 已存在。** 图形选项可能改变；之后已保存的 Custom / 推荐模式选择会保留。直接 installer 对已有 settings 文件的处理与管理器首次初始化不同，详见 INSTALL。
 
-共享的 OptiScaler/NR/MFG 每套游戏只安装一份，不是每个配置档一份。请单独备份个人存档。HUD、编辑器、运动效果和性能仍需在头显中验证。
+## r29 的验证范围
 
+新的双摄像机编辑器已检查两眼图像、独立 UI、皮肤→嘴唇→预览→皮肤切换、手动视角与头部参考的保持，以及重置。模拟器验证不等于物理头显验收：舒适度、完整消除抖动/闪烁和 FPS 尚未确认；残留 UI 遮罩、交替 AER 模式的严重光晕仍在处理。
 
-### 当前实验与开发方向
+**此 native-base 不含 optional OptiScaler/NR/MFG。NR 与帧生成协同工作是后续阶段，不能视为本次发布已完成功能。** 历史本机安装包含的额外组件不代表这些组件也在公共 ZIP 内。
 
-- **双摄像机：**独立左右视角是当前基础。帧率、帧生成和稳定性仍在调试，尚未验证80 FPS目标。
-- **交替双眼/AER：**用户主观感觉它比当前双摄像机模式更自然、更自由、更有临场感；原因尚不明确。该模式远未完成：巨大光晕曾减轻或消失，后来又出现，回归问题尚未解决。
-- **立体角色编辑器：**正在开发空间预览、头显观察，以及左手grip/stick调节摄像机高度和缩放。居中、UI重叠和帧率缺陷仍存在，不能称为已经验收的完整Luke式模式。
+## 编辑器摄像机
 
-欢迎针对具体缺陷或分支开展研究并提交PR。请提供版本、GPU、HMD/runtime和复现步骤。保留上游作者署名。
+按住左手 grip：左摇杆上下控制高度，左右控制距离；右摇杆左右改变围绕角色的角度；左摇杆按下 L3 重置手动偏移。摄像机偏移重置不等于头显系统 recenter。
 
-### 当前原型操作：编辑器摄像机
+## 开发方向与来源
 
-按住左手grip：左摇杆↑↓调节高度（0.5米/秒），←→调节距离（0.6米/秒）。Grip+按下左摇杆仅重置摄像机高度/距离，不是全局头显重新居中。鼠标：Shift+滚轮调高度，Ctrl+滚轮调距离，Ctrl+中键重置。轴向操作仍需头显验证。
+目标是连贯的 VR 体验：空间菜单、舒适编辑器、清晰 HUD、控制器交互，以及稳定的神经渲染与帧生成。这些是开发方向，不是已完成的功能清单。启动及配置档切换时间的现有测量和限制见 STATUS。
 
-OptiScaler：Insert打开菜单，F12请求切换其FG，\在进入世界后切换NR；与移植自身的Own FG不同。当前RTX4060配置的NR310.9.16仍返回createFeatureNotSupported。
+Astra HD 基于 [dariulone 的 CyberpunkVR Port](https://github.com/dariulone/cyberpunk-vr-port) 和 [dabinn 的 Tofu Express X](https://github.com/dabinn/cyberpunk-vr-port)。保留原始作者、历史和许可证；管理器源代码位于 [vr-center/](vr-center/)。各组件的许可证和 notices 随安装包提供，NVIDIA runtimes 不重新授权为 MIT。
 
-欢迎创建分支、将我们的改动移植到其他分支或为主项目加入Cyberpunk支持，也欢迎协助解决具体缺陷。我们仍会继续自己的开发；请保留许可证和上游署名。
-
-本次仅更新文档；此提交不提供可直接使用的安装包或完整当前源码备份。
-
-## 项目来源与致谢
-
-- [dariulone/cyberpunk-vr-port](https://github.com/dariulone/cyberpunk-vr-port)：原始项目，也是本分支的直接上游。
-- [dabinn/cyberpunk-vr-port — Tofu Express](https://github.com/dabinn/cyberpunk-vr-port)：我们本地开发的重要基础。
-- 后续采用其他社区贡献者的代码时，将逐项注明来源。
-
-保留原始提交历史和作者声明。已有组件继续遵循各自的许可证。
-
-更新于 2026 年 10 月 18 日。
-
-[2026 年 10 月 15 日：编辑器立体显示进展、图像和修复补丁](STEREO-EDITOR-2026-10-15.md)
