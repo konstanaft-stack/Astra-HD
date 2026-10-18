@@ -1,6 +1,7 @@
 param([string]$Version='luke263',[bool]$OptiScaler=$false,[bool]$FrameGeneration=$false,[bool]$CleanProfile=$false,[bool]$Hands=$true,[switch]$Uninstall,[switch]$Run,[switch]$CheckOnly,[string]$GamePath,[string]$SettingsFile,[string]$PreviousSettingsFile)
 $ErrorActionPreference='Stop'
 $ProgressPreference='SilentlyContinue'
+. (Join-Path $PSScriptRoot 'NativeRequiredIni.ps1')
 $mutex=[Threading.Mutex]::new($false,'Local\IRD.SingleBuildTestDeploy.v1');$locked=$false
 $done=[Collections.Generic.List[object]]::new()
 $isolation=$null
@@ -119,6 +120,7 @@ try {
     $bundle=Get-Content -LiteralPath (Join-Path $PSScriptRoot 'bundle.json') -Raw -Encoding UTF8|ConvertFrom-Json
     $v=@($bundle.versions|Where-Object id -eq $Version)
     if($v.Count -ne 1 -or -not $v[0].available){throw 'Недоступная версия.'};$v=$v[0]
+    $nativeRequiredIni=Get-NativeRequiredIniPolicy $v
     if(($OptiScaler -and -not $v.allowOpti) -or ($FrameGeneration -and -not $v.allowFG)){throw 'Это дополнение не подготовлено для выбранного порта.'}
     $selected=@{};$flat=$bundle.versions|Where-Object id -eq 'flat'
     foreach($p in $flat.files.PSObject.Properties){$selected[$p.Name]=$p.Value}
@@ -177,8 +179,31 @@ try {
     # Resolve and validate exactly the settings that installation will use, before any writes.
     $prefSettings=Safe-Join $stateDir ('preferences/'+$preference+'/_settings')
     $previousPreference=if($receipt -and $receipt.PSObject.Properties['preference']){$receipt.preference}elseif($receipt){$receipt.version}else{$null}
+    # A directly related native update changes code, not the player's tuning.
+    # A saved choice for this child still wins. Keep the current INI in place
+    # rather than seeding preferences before the installation transaction.
+    $nativeParentUpdate=$false;$inheritNativeSettings=$false
+    if($receipt -and $receipt.kind -eq 'native' -and $v.kind -eq 'native' -and
+       $v.PSObject.Properties['parentId'] -and [string]$v.parentId -ceq [string]$receipt.version){
+        $parents=@($bundle.versions|Where-Object {$_.id -ceq [string]$receipt.version -and $_.kind -eq 'native'})
+        $nativeParentUpdate=$parents.Count -eq 1
+        if($nativeParentUpdate -and $selected.ContainsKey('bin/x64/vrport.ini')){
+            $childIniPreference=Safe-Join $stateDir ('preferences/'+$preference+'/bin/x64/vrport.ini')
+            $currentNativeIni=Safe-Join $GamePath 'bin/x64/vrport.ini'
+            $inheritNativeSettings=(Test-Path -LiteralPath $currentNativeIni -PathType Leaf) -and
+                -not(Test-Path -LiteralPath $childIniPreference -PathType Leaf)
+        }
+    }
+    if($nativeRequiredIni){
+        if(-not $selected.ContainsKey('bin/x64/vrport.ini')){throw 'Required native INI missing from selected build'}
+        $iniSource=Object-File $selected['bin/x64/vrport.ini']
+        $iniPreference=Safe-Join $stateDir ('preferences/'+$preference+'/bin/x64/vrport.ini')
+        if(Test-Path -LiteralPath $iniPreference -PathType Leaf){$iniSource=$iniPreference}
+        elseif($inheritNativeSettings){$iniSource=$currentNativeIni}
+        $null=Update-NativeRequiredIniText (Read-NativeRequiredIniText $iniSource) $v
+    }
     $useCurrent=$sameRenderer -or ($receipt -and $previousPreference -eq $preference) -or (-not $receipt -and $Version -eq 'flat')
-    $sourceSettings=if($SettingsFile){if(Test-Path -LiteralPath $settings -PathType Leaf){$settings}else{Object-File $selected['@settings']}}elseif($useCurrent -and (Test-Path -LiteralPath $settings -PathType Leaf)){$settings}elseif(Test-Path -LiteralPath $prefSettings -PathType Leaf){$prefSettings}else{Object-File $selected['@settings']}
+    $sourceSettings=if($SettingsFile){if(Test-Path -LiteralPath $settings -PathType Leaf){$settings}else{Object-File $selected['@settings']}}elseif($useCurrent -and (Test-Path -LiteralPath $settings -PathType Leaf)){$settings}elseif(Test-Path -LiteralPath $prefSettings -PathType Leaf){$prefSettings}elseif($inheritNativeSettings -and (Test-Path -LiteralPath $settings -PathType Leaf)){$settings}else{Object-File $selected['@settings']}
     if($sourceSettings -eq (Object-File $selected['@settings']) -and (Hash $sourceSettings) -ne $selected['@settings']){throw 'Повреждены сохранённые настройки игры.'}
     $desiredSettings=Installation-Settings ([IO.File]::ReadAllText($sourceSettings)) $v.kind $FrameGeneration
     if($CheckOnly){
@@ -221,9 +246,14 @@ try {
             if(Is-Preference $rel){
                 $pref=Safe-Join $stateDir ('preferences/'+$preference+'/'+$rel)
                 if(Test-Path -LiteralPath $pref -PathType Leaf){$source=$pref}
+                elseif($inheritNativeSettings -and $rel -ieq 'bin/x64/vrport.ini'){$source=$currentNativeIni}
             }
             $sourceHash=if($source -eq (Object-File $selected[$rel])){$selected[$rel]}else{Hash $source}
-            if($rel -ieq 'bin/x64/RealVR.ini'){
+            if($nativeRequiredIni -and $rel -ieq 'bin/x64/vrport.ini'){
+                if((Hash $source) -ne $sourceHash){throw 'Native INI source changed during preparation'}
+                $preparedIni=Update-NativeRequiredIniText (Read-NativeRequiredIniText $source) $v
+                if((Test-Path -LiteralPath $target -PathType Leaf) -and (Read-NativeRequiredIniText $target) -ceq $preparedIni){continue}
+            }elseif($rel -ieq 'bin/x64/RealVR.ini'){
                 if((Hash $source) -ne $sourceHash){throw 'RealVR.ini source changed during preparation.'}
                 $preparedIni=[IO.File]::ReadAllText($source)
                 $cache=if($isolation){Join-Path $isolation.ProfileRoot 'temp'}else{[IO.Path]::GetTempPath().TrimEnd('\')}
@@ -244,8 +274,17 @@ try {
     $operations.Add([pscustomobject]@{target=$settings;source=$null;key='_settings';text=$desiredSettings})
     $operations.Add([pscustomobject]@{target=(Safe-Join $GamePath 'CPVR-Portable/Start-Game.ps1');source=(Join-Path $PSScriptRoot 'Start-Game.ps1');key='CPVR-Portable/Start-Game.ps1'})
     if($isolation){foreach($helper in @('Isolated-Profile.ps1','Profile-Settings.ps1')){$operations.Add([pscustomobject]@{target=(Safe-Join $stateDir $helper);source=(Join-Path $PSScriptRoot $helper);key=('CPVR-Portable/'+$helper)})}}
-    $critical=@($selected.Keys|Where-Object {$_ -ieq 'archive/pc/mod/cyberpunkvrport.archive' -or $_ -match '^bin/x64/(dxgi\.dll|RealFG64\.dll|dbghelp\.dll|version\.dll|winmm\.dll|OptiScaler\.asi|nvngx_dlss\.dll|nvngx_dlssg\.dll|nvngx_dlssnr\.dll)$' -or $_ -match '^(red4ext/|bin/x64/(plugins|CPVR_HandsTracking|CheekyFoveatedDLSS)/|CPVR-Portable/NvidiaMenu/).+\.(dll|asi|reds|lua|dxil)$'}|Sort-Object|ForEach-Object {@{path=$_;sha256=$selected[$_]}})
+    $editorNativeDualArchive='archive/pc/mod/cyberpunkvrport_editor_dual.archive'
+    $editorNativeDualRequired=$false
+    if($v.kind -eq 'native' -and $v.editorNativeDual){
+        if($v.editorNativeDual.schema -ne 1 -or $v.editorNativeDual.required -isnot [bool] -or -not $v.editorNativeDual.required -or
+           $v.editorNativeDual.path -cne $editorNativeDualArchive -or $v.editorNativeDual.sha256 -cnotmatch '^[A-F0-9]{64}$' -or
+           -not $selected.ContainsKey($editorNativeDualArchive) -or $selected[$editorNativeDualArchive] -cne $v.editorNativeDual.sha256){throw 'Invalid selected NativeDual archive declaration'}
+        $editorNativeDualRequired=$true
+    }
+    $critical=@($selected.Keys|Where-Object {$_ -ieq 'archive/pc/mod/cyberpunkvrport.archive' -or ($editorNativeDualRequired -and $_ -ceq $editorNativeDualArchive) -or $_ -match '^bin/x64/(dxgi\.dll|RealFG64\.dll|dbghelp\.dll|version\.dll|winmm\.dll|OptiScaler\.asi|nvngx_dlss\.dll|nvngx_dlssg\.dll|nvngx_dlssnr\.dll)$' -or $_ -match '^(red4ext/|bin/x64/(plugins|CPVR_HandsTracking|CheekyFoveatedDLSS)/|CPVR-Portable/NvidiaMenu/).+\.(dll|asi|reds|lua|dxil)$'}|Sort-Object|ForEach-Object {@{path=$_;sha256=$selected[$_]}})
     $newReceipt=@{version=$Version;label=$v.label;kind=$v.kind;hands=$wantHands;clean=$CleanProfile;preference=$preference;opti=$OptiScaler;fg=$FrameGeneration;exeSha256=$bundle.exeSha256;paths=@($selected.Keys|Where-Object {$_ -ne '@settings'});critical=$critical;time=$stamp}
+    if($nativeParentUpdate){$newReceipt.settingsInheritedFrom=[string]$receipt.version}
     if($SettingsFile){$newReceipt.settingsFile=$settings}
     if($isolation){$newReceipt.isolation=@{profileRoot=$isolation.ProfileRoot;settingsFile=$settings;reference=$isolation.ReferencePath}}
     $operations.Add([pscustomobject]@{target=$receiptPath;source=$null;key='CPVR-Portable/installed.json';text=($newReceipt|ConvertTo-Json -Depth 8)})

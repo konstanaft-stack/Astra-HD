@@ -1398,7 +1398,7 @@ using UiCreateUavFn=void(STDMETHODCALLTYPE*)(ID3D12Device*,ID3D12Resource*,ID3D1
 static UiCreateSrvFn uiCreateSrvOriginal{};static UiCreateUavFn uiCreateUavOriginal{};
 static void STDMETHODCALLTYPE UiCreateSrv(ID3D12Device* device,ID3D12Resource* resource,const D3D12_SHADER_RESOURCE_VIEW_DESC* desc,D3D12_CPU_DESCRIPTOR_HANDLE handle){
     const auto token=TimedUiBegin(UiBeginKind::Srv,[&]{return cvr::menu_preview::BeginUiSrvWrite(handle);});uiCreateSrvOriginal(device,resource,desc,handle);
-    cvr::menu_preview::FinishUiSrvWrite(token,resource,handle);
+    cvr::menu_preview::FinishUiSrvWrite(token,resource,handle,false,desc);
 }
 static void STDMETHODCALLTYPE UiCreateUav(ID3D12Device* device,ID3D12Resource* resource,ID3D12Resource* counter,const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc,D3D12_CPU_DESCRIPTOR_HANDLE handle){
     const auto token=cvr::menu_preview::BeginUiSrvWrite(handle);uiCreateUavOriginal(device,resource,counter,desc,handle);
@@ -1587,7 +1587,7 @@ bool ResolveComputeLocations(uintptr_t root,const ComputeShaderEvidence& shader,
         out=resolved;count=used;return true;
     }catch(...){return false;}
 }
-bool ResolvePixelSrvLocations(uintptr_t root,const PipelineShaderEvidence& shader,std::array<ShaderSrvLocation,16>& out,uint32_t& count)noexcept {
+bool ResolvePixelSrvLocations(uintptr_t root,const PipelineShaderEvidence& shader,std::array<ShaderSrvLocation,16>& out,uint32_t& count,bool includeStructuredBuffer)noexcept {
     out={};count=0;
     if(!shader.srvBindingsKnown||shader.srvBindingCount>shader.srvBindings.size())return false;
     try {
@@ -1598,7 +1598,7 @@ bool ResolvePixelSrvLocations(uintptr_t root,const PipelineShaderEvidence& shade
         const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc{};
         if(FAILED(deserializer->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1,&desc))||!desc||desc->Desc_1_1.NumParameters>64)return false;
         for(uint32_t s=0;s<shader.srvBindingCount;++s){const auto& binding=shader.srvBindings[s];
-            if(binding.resourceKind!=2||binding.firstRegister!=binding.lastRegister)continue;
+            if((binding.resourceKind!=2&&!(includeStructuredBuffer&&binding.resourceKind==12))||binding.firstRegister!=binding.lastRegister)continue;
             bool matched=false;ShaderSrvLocation location;
             for(UINT r=0;r<desc->Desc_1_1.NumParameters;++r){const auto& parameter=desc->Desc_1_1.pParameters[r];
                 if(parameter.ParameterType!=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE||(parameter.ShaderVisibility!=D3D12_SHADER_VISIBILITY_PIXEL&&parameter.ShaderVisibility!=D3D12_SHADER_VISIBILITY_ALL))continue;

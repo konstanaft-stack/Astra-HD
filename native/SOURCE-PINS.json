@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "C4SourceCommit": "bbfa2ec325426bf26deec251a0f6c1e52b6d6679",
+  "C4SourceCommit": "ff3c7f2618bbd4f6754a633998f33ce838b61272",
   "nativeBackendSourceCommit": "1be5da1a6e138a3e4470ad0be5cf5381741afa49",
   "backendDLL": "CB3377753E478BDDF6208197166552FA27CD8AFA44602D06AA764032B4354F9E",
   "workerSource": "Five sources and25 headers verified against accepted full22 source-before",
@@ -57,5 +57,39 @@
       "status": "EXTERNAL_LICENSED_NGX_HEADER_NOT_INCLUDED"
     }
   ],
-  "sourceBoundary": "Native own source and attribution only; proprietary NGX headers require a separately obtained applicable NVIDIA SDK/license. No vendor runtime or headers imported under MIT."
+  "sourceBoundary": "Native own source and attribution only; proprietary NGX headers require a separately obtained applicable NVIDIA SDK/license. No vendor runtime or headers imported under MIT.",
+  "previousC4SourceCommit": "bbfa2ec325426bf26deec251a0f6c1e52b6d6679",
+  "rendererRootOverlay": [
+    {
+      "path": "src/MenuPreview/UiConsumer.cpp",
+      "sha256": "F651418714B7F0BD011A59BB982F90602C2E4B610FA224E68A9EB50510B06C70"
+    },
+    {
+      "path": "src/Stereo/DeviceHooks.cpp",
+      "sha256": "78436E03C61990DBEFD673322B1FDC0E8A6F6B0AE7987D1C1EA638923443F8BF"
+    },
+    {
+      "path": "include/MenuPreview/UiConsumer.hpp",
+      "sha256": "2C69DD155C90453BBD98BDA2790ED78CFC333F310190B4FEA23EFB9C2B96D08A"
+    },
+    {
+      "path": "include/MenuPreview/PipelineEvidence.hpp",
+      "sha256": "87C89606B8633F753A2013F380F264B8602F0F4D65C8DAD3B7C2A7A91A7E7F0E"
+    },
+    {
+      "path": "include/MenuPreview/UiBinkShaderPolicy.hpp",
+      "sha256": "21882327B40ECEA748DF96392C3F22E9E02C5D3E8F20099F479E5B704767F478"
+    },
+    {
+      "path": "tests/MenuPreviewBinkUiTests.cpp",
+      "sha256": "1BA34B6A97CD5BEB3C17473B5BAC7FB0D952E4443CD4B3CF8BDE1CEC242A3C2C"
+    }
+  ],
+  "rendererFullLink23": {
+    "sourceCommit": "ff3c7f2618bbd4f6754a633998f33ce838b61272",
+    "nativeUmbrellaSourceCommit": "8811b2184dcf447ece8ed11586f2a73f02d87af1",
+    "rendererSHA256": "FDC3A66ED3FD6991108AAE9CE64FBD0E99BB72C85CAA3FB71ADDD7CA6A321376",
+    "linkReceiptSHA256": "39B967102C0CE6F51B1F2CF7374253C04E35BF27E943B37A38038EF04235B3A1",
+    "boundary": "Renderer/root overlay build provenance only. Backend snapshot1be5/CB33 and external header exclusions remain unchanged."
+  }
 }

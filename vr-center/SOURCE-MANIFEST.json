@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "state": "SANITIZED_PUBLIC_SOURCE_CENTER04_R29_DEFAULT_NATIVE_AND_CAPTURED_PROFILE_INSTRUCTIONS",
+  "state": "PUBLIC_GIT_SOURCE_CONTENT_R30_CENTER05_EXPECTED_OVERLAY",
   "sourceCommit": "737e89bd233f690ab2b64a0a8bf696e8e3a2cd98",
   "sourceCommitState": "Export with original public overrides, preserved SettingsProfiles baseline, owned-image URI fix and25 developer-path sanitizations; not a pristine Git checkout.",
   "publicOverrides": [
@@ -65,6 +65,29 @@
         "tests/clean-baseline.tests.ps1"
       ],
       "purpose": "Available native defaultVersion with bounded legacy fallback; captured R29/profile-return regression"
+    },
+    {
+      "sourceCommit": "3bda14801d34d3c1a9d4d5a5984eb0846065d456",
+      "paths": [
+        "Core.ps1",
+        "SettingsProfiles.ps1",
+        "Backend.ps1",
+        "NativeRequiredIni.ps1",
+        "installer/Install.ps1",
+        "tests/mandatory-runtime-ini.tests.ps1"
+      ],
+      "purpose": "Public04 base retained; exact3bda HUD preservation overlay plus Core6BA defaults and added time closure"
+    },
+    {
+      "candidateSHA256": "F6CC988F700733D949F8AD4BF4D3CC7436E82C56435DCA4FEA3BBCB922D59C6E",
+      "reviewSHA256": "5DA48926F29AB57A2DDB9CDF6621F5D49D806BA355C8D2476632C30D86C986AD",
+      "paths": [
+        "README.md",
+        "README.ru.md",
+        "README.zh-CN.md",
+        "tests/game-profile-templates.tests.ps1"
+      ],
+      "purpose": "Reviewed R30/Center05 setup and unresolved world-exit status; exactly one owned bundle input in shipped template fixture"
     }
   ],
   "fileCountIncludingManifest": 172,
@@ -81,11 +104,6 @@
       "sha256": "F65E0BE4B5CADE5F6023D0249A40CECD4572454015D5C280D3BDD20D582CE8EF"
     },
     {
-      "path": "app.manifest",
-      "bytes": 545,
-      "sha256": "BFF469E9A32D007507BA80318988AD889537B74362B56BEA47B370E199FEE18B"
-    },
-    {
       "path": "Assets/vr-center-quest3-cyberpunk.png",
       "bytes": 1735154,
       "sha256": "64E7F6423A48AEEB23124D503ACCDD6BEF830F44FA669BDFE4D9EE8EF7154894"
@@ -97,13 +115,13 @@
     },
     {
       "path": "Backend.ps1",
-      "bytes": 27618,
-      "sha256": "132A3817A943D9E2946D6797F66050FF2BB779CE7E7780CFFB98478DAC7E1DD9"
+      "bytes": 28122,
+      "sha256": "96CEBD582B925EE9F9BA194F244E828692119E770BC8A6156F8B7CDA7F001275"
     },
     {
       "path": "Build.ps1",
-      "bytes": 2423,
-      "sha256": "53785D1A1DF85686D91158980EDA7FEDDF66B456661A30D602E9C8CE24C49418"
+      "bytes": 2403,
+      "sha256": "E1B84F8C1F7D661F4D20D30F440F2DFFAD29F78AE6C96C3BFFA59549BC6664BD"
     },
     {
       "path": "CleanBaseline.ps1",
@@ -112,8 +130,8 @@
     },
     {
       "path": "CollectionControls.cs",
-      "bytes": 12021,
-      "sha256": "721B0B75992F28D2BA8533BB3799F7B07035842709AD619EE9D6F5ECEC5E63BA"
+      "bytes": 11845,
+      "sha256": "7E07920063CBBAE22F383CE2B8CDF8E729BF71DCF766E2976643DA71409DC16A"
     },
     {
       "path": "CollectionSources.ps1",
@@ -122,28 +140,23 @@
     },
     {
       "path": "Components.ps1",
-      "bytes": 12717,
-      "sha256": "D167C15B9CDBAB50E3BED29ACFCB456C4C1141C4990D1B4F77B066C81CA7A34D"
-    },
-    {
-      "path": "config.example.json",
-      "bytes": 385,
-      "sha256": "E05F4814513DD2760DAF66A2E1CE70D6A4F136E2A6E892F491A42ADED9B10492"
+      "bytes": 12578,
+      "sha256": "09239D153E0FB51727020701105CDB0102CABB317F98501BD40082953176E71E"
     },
     {
       "path": "Copyright.txt",
-      "bytes": 848,
-      "sha256": "5052CEA6F75D0FC17E8BCE5CA54F932D0287FC7F27518B73EB1D553AD971B52D"
+      "bytes": 824,
+      "sha256": "00CD46DA92A784FA5D1984B94A3BB858A81869263619226885B6B643615E3432"
     },
     {
       "path": "Core.ps1",
-      "bytes": 16767,
-      "sha256": "697E3E07FC2EC2DDECAB071D426F8008A4F4D48902F437740900731CBB29C59B"
+      "bytes": 17296,
+      "sha256": "50595736903173EF22E4981294F677D3B893A2DABEE539127394F4942622E3DE"
     },
     {
       "path": "CurrentLaunchControls.cs",
-      "bytes": 2004,
-      "sha256": "44BE732C956D9EAA168967B4D5F090C0A65EFECF032EBE43D41924BA04B5F4A6"
+      "bytes": 1963,
+      "sha256": "2FD9B86A8DCEEDBCCB55392518BC5445D25650B989A4F2C1B78437855A9BE7C3"
     },
     {
       "path": "CyberpunkCollection.ps1",
@@ -152,8 +165,13 @@
     },
     {
       "path": "DESIGN-v2.ru.md",
-      "bytes": 4134,
-      "sha256": "AEEAB4199EBDD367709DE0F695D6DE6C8AA69315B5413E563DDF1D1B173D9D01"
+      "bytes": 4118,
+      "sha256": "778DD70457C1881E481C2A2314AC5E15F52D4A6D3CE8A1405D5133DF489FB9E6"
+    },
+    {
+      "path": "EXTERNAL-DEPENDENCIES.md",
+      "bytes": 2313,
+      "sha256": "75C91194B2463532F6D45E633DAC4A335E63126BEBCFC94EE7B8236178758B36"
     },
     {
       "path": "EnhancementControls.cs",
@@ -166,39 +184,24 @@
       "sha256": "958DEEEEC16CAE9179148AB166D3D461FDE95176CD1C6E6BF536FED013E0397A"
     },
     {
-      "path": "EXTERNAL-DEPENDENCIES.md",
-      "bytes": 2330,
-      "sha256": "22C27A2736740B307124EF4513A9CBC99305D19126C17C9936817F1C57D41D23"
-    },
-    {
-      "path": "fg-settings.tests.ps1",
-      "bytes": 1784,
-      "sha256": "0187D76448B20283EBB06499064DBCDA0D3B608CDDE572AD77884AFF0C8DCE8F"
-    },
-    {
       "path": "GAME-LIBRARY.ru.md",
-      "bytes": 11217,
-      "sha256": "B1713FF17A95FE2FB6FD0DD038CAB36F257A552AF23DDF24E39BFFF501BC634A"
+      "bytes": 11174,
+      "sha256": "BA6AD2BA27834BECC1A5C3FA781C958656D99C1F51F51F0694C2BFB2F7C3BAC9"
     },
     {
       "path": "GameLaunch.ps1",
-      "bytes": 31762,
-      "sha256": "80800741916A646AE280B79C07CAB448D65EB5BFF5A82389E7D03AEF40BF1289"
+      "bytes": 31760,
+      "sha256": "02A242917D63ADCF4B437A239093442F55004E863CF21A3915CCC8C8A166FCD3"
     },
     {
       "path": "GameProfileControls.cs",
-      "bytes": 17255,
-      "sha256": "200B87F8D1487A81635F695C5E8F51D2E7EE0005ACB184DAB5083475143A6EB7"
-    },
-    {
-      "path": "GameProfiles.ps1",
-      "bytes": 11370,
-      "sha256": "CF08AE72D3669B2EDEFFC7516B41BDD0879E70F6665176A2E250F31AC34F031D"
+      "bytes": 17001,
+      "sha256": "6E61034E98566B0B1E479047CD42CA9FE0C9305343A1036D7A617E3234284F34"
     },
     {
       "path": "GameProfileStore.ps1",
-      "bytes": 76061,
-      "sha256": "93116D0269DCFDCA3E106CF39FCDB296B6975DAF365F40F61071FDA7F5F2BFC5"
+      "bytes": 75147,
+      "sha256": "DA0A34ADCDB2EC3878083D4C6EF6B4F74B129DF1F47FD090039F5321E8A9B3B5"
     },
     {
       "path": "GameProfileTemplates.ps1",
@@ -206,9 +209,14 @@
       "sha256": "FBC0E40B774AB9B0D049DD89E3E9DA60729F0672124AB9F3A57055628E2A514D"
     },
     {
+      "path": "GameProfiles.ps1",
+      "bytes": 11370,
+      "sha256": "CF08AE72D3669B2EDEFFC7516B41BDD0879E70F6665176A2E250F31AC34F031D"
+    },
+    {
       "path": "GraphicsControls.cs",
-      "bytes": 9364,
-      "sha256": "ED9023C368F6E71345F4775762155D3D42B4C4945EF9C7C940C8C32C76A3B191"
+      "bytes": 9249,
+      "sha256": "B9B28DC51C8E98EB481D5CA778DA729BC963C1D75C0AD89A34BFF1B76229B741"
     },
     {
       "path": "GraphicsSettings.ps1",
@@ -216,49 +224,19 @@
       "sha256": "64F5092C9F7D5FA5D27A820504FBCF111CCB4CBFB487F3D850538B15874E2D52"
     },
     {
-      "path": "helpers/VfsHost/Program.cs",
-      "bytes": 10289,
-      "sha256": "6182853FD83766B462525DBD57C84C65372B3B60BCA19C78B4AC01EA7965278B"
-    },
-    {
-      "path": "helpers/VfsHost/VfsHost.csproj",
-      "bytes": 319,
-      "sha256": "DF581A2597908F7D095F25E3640F8666A137E48B97A47B88972F44CF6F7AFAC7"
-    },
-    {
       "path": "Install-Selected.ps1",
-      "bytes": 1579,
-      "sha256": "528C98F95FDB1F3C3A3DAC8EFD10DADB6B625F5065244E341BFC1E11BAC542B8"
-    },
-    {
-      "path": "installer/Install.ps1",
-      "bytes": 25621,
-      "sha256": "C933D1210BCDA5A3EB36C7E0CE664CFCE719D1A68A94AB782CCA1A7FD5B883D8"
-    },
-    {
-      "path": "integrations/vortex/read-catalog.js",
-      "bytes": 12790,
-      "sha256": "7C5A69EC640C9FFC41E9698217496E05C24DBA13D8EFA0BFDC2B51856D261E54"
+      "bytes": 1556,
+      "sha256": "2BE640CE3A6AD410AA5B1E2C5ABFEB899F587C98AB71CDB1ABCBB0F2CE62D472"
     },
     {
       "path": "KeyBindings.ps1",
-      "bytes": 2698,
-      "sha256": "BE42787621FEB7D4BC6FA6D1ED77FC88C1560AFE45156DD65069B55B7077B771"
+      "bytes": 2672,
+      "sha256": "DBBA0B58C245C35694EDF4B8A06565617D688D09E479FDAD4CCC936722F145D6"
     },
     {
       "path": "KeysWindow.cs",
-      "bytes": 2153,
-      "sha256": "C1D0C33C006F12EAB050711F020A17B8F1A425C1F22F384B54C127CB26F3CB86"
-    },
-    {
-      "path": "LauncherProcess.ps1",
-      "bytes": 2401,
-      "sha256": "2FC4EC9995C1FECC23ED4F20E2C3232E68A324509B60B001E1DCBC8E9663F0D8"
-    },
-    {
-      "path": "LibraryActions.ps1",
-      "bytes": 1653,
-      "sha256": "0C2DB53C75384030002AA7D95C4E67414B24C64FF31CFAB49FCE3FE12D1C23ED"
+      "bytes": 2132,
+      "sha256": "3369AF0F75F34EFB0CF68C9799269D55E4B9997BD1D14D1BF6F7AE698F4FE443"
     },
     {
       "path": "LICENSE",
@@ -266,49 +244,44 @@
       "sha256": "274EDDE0222824277B93E54E508D244E01B3360F5B386710F5E2E02AF0DFB359"
     },
     {
-      "path": "licenses/basic-games-MIT.txt",
-      "bytes": 1053,
-      "sha256": "2E2D9D1CA183C23EE3CDFDF58EEB4DA3E8C67CEF6D02ECED76BE2E9A3DE33E64"
+      "path": "LauncherProcess.ps1",
+      "bytes": 2365,
+      "sha256": "B99AA288BE4D71EA52FC086B9B037BACC6933D658DA3D6FD584188AC2819618C"
     },
     {
-      "path": "licenses/DLSS5Manager-Copyright.txt",
-      "bytes": 848,
-      "sha256": "5052CEA6F75D0FC17E8BCE5CA54F932D0287FC7F27518B73EB1D553AD971B52D"
-    },
-    {
-      "path": "licenses/DLSS5Manager-THIRD-PARTY-NOTICES.txt",
-      "bytes": 12590,
-      "sha256": "FAB10FA2D64AF0049A44E0C962D4D0D0F2662E01385B8EA2C72B80C70CCAC6C9"
-    },
-    {
-      "path": "licenses/usvfs-GPL-3.0-or-later.txt",
-      "bytes": 37468,
-      "sha256": "0A73F57AB786014545CB590E20D316053B7C85D33836AC9FDED4BA15654D8754"
+      "path": "LibraryActions.ps1",
+      "bytes": 1632,
+      "sha256": "6E2472F1843D7FC9B4CA75C83C245AAD431E3F61B6DB6F01D1A7601416E05BE7"
     },
     {
       "path": "MainWindow.axaml",
-      "bytes": 1428,
-      "sha256": "E0D6BC4E1D39803DEA7B60A109381B41749FDD41DDD4B97AE3A0D1507FE2365A"
+      "bytes": 1417,
+      "sha256": "72AD4F9DE14151E64C430CD5340306B23DCFB6D120A3BC45C73ECDA27936183E"
     },
     {
       "path": "MainWindow.axaml.cs",
-      "bytes": 30365,
-      "sha256": "68558AED820786753B1E95AFA444B1988005D8DE7EA7D96E767D16445E416015"
+      "bytes": 30244,
+      "sha256": "054B9BFE2972ECB874EFF0075ABF620966BF9F9BC1775261867B2D10ED9A8263"
+    },
+    {
+      "path": "NativeRequiredIni.ps1",
+      "bytes": 2456,
+      "sha256": "6451D4FB373511F38723641A37565D941BABBEDFA25D3E86C6D6934A546714FC"
     },
     {
       "path": "NrStartupPolicy.ps1",
-      "bytes": 2867,
-      "sha256": "177B48E002CADCCA4ED0CCD18ED3338151BD154E4C7495A7652F51E89B33D468"
+      "bytes": 2866,
+      "sha256": "270561E53BB3EEF8845BADFFEA11E3C15F333870CDDA9CE129997B4A48CECFC7"
+    },
+    {
+      "path": "PROFILE-REQUIREMENTS.ru.md",
+      "bytes": 20470,
+      "sha256": "7243E49D2AE524655F316152C066561BD46BA1A75A0E99F89AFA17AB110AF40E"
     },
     {
       "path": "PortPayloadPolicy.ps1",
       "bytes": 8602,
       "sha256": "D3CFF0822445CB5B04D914D742059575FE34E9EAD08CBADB5EC1721686959663"
-    },
-    {
-      "path": "PROFILE-REQUIREMENTS.ru.md",
-      "bytes": 20553,
-      "sha256": "A5B1609EB0949D5C1E796985FD1773110D5D47B5D8C5A4B040D7272F3ED91AEB"
     },
     {
       "path": "ProfilePathChecks.ps1",
@@ -317,28 +290,73 @@
     },
     {
       "path": "Program.cs",
-      "bytes": 1845,
-      "sha256": "388842FB7E16F3F9F3D6BE2A4653D4BCD6AF75C11D145D968E754EBF9CE42AC7"
+      "bytes": 1813,
+      "sha256": "19701AE016C77A7B2D6482711FF036CD9BE4E325DD9007901F832745C79C7378"
     },
     {
       "path": "README-v2.ru.md",
-      "bytes": 12290,
-      "sha256": "EB4224721CC4D205193D8FED0D33DE057491DDEA2525AFB27CC7D2B45B4DCA51"
+      "bytes": 12246,
+      "sha256": "7F35104FC677AA4373916FAE86AD3D24AA69F143D9F87A668D14B8A20B1E9CEB"
     },
     {
       "path": "README.md",
-      "bytes": 9408,
-      "sha256": "0A0718C3E7DCE3A87A483C0468C9D1B361ED2479F1CD9F8CF7C89342644EB254"
+      "bytes": 9758,
+      "sha256": "73EECEA66C513353DC200A53EB252B4CC9CD92430D99E5CFDF4582F19C33CFBB"
     },
     {
       "path": "README.ru.md",
-      "bytes": 8659,
-      "sha256": "BB3934217DED1466A5BCF0F10D8497CD9B8ED10945FCB8805E6751A8E8F83C1F"
+      "bytes": 9383,
+      "sha256": "32CDB6B29D9F826FA8DA77F7D83A6D02E12F323A790BE20E6F8A6A2CF41D3E56"
     },
     {
       "path": "README.zh-CN.md",
-      "bytes": 7843,
-      "sha256": "BADCD68775AE0EB79DFA5C2879EAF37B29DF32132AE0ED58D0990B37D9C72597"
+      "bytes": 8172,
+      "sha256": "D43D617A2DB8A9D5429B940D18ED3B5DCBD69FEF9F7CAC9C9DA94E86517D4FF6"
+    },
+    {
+      "path": "RELEASE-3.0.11.ru.md",
+      "bytes": 3185,
+      "sha256": "D5D36D7D191538376966AEDD3DAC3F8613E5FBD3B64E045F732486D370340E28"
+    },
+    {
+      "path": "RELEASE-3.0.15.ru.md",
+      "bytes": 3321,
+      "sha256": "15542C27FC5FE5697AC72AA95C1C8782689541A0C8878D273DEC88B5F7B4DCC4"
+    },
+    {
+      "path": "RELEASE-3.0.18.ru.md",
+      "bytes": 2655,
+      "sha256": "09F72A1B86E772699E27AC5A205E5D8D23F8198107DDA8B24839B928C82AF5A6"
+    },
+    {
+      "path": "RELEASE-3.0.19.ru.md",
+      "bytes": 1475,
+      "sha256": "1F1A7D25FD5F24BC368A0D03BC56F853A97947C592C77B235C5E61DC7794AA2D"
+    },
+    {
+      "path": "RELEASE-3.0.2.ru.md",
+      "bytes": 1548,
+      "sha256": "D3B6449E70525A518FDD02F4560D3C86C7A711C722CDD87AAEE312D920267548"
+    },
+    {
+      "path": "RELEASE-3.0.20.ru.md",
+      "bytes": 3536,
+      "sha256": "47F7D7B3EB42841A89F5AD3E5FED666D31435373DF562CD507C8A9D15583E226"
+    },
+    {
+      "path": "RELEASE-3.0.21.ru.md",
+      "bytes": 4204,
+      "sha256": "3353167417ECE589145397ECA9822A24023EDF3E030ACE96E41285570078F50A"
+    },
+    {
+      "path": "RELEASE-3.0.8.ru.md",
+      "bytes": 3907,
+      "sha256": "F6B3B28818C4E42FE63F3A0E417683CBA60FA76ABD0772F419D4EE86A7BCAFAB"
+    },
+    {
+      "path": "RELEASE-3.0.9.ru.md",
+      "bytes": 4605,
+      "sha256": "C4D2F8D06D14DDB2E433A0729C9AA3E537D6E710201982498DCD795EF1B119E3"
     },
     {
       "path": "Redmod.ps1",
@@ -346,54 +364,14 @@
       "sha256": "540DCDCEABE3DBEC636758061AA7F57B9C0F910B3035FAD9291C292CCF512A03"
     },
     {
-      "path": "RELEASE-3.0.11.ru.md",
-      "bytes": 3196,
-      "sha256": "25E38B6D2361213107B74CC8026858BA3B11D8F4EECF0B7CEC72B716E423875E"
-    },
-    {
-      "path": "RELEASE-3.0.15.ru.md",
-      "bytes": 3336,
-      "sha256": "0ED3277574B79C462C2A4434172CCF1CE48BC0A44999426D09C6CD5B1BF4E1BC"
-    },
-    {
-      "path": "RELEASE-3.0.18.ru.md",
-      "bytes": 2668,
-      "sha256": "5C40C2BE8DECF15C4B01E61F743ED7EF83BEA3E44F796C697999C0DBBF2B83E4"
-    },
-    {
-      "path": "RELEASE-3.0.19.ru.md",
-      "bytes": 1480,
-      "sha256": "E5E70E9D48367F0C6E045B7C6E5FE2D0538EC0CB93C9512DCCFC80BECFD6CFCB"
-    },
-    {
-      "path": "RELEASE-3.0.2.ru.md",
-      "bytes": 1556,
-      "sha256": "E7CF9BD6EC94EB5ACBA1C2D6FF4567374D21A0D817B7B4B3A6828927B27DB111"
-    },
-    {
-      "path": "RELEASE-3.0.20.ru.md",
-      "bytes": 3552,
-      "sha256": "3CBDD0127FE9029356A6592B5C17F5E97E10D8B0274A9E4194124CDDD6769FEC"
-    },
-    {
-      "path": "RELEASE-3.0.21.ru.md",
-      "bytes": 4217,
-      "sha256": "4B53114B3FC5CA3DE98F8FF08F5A6609C3122CF8616D622ECE59E5911F60F93D"
-    },
-    {
-      "path": "RELEASE-3.0.8.ru.md",
-      "bytes": 3924,
-      "sha256": "DDFC99AAFC9ECE8D8F7957841A1E3C6D2E6A1B6FA0FA09A03B41E605D33A14EF"
-    },
-    {
-      "path": "RELEASE-3.0.9.ru.md",
-      "bytes": 4618,
-      "sha256": "3DF64C39A451D3D152B84F87902979A5C1AA6C2C086AA1B03C989B8A16E00212"
+      "path": "SOURCE-COMPONENTS.ru.md",
+      "bytes": 3406,
+      "sha256": "C4DE65219CE96AA408441B79ED8F3239E0A8FDB02308DFEB38C3155E236BA82C"
     },
     {
       "path": "SettingsProfiles.ps1",
-      "bytes": 7253,
-      "sha256": "CF56A2D3053E11E738A0C43A95856BD262EE6D7BEABDCC28CD54175AE3A991C0"
+      "bytes": 10943,
+      "sha256": "6B879E0AF85E33F7DE3FF71FDCDBF20D1578C14A4EF7BC88113C526E25EA3612"
     },
     {
       "path": "SharedEnhancementPolicy.ps1",
@@ -402,13 +380,8 @@
     },
     {
       "path": "ShellView.cs",
-      "bytes": 12579,
-      "sha256": "86C5432BC62ECD3172DC19AC859221D731384807059F4F29DD09122E254A4B75"
-    },
-    {
-      "path": "SOURCE-COMPONENTS.ru.md",
-      "bytes": 3422,
-      "sha256": "BECDD01194C14B27F46568C03F92EFB566F3F0070FBA4FC626110B6EA8C6AEE1"
+      "bytes": 12435,
+      "sha256": "7695B1277DC46057F8EC663208AC076D2DCCFDE64215633F47032C71426C85BA"
     },
     {
       "path": "StandaloneVfs.ps1",
@@ -422,8 +395,8 @@
     },
     {
       "path": "Start-VR-CENTR.ps1",
-      "bytes": 3348,
-      "sha256": "CC144DDDA1EA0AA7FA109B1D68E93A31DAF174CDB3CD17C676638DB7631EA696"
+      "bytes": 3294,
+      "sha256": "DD035068EF8492A8D3953F95D2DDAE572F8246AEF1A3BBB8DA1349AC3D255E9E"
     },
     {
       "path": "StockIdentityCache.ps1",
@@ -431,269 +404,414 @@
       "sha256": "430261F04486625DCDF5C31889C1340B18DF9F96840668782B5E6EED1D49BC85"
     },
     {
-      "path": "tests/backend.tests.ps1",
-      "bytes": 2451,
-      "sha256": "560C8F3BE455F5C4CED7099F0D3C4F2F652850BD1854373A83F5A062E6EF221E"
+      "path": "THIRD-PARTY-NOTICES.txt",
+      "bytes": 12298,
+      "sha256": "7952BEE54BDDE3969EB7CE516729416D933D0AF366B0C47D1905ABFD217C5B95"
     },
     {
-      "path": "tests/cet-runtime-view.tests.ps1",
-      "bytes": 4771,
-      "sha256": "22AA4052E4BB3A8217FD116D96FEB6BB0984274A82C13FB1A746DA9DB504937F"
+      "path": "THIRD-PARTY.md",
+      "bytes": 1242,
+      "sha256": "FEFF73C3C0601A8C06DE2CC124DE1A165BB567B0B8E672C6D7E1A52D92E4E310"
     },
     {
-      "path": "tests/clean-baseline.tests.ps1",
-      "bytes": 6517,
-      "sha256": "4557A2D0D1512ED38AA5E5C93A6A5FEDBC2988A4940FDD859E8F7CBAE446E515"
+      "path": "TestSaveControls.cs",
+      "bytes": 8776,
+      "sha256": "CA19F04FB4DA8675E2CA50ACC0C3362932167859217212552535CAC62395B5D1"
     },
     {
-      "path": "tests/collection-port-install.tests.ps1",
-      "bytes": 10487,
-      "sha256": "AB6C16C9F67E13BB5D7CA113837BC437F998AEBF2F5E7315B7F353906DE021E5"
+      "path": "TestSaves.ps1",
+      "bytes": 14921,
+      "sha256": "429BD44CB6494F9573AF50BB7C6CB3FF704D6AC72423CDCB8A9FFC1F18C1658C"
     },
     {
-      "path": "tests/collection-source.tests.ps1",
-      "bytes": 9393,
-      "sha256": "16111442C3D51C108D9687A8CB4094CDF2B0DCB4B00654E30979B6014F8B6F9B"
+      "path": "TranslatorWindow.cs",
+      "bytes": 2864,
+      "sha256": "8A3E565ADD62AB31CBF69173B49196DA07B023F872CBDDD0EE03A8F2F84F57B3"
     },
     {
-      "path": "tests/components.tests.ps1",
-      "bytes": 3608,
-      "sha256": "6A5071F90AF3B494782F7BB54A722FD631E9CB1ACBB4F13A03083B73C928B17E"
+      "path": "UI-BACKLOG.ru.md",
+      "bytes": 19064,
+      "sha256": "94643CD78CB55EBD8BBA67CEB423673F413CFA7823D7E4D860A5F7C86322A207"
     },
     {
-      "path": "tests/content-packages.tests.ps1",
-      "bytes": 9186,
-      "sha256": "E8127B0E87D07955DC0AC6827B83E58985CFF05DBF14C85485E6FB6C33346046"
+      "path": "UIcontrol/FeatureToggleButton.cs",
+      "bytes": 1841,
+      "sha256": "B3008797C71041FCC1D5849C239C8E9C1161C8132FB9C784A0C131569ABFB3D7"
     },
     {
-      "path": "tests/cyberpunk-collection.tests.ps1",
-      "bytes": 3313,
-      "sha256": "CC4F0FCC5EB48AB0ED9968CBFF47303B4F30135854114067FEF638C9651C7DB0"
+      "path": "UIcontrol/FeatureToggleState.cs",
+      "bytes": 2323,
+      "sha256": "73C042E667BC86EE52AC487899535B58132B3A0CE31656878CDB712A99D71087"
     },
     {
-      "path": "tests/duplicate-profile.tests.ps1",
-      "bytes": 2739,
-      "sha256": "44F09DE4EA1AC16E93B0CC0A25DBD75010BA2197275E0E8A060F064669A30809"
+      "path": "UPDATES-v21.ru.md",
+      "bytes": 3709,
+      "sha256": "98E46E357884FA1D00CCEE1B9642C3760697ABF2FC0E307D065316B9777FC721"
     },
     {
-      "path": "tests/enhancement-package.tests.ps1",
-      "bytes": 5858,
-      "sha256": "63BCECE56CD1C9FE71AE3C3214F51776CCB13FBAE305258CB76ADB30696EC723"
+      "path": "Updates.ps1",
+      "bytes": 6001,
+      "sha256": "7D67924DA065009264E51FFF65370414A9D2308B21EC89026A110604357FECC3"
     },
     {
-      "path": "tests/enhancement-port-lifecycle.tests.ps1",
-      "bytes": 7923,
-      "sha256": "7F15A9194473D1C5E0342F68797A254F1CF61A87275E79C0988E727C0FA548D5"
+      "path": "UpdatesWindow.cs",
+      "bytes": 4920,
+      "sha256": "8DD83F0D5810C3BB1D12A172D6B7F2222349CE339381497B577EF084C98E1E7C"
     },
     {
-      "path": "tests/feature-toggle-state.tests.ps1",
-      "bytes": 5194,
-      "sha256": "4A67744A5B8A90FF30510318A6FAB63F95643E356112573A1774C88795912B9D"
+      "path": "UsbRecovery.ps1",
+      "bytes": 7654,
+      "sha256": "9756A91AA8DA761CC5EA906FAD32232A7F8D2A1CEFF6ED52B730C82837F3ED11"
+    },
+    {
+      "path": "VALIDATION.ru.md",
+      "bytes": 6588,
+      "sha256": "94A0D97DF902E50798674A01912763C427866B048CCA68DBE60465B20CE0D785"
+    },
+    {
+      "path": "VRPorts.csproj",
+      "bytes": 1030,
+      "sha256": "3C4B1B954DABBD80A6F81E49EE21E3DDC413EAEAB2514742F9B643AD085B9997"
+    },
+    {
+      "path": "VortexCollections.ps1",
+      "bytes": 13834,
+      "sha256": "EE4A9B44089135C2BA2B39CD4719E7C674B56C24311763C5A50F63E6ECF38FD1"
+    },
+    {
+      "path": "app.manifest",
+      "bytes": 539,
+      "sha256": "769B997E82FD87A1667AA8C0AE13EA62975C9E33E073C6189A25A368F15E2D9A"
+    },
+    {
+      "path": "config.example.json",
+      "bytes": 385,
+      "sha256": "E05F4814513DD2760DAF66A2E1CE70D6A4F136E2A6E892F491A42ADED9B10492"
+    },
+    {
+      "path": "fg-settings.tests.ps1",
+      "bytes": 1761,
+      "sha256": "98F2710DADE2FDAEB76A4977EC6C3414FA55E43BEA4BF8B8F181420784C95DFA"
+    },
+    {
+      "path": "helpers/VfsHost/Program.cs",
+      "bytes": 10122,
+      "sha256": "D00F90A80E96D36C179E9F25043A254414C01C5D28CAB152D3839B754586CDB2"
+    },
+    {
+      "path": "helpers/VfsHost/VfsHost.csproj",
+      "bytes": 312,
+      "sha256": "50F5F7DF2FE1051A9AF21197E0245AD3C130B49F658CE9A9D809A7E687C90054"
+    },
+    {
+      "path": "installer/Install.ps1",
+      "bytes": 28532,
+      "sha256": "142EFFB9ED1DA3147A8AC6B01815C465D723C0B37D17C7DD3176B5DEF1DC68F7"
+    },
+    {
+      "path": "integrations/vortex/read-catalog.js",
+      "bytes": 12598,
+      "sha256": "F82D9DA4E61E7A0B61F78DC05EBF42C69494A4E1049BFB7CDDC0768B33818469"
+    },
+    {
+      "path": "licenses/DLSS5Manager-Copyright.txt",
+      "bytes": 824,
+      "sha256": "00CD46DA92A784FA5D1984B94A3BB858A81869263619226885B6B643615E3432"
+    },
+    {
+      "path": "licenses/DLSS5Manager-THIRD-PARTY-NOTICES.txt",
+      "bytes": 12298,
+      "sha256": "7952BEE54BDDE3969EB7CE516729416D933D0AF366B0C47D1905ABFD217C5B95"
+    },
+    {
+      "path": "licenses/basic-games-MIT.txt",
+      "bytes": 1046,
+      "sha256": "0865C91C89A6B8569B0F8D496EBC8935E5725032DC2EDBA536419513A5148B88"
+    },
+    {
+      "path": "licenses/usvfs-GPL-3.0-or-later.txt",
+      "bytes": 36769,
+      "sha256": "6ADE493F62FB87B3A2FC83D681EB5CB84E1A7A17D426B0277490C0D618017935"
     },
     {
       "path": "tests/FeatureToggleVisualHarness/FeatureToggleVisualHarness.csproj",
-      "bytes": 392,
-      "sha256": "6BD75560B4AC886E60A58053E3FB679837C42728416F4C4C677693AE9334B2C0"
+      "bytes": 382,
+      "sha256": "1A314A009967E6290FEC3A162CF76EEC53DFCD4531DA0FBC6351CA24CD24FF51"
     },
     {
       "path": "tests/FeatureToggleVisualHarness/Program.cs",
-      "bytes": 6244,
-      "sha256": "038DF5638CA4913356C65197E22C9B1567C7D6C536F9576EACF86855FE771F12"
+      "bytes": 6148,
+      "sha256": "BF957A1222EF26AA9D1CA44246401E2565DCF69FD85FD9F128DD6087E5CBB8FE"
+    },
+    {
+      "path": "tests/VfsConsumer/Program.cs",
+      "bytes": 1447,
+      "sha256": "D0C5C515774BBAD643FEA688FF2CBA7C0F0018C47118DCD928A3881178950BA5"
+    },
+    {
+      "path": "tests/VfsConsumer/VfsConsumer.csproj",
+      "bytes": 187,
+      "sha256": "75690A11CDF9BC8D45689E99CE0310049243C2B3AB210055B7FC9C06B92B5B72"
+    },
+    {
+      "path": "tests/backend.tests.ps1",
+      "bytes": 2421,
+      "sha256": "3CEC12BD579A9BC0D14C970411A493941EDA35EBF58E1193EA1757351BED9EC8"
+    },
+    {
+      "path": "tests/cet-runtime-view.tests.ps1",
+      "bytes": 4712,
+      "sha256": "DF7C3BDFDF9E2671D826DA19B8621B49380D5BEB4F186F84A07B6DF0F7359853"
+    },
+    {
+      "path": "tests/clean-baseline.tests.ps1",
+      "bytes": 6462,
+      "sha256": "EA22B1080A74FF49C6DC398EEDA6EF0E046CBEAA7BECFE602F6D152E40F2D3E2"
+    },
+    {
+      "path": "tests/collection-port-install.tests.ps1",
+      "bytes": 10343,
+      "sha256": "CDD29C5907ED5C1D7CF1728BB810E60827B15671D631A6A48B9F39C6D1C0ED33"
+    },
+    {
+      "path": "tests/collection-source.tests.ps1",
+      "bytes": 9296,
+      "sha256": "FB2C72649B1198235004D2745FA3C4A804BB5C6E8D942B4BD4E4B8D0C0A90158"
+    },
+    {
+      "path": "tests/components.tests.ps1",
+      "bytes": 3568,
+      "sha256": "AB44AB392F5EF31D0E420C42D5E165F61BE6CEEF6DDB1649BF791C9A41DFE038"
+    },
+    {
+      "path": "tests/content-packages.tests.ps1",
+      "bytes": 9059,
+      "sha256": "0913C06F92531889E1B30E251AC260D13F98E850963D4E8F99A8840FFC36D4E5"
+    },
+    {
+      "path": "tests/cyberpunk-collection.tests.ps1",
+      "bytes": 3277,
+      "sha256": "42157C1DC2B5E1AFA393F95B7F4741813B76626384C8FE58CE9BE1313978A450"
+    },
+    {
+      "path": "tests/duplicate-profile.tests.ps1",
+      "bytes": 2713,
+      "sha256": "06F2409AB146FB4C29207BFD588A248D2F49A9644A3490FADCA9E2EB9F4BF22E"
+    },
+    {
+      "path": "tests/enhancement-package.tests.ps1",
+      "bytes": 5799,
+      "sha256": "9C22D2C983CAFD767B6983A914313DF2B066E8F1E6B438FC31CE21DDB172316B"
+    },
+    {
+      "path": "tests/enhancement-port-lifecycle.tests.ps1",
+      "bytes": 7826,
+      "sha256": "CD448480B2CEC982887544E6ACB68C5FC8D6DE257F9F6EF054936B3330258E9C"
+    },
+    {
+      "path": "tests/feature-toggle-state.tests.ps1",
+      "bytes": 5114,
+      "sha256": "1347F80FFA704062C258A2FA509A08149231935CA5A4E2E6322CBBE1CA35E3E2"
     },
     {
       "path": "tests/game-launch.tests.ps1",
-      "bytes": 12082,
-      "sha256": "9BCCA049770D5FC8FB88A8315DDB36C64731EB34B17963CEC96757C6492534D3"
+      "bytes": 11956,
+      "sha256": "455F5BF760ED88F2439DA6423D31D16A7035B17772350E3B5B63BD675CC4A42A"
     },
     {
       "path": "tests/game-profile-integration.tests.ps1",
-      "bytes": 23361,
-      "sha256": "A44F6CD8CECDCA31E4B01C808546735AD58EA7723F7A6EC38C33291C5D2ACF04"
+      "bytes": 23185,
+      "sha256": "FB6B4E523EBECFD6D22AEB2681FBAA28C35D1613B72B383B8AD771E53A1E66F8"
     },
     {
       "path": "tests/game-profile-store.tests.ps1",
-      "bytes": 25308,
-      "sha256": "D91A12C860F196CF171D19B9F890D835A20D9365FAB75A40292EA8C3627C0207"
+      "bytes": 25044,
+      "sha256": "9E5F579DC1FA41E7DD3C7D58E4789FCA4FA1B9A495ED4845E3CFDD56C4D8A56B"
     },
     {
       "path": "tests/game-profile-templates.tests.ps1",
-      "bytes": 19827,
-      "sha256": "348FBB738155D2514E7ED1FBBA0E4F2709E8847403807250FBCA4A4E3406274A"
+      "bytes": 19663,
+      "sha256": "818440DB66C82038CDCA9FF12A48563D0288A459DB9C44F2D7C36EEF7871EBB5"
     },
     {
       "path": "tests/graphics-settings.tests.ps1",
-      "bytes": 6059,
-      "sha256": "427651D8AE5700735B73FA9B6EC416423EBFDD48E3C291A68A15A6A806BB415D"
+      "bytes": 6003,
+      "sha256": "27C30F992D99EC0E42834F0EA9AEB7473792720F050E18833F1CB13A15A31AC8"
     },
     {
       "path": "tests/installer-config-forwarding.tests.ps1",
-      "bytes": 3602,
-      "sha256": "F678A21CD8B137D3465AE9B0036ED2E7ACB0B08549F450F535952616E08FCBAF"
+      "bytes": 3553,
+      "sha256": "5C5FE431BF7FEB75AB19A4524EAE17FE815E699E84C5D2CBB9B69400CCDE8AAA"
     },
     {
       "path": "tests/installer-settings-route.tests.ps1",
-      "bytes": 7686,
-      "sha256": "DF04A37E5C1549CB0131E3C5DFDA3DD1BC4250E42E0A799E0179657B34BA8F0A"
+      "bytes": 7603,
+      "sha256": "7712C2D931111D5BF83834F26703887FB5C9A4793C04CE1B7238C5AA68E02A24"
     },
     {
       "path": "tests/keys.tests.ps1",
-      "bytes": 770,
-      "sha256": "C80430823DA483641EE0D0B823F128BB73AEBFE82CD415EA08F3DE9822A318FA"
+      "bytes": 761,
+      "sha256": "6AF3DF7C1D346DEF5887F6F7A3B0D881D1F09D877479557ABA3E4B1CC47C63DF"
     },
     {
       "path": "tests/launcher-process.tests.ps1",
-      "bytes": 1803,
-      "sha256": "3930E32AA062EF2C93803C6C55482329DD84A0C7A3152F3B7AC7D750B352D69A"
+      "bytes": 1773,
+      "sha256": "74C58A67A0C826C93488B00B8D558A8FB8128949FCD861C9E547C7A47F7D289B"
     },
     {
       "path": "tests/library-actions.tests.ps1",
-      "bytes": 1182,
-      "sha256": "89CDF0F935EFA54A554C3C56D276947EC7BBB581479BF2936204EF8A663297C9"
+      "bytes": 1168,
+      "sha256": "2AC57F74CA563407D881250B6FE35E1D699609AC693FFFC123FC2EABA68B85EA"
     },
     {
       "path": "tests/managed-runtime.tests.ps1",
-      "bytes": 1775,
-      "sha256": "3FF0260958D92D8488655EABB95F08F13AC7047971C570F71C4F041FE81E0A9A"
+      "bytes": 1757,
+      "sha256": "DBC3FFA3B2D35744E871E21D7F8CEB8707B15DC61CA663C3B9074D32709694E8"
+    },
+    {
+      "path": "tests/mandatory-runtime-ini.tests.ps1",
+      "bytes": 10837,
+      "sha256": "3B0AD6C3182356B53EFD779AC67D9D7B05F18D17FCE210476B4B7289129D4FFF"
     },
     {
       "path": "tests/mod-profile.tests.ps1",
-      "bytes": 2408,
-      "sha256": "AC33BB00D132CD3E00D0F1B6EBFA19D199B7A25E47917AC7A02596B75D24A75F"
+      "bytes": 2379,
+      "sha256": "AF5FEDFD3BA72A711BA8E6E8A7E30CD6AAE07211BB7B729E09ED76766764A5CA"
     },
     {
       "path": "tests/nr-startup-policy.tests.ps1",
-      "bytes": 5281,
-      "sha256": "C4AE98BC29CD094C6B890E1677E7F3A82BFE0FBF97FEB32E0235FCA099287A01"
+      "bytes": 5279,
+      "sha256": "26FE6AD6C291866B955268D7834F242B8A28B09C68A20404E0425E17A3CAF44C"
     },
     {
       "path": "tests/nr.tests.ps1",
-      "bytes": 1199,
-      "sha256": "5FA807196ECB75707443DCA54DB32A5593B3682C9B2A13C5B8689D051A0F6813"
+      "bytes": 1184,
+      "sha256": "EFB90120A9A4650C994180214D57C702E5F88CBF296862C82C07EC9AE38C436E"
     },
     {
       "path": "tests/packaged-collection.tests.ps1",
-      "bytes": 5557,
-      "sha256": "8CE99450FEACDBC146FF33314C1F262B90DFA9F418DC954111FDFFDD9A7863C2"
+      "bytes": 5504,
+      "sha256": "4DA8DB4D7702882E89883FB7E64FEA406B1E2533D5AE04DB37AD558E22232FC6"
     },
     {
       "path": "tests/packaged-enhancement.tests.ps1",
-      "bytes": 3323,
-      "sha256": "32358E638721E81370EBD4531DBACF5B979902E7F64D880183D6C3D1F2A00236"
+      "bytes": 3290,
+      "sha256": "08E2F322669C91C575CCA0ADAEF48DBF296889B1D50B37376F8660BB1C4482CD"
     },
     {
       "path": "tests/plain-collection-launch.tests.ps1",
-      "bytes": 1490,
-      "sha256": "CAC60192A647181200CC402B46315D421789FEA0DC5463CC21A59CB24320030B"
+      "bytes": 1473,
+      "sha256": "DE507FE7B37A4F4A076A1D5B491FDB035D1813FBADA76830B9B474B0AA763AEA"
     },
     {
       "path": "tests/port-payload-policy.tests.ps1",
-      "bytes": 7723,
-      "sha256": "E30EB3BF6B97C3DC92526CE54CADCBC7A0A1F0686DF4495AA3F2AD41BFE718C0"
+      "bytes": 7642,
+      "sha256": "B42DE207F76FCAFC3CFA3BC0D5852045E29D77F4234CA20E77DF3AEBE3E14C6E"
     },
     {
       "path": "tests/prepare-vortex-ui-fixture.ps1",
-      "bytes": 4236,
-      "sha256": "15D14A581DF847CE030384B4C702D3DC145E1F1ACFD007D5F6DFDF26228D4BE1"
+      "bytes": 4194,
+      "sha256": "9A977E4978569D9A0C4AB08D1F191934B84FF800A3C6A341E5EE4E4075D46DA0"
     },
     {
       "path": "tests/profile-cas-leases.tests.ps1",
-      "bytes": 2815,
-      "sha256": "688BF914582A107C964D122A6070913D73F975F15DD4E70F62E3ADE1602F56BA"
+      "bytes": 2784,
+      "sha256": "B602D0CA3BDBED337D1F73C1A61B28C9B9B23A9D9FA93B2FC5E16D97372E1555"
     },
     {
       "path": "tests/profile-exclusion-culture.tests.ps1",
-      "bytes": 1365,
-      "sha256": "86FC4FE243F63E1F14590D7309551BC291CEB731EBDDFD497A7F6F87CB34A974"
+      "bytes": 1347,
+      "sha256": "E15C7FF898F5E2947544B8E15F471763A47F5EA367C9CF8B95DE0F398E555FF2"
     },
     {
       "path": "tests/profile-hash-stream.tests.ps1",
-      "bytes": 3956,
-      "sha256": "35F22AB35B68A6F530EABC3111F26CDFDC1E51389EE8D7DD294ACA27A8E40A2A"
+      "bytes": 3916,
+      "sha256": "BD0BD2D5A91B75F13E580FE35F96E2433F630E193F3AC9F62AB6D13163DEB4C5"
     },
     {
       "path": "tests/profile-inventory-speed.tests.ps1",
-      "bytes": 1238,
-      "sha256": "83D1F6DD28D65267AD9EB0DD5440C48D7AEA2EDE266E2C1432FE4DA83AAE7B0F"
+      "bytes": 1223,
+      "sha256": "CE0BBF231F6B5C115192152E80D344C5D575E77F788DD826D97A81AA04839B7F"
     },
     {
       "path": "tests/profile-journal-append-failure.tests.ps1",
-      "bytes": 3695,
-      "sha256": "FC0D9D423BB786011DC2C559C09D29BC10443A5FEC941D936144729E94246E1C"
+      "bytes": 3650,
+      "sha256": "89B60E2441012BB1B85B791AE71159CDC4509AF032AA4354AEA12CB135DCA31D"
     },
     {
       "path": "tests/profile-journal-cost.tests.ps1",
-      "bytes": 3202,
-      "sha256": "EAEAFAC9AC78249400CE520F065D854682A507C9107DBF7C7333E1A6869365D1"
+      "bytes": 3183,
+      "sha256": "481287CE980F87918CF8CDEE7E7A4302C51427A848760FA45A73D4F3357B0423"
     },
     {
       "path": "tests/profile-journal-progress.tests.ps1",
-      "bytes": 9564,
-      "sha256": "8D63F38BB2D964CF6F8F235317100ED054AF78DA76327D4F4D90A38831185917"
+      "bytes": 9465,
+      "sha256": "6CEA6BE9F1589B68C1D9F0A7BFBCBEA782EB8ED411528749D9FFE6C8B4CAAD64"
     },
     {
       "path": "tests/profile-journal-receipt.tests.ps1",
-      "bytes": 3477,
-      "sha256": "FC53943DE65914874B923C72468121BAFF152CA7B8DE9AB306F421F6CF9B3A00"
+      "bytes": 3449,
+      "sha256": "54E6B63CFFE516505BA6103C70A4F9E45A0F5009E9466E9EEFE3CFC429B9DC47"
     },
     {
       "path": "tests/profile-manifest-directory-map.tests.ps1",
-      "bytes": 4823,
-      "sha256": "819B71DC1666D01EC3688B170D6C14EC2548F415172EA1A055A666E45C2661BC"
+      "bytes": 4778,
+      "sha256": "DB9164745C1EA99ECBB329BE95A918CB3A91316C77B5F779040893F8DC013EBA"
     },
     {
       "path": "tests/profile-manifest-phases.tests.ps1",
-      "bytes": 3004,
-      "sha256": "810F8A883020E31363BFA049C7E102A1478CBFFB97D4439A085860C8E2253D00"
+      "bytes": 2975,
+      "sha256": "8C0EE20315EA603AD9B65E4E24F35BDACE553B66A0795CCFE0DB5AFCA8D06FB1"
     },
     {
       "path": "tests/profile-metadata-cost.tests.ps1",
-      "bytes": 3118,
-      "sha256": "268865C37A42B451CA47721C3906490F54D350D003059FCF1765275C15CD24EF"
+      "bytes": 3086,
+      "sha256": "57B2ADE0EA1776ED86B89B9E4EABE82E0FD314B1FD023EA1D0594D91A10FDC38"
     },
     {
       "path": "tests/profile-native-inventory.tests.ps1",
-      "bytes": 6112,
-      "sha256": "8BFD0E605BC352B1F8F1CDE7EFD18399F7FA90F1CF4B062D87B757C559B6D334"
+      "bytes": 6061,
+      "sha256": "88593ACFC62CC2D87F72B0456A6439BFDF73962550468AEE8193E375B5D6D10F"
     },
     {
       "path": "tests/profile-native-paths.tests.ps1",
-      "bytes": 4740,
-      "sha256": "74210C0FF30D3E9322D896456B3BFB40059ED96EA99F8407558E878B8704B4CD"
+      "bytes": 4711,
+      "sha256": "A9479FB2F7A518A8D79A0804E204E5823AFF633E3AD8E043CB32036ECECE29B9"
     },
     {
       "path": "tests/profile-native-sort.tests.ps1",
-      "bytes": 2128,
-      "sha256": "B54A24A7D25C14FCF76E61DAC20412313B4F98C0A72248787230FF66B3A13590"
+      "bytes": 2103,
+      "sha256": "C51AD315BBD71B0635B153D33D0812EA55BACB9A195DE2CF3E5CC7CFD9D78429"
     },
     {
       "path": "tests/profile-path-checks.tests.ps1",
-      "bytes": 1741,
-      "sha256": "E519505212485D6A892B3BDBB00BF8D1C997A6965A1E1B26AF5AA55A5D75F99E"
+      "bytes": 1721,
+      "sha256": "4DA73E54114EAEDEEE484F6FE22F5F75357CE8BAE418DB45F60DA72126E49F6A"
     },
     {
       "path": "tests/profile-protected-directory.tests.ps1",
-      "bytes": 2957,
-      "sha256": "9EA555EC05F4A49FF9A056AB2E6D6C1AF53223F2FC524822893F09B384C8D67F"
+      "bytes": 2919,
+      "sha256": "8D148CF06820222793C014D215162D818A624ADA8400CD2971A3F8446F71CE05"
     },
     {
       "path": "tests/profile-transient-lock.tests.ps1",
-      "bytes": 1874,
-      "sha256": "99EE92DFEED7B5465392E9132FE51F777B060DB7DC1790CEFCB3EE767077A083"
+      "bytes": 1839,
+      "sha256": "5FF809D73E19EF72734CBE23A9F52682957B733882C16E31E8546BBE14F73DF5"
     },
     {
       "path": "tests/profile-ui-harness/CollectionImportChecks.cs",
-      "bytes": 7050,
-      "sha256": "1E20969FFCC61E6176F09D28EB48B4FB5644E84D6E37E97E6C30BF0EFF180A8B"
+      "bytes": 6957,
+      "sha256": "9CFCA9852E7BDD1B257FC4CF4450AFAA408AE54282FB529DC27D067D6883FB64"
     },
     {
       "path": "tests/profile-ui-harness/CurrentLaunchChecks.cs",
-      "bytes": 4961,
-      "sha256": "1316824BDF5264B87DF29E3F60B4B6944D0DA31C7433DDF36AE1ACADAF29AAC2"
+      "bytes": 4900,
+      "sha256": "54D0471452B19741EFDA45D955B502870B2733326D45846B864C26D09834F342"
     },
     {
       "path": "tests/profile-ui-harness/ProfileUiHarness.csproj",
-      "bytes": 392,
-      "sha256": "6BD75560B4AC886E60A58053E3FB679837C42728416F4C4C677693AE9334B2C0"
+      "bytes": 382,
+      "sha256": "1A314A009967E6290FEC3A162CF76EEC53DFCD4531DA0FBC6351CA24CD24FF51"
     },
     {
       "path": "tests/profile-ui-harness/Program.cs",
@@ -707,226 +825,145 @@
     },
     {
       "path": "tests/profile-ui-harness/StartupRecoveryChecks.cs",
-      "bytes": 12471,
-      "sha256": "F0C58697D8534E78C604D34EE02C2BF741B22D4E18A6E8817560C5F496F6607C"
+      "bytes": 12325,
+      "sha256": "8CB58C0486C26EA5F88AAD2531F8D92081F15206BDFA75A172532EC0B545DC7B"
     },
     {
       "path": "tests/profile-ui-harness/TestSaveUiChecks.cs",
-      "bytes": 7504,
-      "sha256": "840E423AA8474DA0BFBD758B3531E136AF8690197FB04CC4DFFC05F74AB46386"
+      "bytes": 7398,
+      "sha256": "404E5B03034BE8F09AA162BA1A7C1B94E74ABE3FF8794933CC4FA13A422A5283"
     },
     {
       "path": "tests/profile-ui-harness/UiPreview.cs",
-      "bytes": 9041,
-      "sha256": "8FF025B08F648332CD386624305CA09DF839C2B41F0C41F0A93B14F191591045"
+      "bytes": 8951,
+      "sha256": "902709A79D02CAE49B41F1F35D408AD0D559BB37B19B8BB8BA405FFA2D9DCBBA"
     },
     {
       "path": "tests/profile-ui-harness/VortexCollectionChecks.cs",
-      "bytes": 7175,
-      "sha256": "700E6AFFCD99081940B979F8AD2745128B5A68E0F6C621CFAA8BC9F0727E6D0C"
+      "bytes": 7064,
+      "sha256": "9772D53CC673C20B141930BCD44A4F22386A0C8C21BDDF1D5B4FA304AC0B36CB"
     },
     {
       "path": "tests/profile-ui-state.tests.ps1",
-      "bytes": 3998,
-      "sha256": "A0AD957AF41F4419F8869950700BBF676027003D47988B0300D152FE4CE35C36"
+      "bytes": 3939,
+      "sha256": "B401CEAC8A9CBA1A420CEB8610FA8F41E2C64EE8F239313085B7CABCBC424A59"
     },
     {
       "path": "tests/recommended-settings.tests.ps1",
-      "bytes": 5141,
-      "sha256": "85A02979E99BB2E482B0D08FB8E50DF27BE7E3BBC46555DEDE4D15A3ED0E7464"
+      "bytes": 5075,
+      "sha256": "8AD246B56787A9B2845E879D396D5F88C8CD30043E6A04C2994039F9257098E4"
     },
     {
       "path": "tests/redmod.tests.ps1",
-      "bytes": 3295,
-      "sha256": "23F65A78D2342F8730D7366FBCAC244126A93EE956DF407DB3FAD2FE6B14AA53"
+      "bytes": 3259,
+      "sha256": "B76F5A66D7F3515314D6A07420F9F5920E53B257A99D29267F8DDBB7C1D0E7FB"
     },
     {
       "path": "tests/renderer-override.tests.ps1",
-      "bytes": 4025,
-      "sha256": "6312ED965D1E827CA7B776CDD180FE43FDCF3B26864121724ACE6D8E6AA6780F"
+      "bytes": 3983,
+      "sha256": "F5D95AF34EC4696BCF4D4775C87EC73D8DB4D5435A869F13CE13B4B0A2CF20DF"
     },
     {
       "path": "tests/settings-persistence.tests.ps1",
-      "bytes": 1598,
-      "sha256": "93273AAA9713767DC6C34F47B1DE7BFBA5EC02761B043A8EABC93B50A74CB3B3"
+      "bytes": 1576,
+      "sha256": "17F7C47C1611FA90501CAE1449D7C64169DBAB2028940A06DEC3DA13D834429E"
     },
     {
       "path": "tests/shared-archive-profile-cycle.tests.ps1",
-      "bytes": 4629,
-      "sha256": "2DC3D7546C6111A8A515BBEBDA3E7860CCFA72A90BB15C3FA18A6BBAA1273068"
+      "bytes": 4577,
+      "sha256": "71726F9CD14F0AB831CD77B5EFF6EE68CB2F898FA7D2D5EB7967080DE7328A51"
     },
     {
       "path": "tests/shared-enhancement.tests.ps1",
-      "bytes": 12753,
-      "sha256": "CDF66B8C11594F621006EBCB05DB3BFF5F70BB331C32FCEB4D82C4F1EB0B1748"
+      "bytes": 12633,
+      "sha256": "D19870D99B22DB651F5784117EE4F847902928AB55CC3A48BB7846CA628BA3FA"
     },
     {
       "path": "tests/snapshot.tests.ps1",
-      "bytes": 1330,
-      "sha256": "1146ADE68419BD5D2741881331F16709B3A944BFF1B6F90D2236FC2397853F37"
+      "bytes": 1314,
+      "sha256": "C4D7A91DC4BA75B00A49E42045F525188DF2D209EFBE30A4A7731B398626F4D4"
     },
     {
       "path": "tests/standalone-profile-cycle.tests.ps1",
-      "bytes": 6571,
-      "sha256": "F9A64FB9E66D6C3353A966DD0C637ED605748800C10BAC0FC6AE34BFDC5B9F96"
+      "bytes": 6511,
+      "sha256": "36E756692C901E687A279EE8BBCA9EFD2871361296E6FC311CE907758E943794"
     },
     {
       "path": "tests/standalone-vfs.tests.ps1",
-      "bytes": 6141,
-      "sha256": "A013E3606BC39CFC17435FF48817D4474250659C146D77E291D0AD7CF0EA8798"
+      "bytes": 6080,
+      "sha256": "C15C1C85E13305C3E955B545D6D6977F53F850ACC63632F43A294C3DA39F57FB"
     },
     {
       "path": "tests/stock-identity-cache.tests.ps1",
-      "bytes": 5192,
-      "sha256": "77759DBE0B88DBB2A7C7083C13D65E0AF316B510C097444B241750ACD0EDB7D1"
+      "bytes": 5134,
+      "sha256": "DD8850156AE02824DABAEBC054B1A1F835B4FC9BCF4E05B571C2687FA188E410"
     },
     {
       "path": "tests/test-saves.tests.ps1",
-      "bytes": 6122,
-      "sha256": "0E6A6036F794ED579EAF6EF2ED415AD7B03C768CAD7FF6E356D995881EE8CFDF"
+      "bytes": 6053,
+      "sha256": "997051CDF0232733427ED4725A25CA8A93097C7F94D9552D14736185B2BD5E92"
     },
     {
       "path": "tests/usb-process-identity.tests.ps1",
-      "bytes": 1643,
-      "sha256": "50071CD90FCE84C383CDBB754130B3E46EEEE01E10E86E9C31AC97DC17B5C6BF"
+      "bytes": 1615,
+      "sha256": "73E0E20A72CB26DF69E6C48A1D3813D7BC79A18D43202D23262CC0A537F3AA94"
     },
     {
       "path": "tests/usb-recovery.tests.ps1",
-      "bytes": 2580,
-      "sha256": "84F9D58A5C08A0F24BE52B8894F0B0E58E2824A010546D08BEC4F58EFD148B53"
+      "bytes": 2543,
+      "sha256": "8C4136070483BD610A409369E8C9F23A560E55C0CA2B225C0F1FFA2CD569FE23"
     },
     {
       "path": "tests/version-dates.tests.ps1",
-      "bytes": 7009,
-      "sha256": "0E4A02F667C9A05B5A16710C595C2734C604DFAFF96C313E3358EDFCCC8150E7"
-    },
-    {
-      "path": "tests/VfsConsumer/Program.cs",
-      "bytes": 1472,
-      "sha256": "0D0DB3B5071FB355FA66F6379BBE63861F2BA4CBDA13153674B804F587BD90B2"
-    },
-    {
-      "path": "tests/VfsConsumer/VfsConsumer.csproj",
-      "bytes": 190,
-      "sha256": "F91811E33E52DC6FF0B40DB289E667D8E534A7E02056752EAC6FA93C1CB5C964"
+      "bytes": 6925,
+      "sha256": "AB9FE7C456322F8E6A6017613BA4125B80E34ABC736E40549E56F44661BBC347"
     },
     {
       "path": "tests/vortex-collection.tests.ps1",
-      "bytes": 4693,
-      "sha256": "D0059444D6BF4E269BB13E58FA13BFE063A5406EB458DC0377005B267800EC40"
+      "bytes": 4652,
+      "sha256": "4214B44DDB783B933ECFDF2ED9E5D924E8EB21AA7D537C8F5DA727FEB14DF1BC"
     },
     {
       "path": "tests/vortex-read-catalog.tests.js",
-      "bytes": 6757,
-      "sha256": "DBBC3824623120C96680C5C617D47DB35807C3C30E8961914D6A1C1C908705AB"
-    },
-    {
-      "path": "TestSaveControls.cs",
-      "bytes": 8935,
-      "sha256": "E15393884502BCA7A706A1477E937C77BC5D65F3D1947EB963E5832231889CDA"
-    },
-    {
-      "path": "TestSaves.ps1",
-      "bytes": 14921,
-      "sha256": "429BD44CB6494F9573AF50BB7C6CB3FF704D6AC72423CDCB8A9FFC1F18C1658C"
-    },
-    {
-      "path": "THIRD-PARTY-NOTICES.txt",
-      "bytes": 12590,
-      "sha256": "FAB10FA2D64AF0049A44E0C962D4D0D0F2662E01385B8EA2C72B80C70CCAC6C9"
-    },
-    {
-      "path": "THIRD-PARTY.md",
-      "bytes": 1242,
-      "sha256": "FEFF73C3C0601A8C06DE2CC124DE1A165BB567B0B8E672C6D7E1A52D92E4E310"
-    },
-    {
-      "path": "TranslatorWindow.cs",
-      "bytes": 2904,
-      "sha256": "4F31EE74DC1271DC4388A2C3D46B505075094D7B62BDF5092D25157C85700C92"
-    },
-    {
-      "path": "UI-BACKLOG.ru.md",
-      "bytes": 19130,
-      "sha256": "FEE6A7ED003F5E4967C066E5391542154BB6756187EC3130D573B03FBCE9B34F"
-    },
-    {
-      "path": "UIcontrol/FeatureToggleButton.cs",
-      "bytes": 1889,
-      "sha256": "2973766C0818B4879907A46324AA3762B7257D7F25D21D68BB3F90EFCF472C6D"
-    },
-    {
-      "path": "UIcontrol/FeatureToggleState.cs",
-      "bytes": 2370,
-      "sha256": "5892A13E9FB63A248BF752DEFE62771910DA49DEE3FB118B0FEBC9F66303A7BE"
-    },
-    {
-      "path": "UPDATES-v21.ru.md",
-      "bytes": 3722,
-      "sha256": "5D4F94DCFE761E88FE1536D1C427118162F59E4A0FA1EC0EE62F4F33DA0314A6"
-    },
-    {
-      "path": "Updates.ps1",
-      "bytes": 6059,
-      "sha256": "B915D368C5BD2318228DD111FCA59D01AC183AEBCFF1FA6BA888699956160C2C"
-    },
-    {
-      "path": "UpdatesWindow.cs",
-      "bytes": 4946,
-      "sha256": "E6EA5AC2CF0A655B13DCE204E959D841E6919B3C493B051EE08BB127CE16A09F"
-    },
-    {
-      "path": "UsbRecovery.ps1",
-      "bytes": 7752,
-      "sha256": "ED55608FBCD4042328CF54982E7C7D2789E47CEAFB6780BBE82C6BAE940F0BC1"
-    },
-    {
-      "path": "VALIDATION.ru.md",
-      "bytes": 6614,
-      "sha256": "695E08A73F2A7FD01F2F384B6199BC9B06B73A15C859541FB2E126CF3D32153B"
+      "bytes": 6673,
+      "sha256": "BC721911B28F157B0112820FB1D96F2C263DBCD5542AB6481B690BEDD8F816F5"
     },
     {
       "path": "vehicle-tools/CyberpunkVRPort_VehicleGrant/init.lua",
-      "bytes": 4034,
-      "sha256": "F8992E816189D9EF49B73D6B8453FF79A879A9E6294358305D8820BCA4E3103C"
-    },
-    {
-      "path": "vehicle-tools/prepare_packages.py",
-      "bytes": 6207,
-      "sha256": "DC4A1D7FE11B2754DA79DD943B25C39EBD60FD575610ADEA5D18EF79DEBAD952"
+      "bytes": 3908,
+      "sha256": "CCC69F4D03D4DAE3DF3DCB6C685DF83940271026E3A219D7CF1C39D950E8F831"
     },
     {
       "path": "vehicle-tools/README.md",
-      "bytes": 2864,
-      "sha256": "E04A7C85D81678F1F17306B3381D5984107E3D43DEAC96DFDD284E9ABE1E63FD"
+      "bytes": 2839,
+      "sha256": "859F5DB7FD81B2DA0AF83502968CF765166926CF56D7C89499236965FF176385"
     },
     {
       "path": "vehicle-tools/Test-VehicleScripts.ps1",
-      "bytes": 3957,
-      "sha256": "6095A2797FDAEC565E8E9AEC34F5EA87B6E7E79A176A534959A941DFC5642C58"
+      "bytes": 3905,
+      "sha256": "EC565493EAA1CAD633A9CFDA505F0977C712521492FC884BDF9FEA4AE0886AAF"
+    },
+    {
+      "path": "vehicle-tools/prepare_packages.py",
+      "bytes": 6092,
+      "sha256": "124414A4244404EDDF685C4F051A7505F33B098428759982B6877C0A2FC17204"
     },
     {
       "path": "vehicle-tools/tests/run.py",
-      "bytes": 574,
-      "sha256": "4F057382611656662994864A83B0CB66218B4E34681DA25B81A23DFFCC80D01F"
+      "bytes": 557,
+      "sha256": "645F928740474399CC9E731EEFBD296C1E1737B5590DB5C24E3636D6C3E56A60"
     },
     {
       "path": "vehicle-tools/tests/test.lua",
-      "bytes": 5366,
-      "sha256": "2CAE0C1FE2C80078354F0E9EB468387E002F91541C7FC4C7666417ADA7CC02D5"
-    },
-    {
-      "path": "VortexCollections.ps1",
-      "bytes": 13834,
-      "sha256": "EE4A9B44089135C2BA2B39CD4719E7C674B56C24311763C5A50F63E6ECF38FD1"
-    },
-    {
-      "path": "VRPorts.csproj",
-      "bytes": 1048,
-      "sha256": "EFA93B015E7B688F6DA25977FE92DE30CDF0D5C0910E5A7FDE2E1A2691073E5F"
+      "bytes": 5225,
+      "sha256": "2D06605697D6EF1F563684F57A76725AADFBDB21AE04723FA47A98EF5297FFE5"
     }
   ],
-  "distributionBoundary": "Source only; 172 allowlisted files. Center04 PowerShell and first-capture instructions; original4runtime binaries retained. No game, private config, fixtures, build outputs or toolchain.",
+  "distributionBoundary": "Public Git source content:173 allowlisted file blobs plus this manifest. LF source bytes differ from the separately verified Windows portable source folder only by text EOL transport. No binaries, private config, fixture outputs, caches or toolchain.",
   "knownOriginalHostPathReferences": 0,
-  "updatedUtc": "2026-10-18T19:21:56.7673632Z"
+  "updatedUtc": "2026-10-18T22:03:41.7265526Z",
+  "portableSourceManifestSHA256": "5EA08DF719F05F9A6E9716CE3FC320E06386ED70FD04509CDD27BC385A68F5ED",
+  "publicBaseCenterTree": "b8d32f5c70a6e015557be256c864a2aa81bf9867",
+  "sourceByteBoundary": "Computed from prior public vr-center Git blobs plus ten reviewed Center source overlays with CRLF-to-LF normalization only; publisher must verify final tree blobs after applying the complete source overlay.",
+  "currentPublicationGate": "PENDING_ROOT_UNRESOLVED_WORLD_EXIT_BLACK"
 }

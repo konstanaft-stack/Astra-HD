@@ -251,6 +251,17 @@ try{
             if(-not(Test-CyberpunkProfileMode $config) -and (Get-GameLaunchSource $config).kind -eq 'direct' -and $state.receipt){
                 Ensure-LaunchModProfile $config $state
                 Set-RecommendedSettingsMode $config $state (Get-RecommendedSettingsMode $config $state) -BeforeLaunch
+            }elseif((Test-CyberpunkProfileMode $config) -and $state.receipt.kind -eq 'native'){
+                $settingsConfig=Get-GameLaunchEffectiveConfig $config
+                $modePaths=Get-SettingsModePaths $settingsConfig $state
+                if(Test-Path -LiteralPath $modePaths.state -PathType Leaf){
+                    $mode=Read-Json $modePaths.state
+                    if([string]$mode.version -cne $modePaths.version -or $mode.recommended -isnot [bool]){
+                        throw 'Не удалось проверить сохранённый выбор настроек этой сборки.'
+                    }
+                    Set-RecommendedSettingsMode $settingsConfig $state $mode.recommended -BeforeLaunch
+                }
+                Sync-NativeRequiredIni $settingsConfig $state
             }
             # Only an explicit click invokes this action. Never installs or switches a selected profile.
             if(-not (Get-UsbRecoveryState $config).enabled){

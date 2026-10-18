@@ -47,7 +47,7 @@ UiDescriptorMutation BeginUiSrvWrite(D3D12_CPU_DESCRIPTOR_HANDLE)noexcept;
 UiDescriptorMutation BeginUiCbvWrite(D3D12_CPU_DESCRIPTOR_HANDLE)noexcept;
 void FinishUiCbvWrite(UiDescriptorMutation,const D3D12_CONSTANT_BUFFER_VIEW_DESC*,D3D12_CPU_DESCRIPTOR_HANDLE)noexcept;
 UiDescriptorMutation BeginUiDescriptorOverwrite(D3D12_CPU_DESCRIPTOR_HANDLE)noexcept;
-void FinishUiSrvWrite(UiDescriptorMutation,ID3D12Resource*,D3D12_CPU_DESCRIPTOR_HANDLE,bool unorderedAccess=false)noexcept;
+void FinishUiSrvWrite(UiDescriptorMutation,ID3D12Resource*,D3D12_CPU_DESCRIPTOR_HANDLE,bool unorderedAccess=false,const D3D12_SHADER_RESOURCE_VIEW_DESC* view=nullptr)noexcept;
 UiDescriptorMutation BeginUiDescriptorCopy(ID3D12Device*,UINT,const D3D12_CPU_DESCRIPTOR_HANDLE*,const UINT*,UINT,const D3D12_CPU_DESCRIPTOR_HANDLE*,const UINT*,D3D12_DESCRIPTOR_HEAP_TYPE)noexcept;
 void FinishUiDescriptorCopy(UiDescriptorMutation)noexcept;
 void UiDescriptorHeaps(ID3D12GraphicsCommandList*,UINT,ID3D12DescriptorHeap* const*)noexcept;

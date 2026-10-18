@@ -18,6 +18,7 @@
 #include "MenuPreview/WidgetAliasObservation.hpp"
 #include "MenuPreview/PortraitRotationPolicy.hpp"
 #include "MenuPreview/UiQualifiedSourcePolicy.hpp"
+#include "MenuPreview/UiBinkShaderPolicy.hpp"
 #include "Render/StereoSceneState.hpp"
 #include "Utils/MemorySafe.hpp"
 #include "Utils/StereoLog.hpp"
@@ -45,10 +46,10 @@ UiAllocation ReadUiAllocation(ID3D12Resource* resource)noexcept{
 }
 struct Alias {Metadata scope;RED4ext::Handle<RED4ext::DynamicTexture> resource;uintptr_t identity{},readCPU{};uint32_t readID{};};
 struct UiCbvDiagnostic {uint64_t gpu{};uint32_t bytes{};bool known{};bool operator==(const UiCbvDiagnostic&)const=default;};
-struct UiDescriptorEntry {UiCbvDiagnostic cbv{};bool cbvOnly{};uintptr_t cpu{};uint64_t version{},originVersion{};uintptr_t originCPU{};bool pending{},overlap{},unorderedAccess{};uint32_t inFlight{},recordingPins{};uintptr_t resource{};uint64_t resourceGeneration{};};
+struct UiDescriptorEntry {UiSrvView view{};UiCbvDiagnostic cbv{};bool cbvOnly{};uintptr_t cpu{};uint64_t version{},originVersion{};uintptr_t originCPU{};bool pending{},overlap{},unorderedAccess{};uint32_t inFlight{},recordingPins{};uintptr_t resource{};uint64_t resourceGeneration{};};
 struct ResourceKey {uintptr_t resource{};uint64_t generation{};bool operator==(const ResourceKey&)const=default;};
 struct ResourceKeyHash {size_t operator()(const ResourceKey& key)const noexcept{return std::hash<uintptr_t>{}(key.resource)^(std::hash<uint64_t>{}(key.generation)<<1);}};
-struct Heap {uintptr_t owner{};uint64_t generation{};uintptr_t cpu{},gpu{};uint32_t count{},increment{};};
+struct Heap {uintptr_t owner{};uint64_t generation{};uintptr_t cpu{},gpu{};uint32_t count{},increment{};bool operator==(const Heap&)const=default;};
 struct NativeBind {uintptr_t cpu{},layout{};uint32_t id{},slot{},stage{},mip{},tableIndex{},rootIndex{},relative{};bool valid{};bool operator==(const NativeBind&)const=default;};
 void InvalidateNativeIntent(std::array<NativeBind,512>& native)noexcept{if(EditorUiSeparationEnabled()){for(auto& b:native)b.valid=false;}else native={};}
 struct RootTable {uintptr_t gpu{},cpu{},layout{};uint32_t count{},tableIndex{};bool proven{};};
@@ -113,7 +114,7 @@ void ForgetUiCbvHeapLocked(const Heap& heap){
  if(!UiRasterDiagnosticsEnabled()||!heap.increment)return;
  for(auto& d:S().descriptors)if(d.cbv.known&&d.cpu>=heap.cpu&&(d.cpu-heap.cpu)%heap.increment==0&&(d.cpu-heap.cpu)/heap.increment<heap.count){d.cbv={};d.version=++S().serial;}
 }
-void Forget(Retire r){if(r.kind==ObjectKind::List){if(auto* list=S().lists.Find(r.object);list&&list->objectGeneration==r.generation){RetirePanelWitnessLocked(*list);UnpinListLocked(*list);S().lists.Retire(r.object,r.generation);cvr::stereo::scene_state::Retire(reinterpret_cast<ID3D12GraphicsCommandList*>(r.object));}return;}if(r.kind==ObjectKind::Heap){for(auto& h:S().heaps)if(h.owner==r.object&&h.generation==r.generation){ForgetUiCbvHeapLocked(h);h={};}}else{for(auto& d:S().descriptors)if(d.resource==r.object&&d.resourceGeneration==r.generation){d.resource=0;d.resourceGeneration=0;d.unorderedAccess=false;++d.version;}const ResourceKey key{r.object,r.generation};if(auto group=S().sourcesByResource.find(key);group!=S().sourcesByResource.end()){for(auto cpu:group->second)S().persistentSources.erase(cpu);S().sourcesByResource.erase(group);}for(auto& target:S().nativeDiagnostic.targets)if(target.resource==r.object&&target.generation==r.generation)target={};}}
+void Forget(Retire r){if(r.kind==ObjectKind::List){if(auto* list=S().lists.Find(r.object);list&&list->objectGeneration==r.generation){RetirePanelWitnessLocked(*list);UnpinListLocked(*list);S().lists.Retire(r.object,r.generation);cvr::stereo::scene_state::Retire(reinterpret_cast<ID3D12GraphicsCommandList*>(r.object));}return;}if(r.kind==ObjectKind::Heap){for(auto& h:S().heaps)if(h.owner==r.object&&h.generation==r.generation){ForgetUiCbvHeapLocked(h);h={};}}else{for(auto& d:S().descriptors)if(d.resource==r.object&&d.resourceGeneration==r.generation){d.view={};d.resource=0;d.resourceGeneration=0;d.unorderedAccess=false;++d.version;}const ResourceKey key{r.object,r.generation};if(auto group=S().sourcesByResource.find(key);group!=S().sourcesByResource.end()){for(auto cpu:group->second)S().persistentSources.erase(cpu);S().sourcesByResource.erase(group);}for(auto& target:S().nativeDiagnostic.targets)if(target.resource==r.object&&target.generation==r.generation)target={};}}
 void Drain(){std::vector<Retire> pending;{std::lock_guard lock(retireMutex);pending.swap(retires);}for(auto r:pending)Forget(r);}
 void RetireObject(Retire r)noexcept{try{std::unique_lock lock(S().mutex,std::try_to_lock);if(lock.owns_lock())Forget(r);else{std::lock_guard pending(retireMutex);retires.push_back(r);}}catch(...){Fail("retire-exception");}}
 const GUID lifetimeKey={0x81df78b3,0x937a,0x4b49,{0x84,0x55,0x35,0xd6,0x3c,0xd1,0x41,0x28}};
@@ -528,16 +529,16 @@ bool VerifiedBridgePipeline(const PipelineProbeRequest& probe)noexcept{
         auto& slot=cache[cursor++%cache.size()];slot={};slot.pipeline=probe.pipeline;slot.root=probe.root;slot.exact=exact;slot.pipelinePin=std::move(pipelinePin);slot.rootPin=std::move(rootPin);return exact;
     }catch(...){return false;}
 }
-TransferLocations UsedTransferLocations(uintptr_t pipeline,uintptr_t root)noexcept{
-    struct Proof {uintptr_t pipeline{},root{};TransferLocations locations;ComPtr<ID3D12PipelineState> pipelinePin;ComPtr<ID3D12RootSignature> rootPin;};
+TransferLocations UsedTransferLocations(uintptr_t pipeline,uintptr_t root,bool editorClassification=false)noexcept{
+    struct Proof {uintptr_t pipeline{},root{};bool editorClassification{};TransferLocations locations;ComPtr<ID3D12PipelineState> pipelinePin;ComPtr<ID3D12RootSignature> rootPin;};
     static std::mutex mutex;static std::array<Proof,32> cache{};static uint32_t cursor{};
     try{
-        {std::lock_guard lock(mutex);for(const auto& entry:cache)if(entry.pipeline==pipeline&&entry.root==root&&entry.pipelinePin&&entry.rootPin)return entry.locations;}
+        {std::lock_guard lock(mutex);for(const auto& entry:cache)if(entry.pipeline==pipeline&&entry.root==root&&entry.editorClassification==editorClassification&&entry.pipelinePin&&entry.rootPin)return entry.locations;}
         ComPtr<ID3D12PipelineState> pipelinePin(reinterpret_cast<ID3D12PipelineState*>(pipeline));ComPtr<ID3D12RootSignature> rootPin(reinterpret_cast<ID3D12RootSignature*>(root));
         PipelineShaderEvidence shader;TransferLocations result;result.shaderKnown=QueryPipelineShaders(pipeline,shader);if(result.shaderKnown)result.shader=shader;
-        if(result.shaderKnown&&shader.srvBindingsKnown&&shader.srvBindingCount<=shader.srvBindings.size())result.known=ResolvePixelSrvLocations(root,shader,result.rows,result.count)&&result.count<=result.rows.size();
+        if(result.shaderKnown&&shader.srvBindingsKnown&&shader.srvBindingCount<=shader.srvBindings.size())result.known=ResolvePixelSrvLocations(root,shader,result.rows,result.count,editorClassification&&EditorUiShaderLayout(shader)==UiEditorShaderLayout::BinkColorConvert)&&result.count<=result.rows.size();
         if(!result.known)result.count=0;
-        std::lock_guard lock(mutex);auto& slot=cache[cursor++%cache.size()];slot={};slot.pipeline=pipeline;slot.root=root;slot.locations=result;slot.pipelinePin=std::move(pipelinePin);slot.rootPin=std::move(rootPin);return result;
+        std::lock_guard lock(mutex);auto& slot=cache[cursor++%cache.size()];slot={};slot.pipeline=pipeline;slot.root=root;slot.editorClassification=editorClassification;slot.locations=result;slot.pipelinePin=std::move(pipelinePin);slot.rootPin=std::move(rootPin);return result;
     }catch(...){return {};}
 }
 ComputeLocations UsedComputeLocations(uintptr_t pipeline,uintptr_t root)noexcept{
@@ -763,7 +764,7 @@ UiEditorDrawProof InspectEditorUiDraw(ID3D12GraphicsCommandList* list,UINT eleme
   out.kind=UiEditorDrawKind::Unknown;out.scope=lease.metadata;out.scopeLifetime=lease.lifetime;out.list=reinterpret_cast<uintptr_t>(list);out.nativeNode=cvr::detail::t_current_node_work;
   if(NativeList()!=out.list||out.nativeNode!=reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr))+0x20A264)return out;
   uintptr_t root{},pipeline{};ComPtr<ID3D12RootSignature> rootPin;ComPtr<ID3D12PipelineState> pipelinePin;
-  {std::lock_guard lock(S().mutex);auto* l=FindList(out.list);if(!l||l->closed||l->submitted||l->overflow||!S().alias||!SamePreview(S().alias->scope,out.scope)||S().alias->scope.controllerIdentity!=out.scope.controllerIdentity)return out;
+  {std::lock_guard lock(S().mutex);Drain();auto* l=FindList(out.list);if(!l||l->closed||l->submitted||l->overflow||!S().alias||!SamePreview(S().alias->scope,out.scope)||S().alias->scope.controllerIdentity!=out.scope.controllerIdentity)return out;
    out.objectGeneration=l->objectGeneration;out.recordingGeneration=l->generation;out.aliasID=S().alias->readID;out.aliasLifetime=S().alias;
    uint32_t count{};for(size_t i=0;i<l->targets.size();++i)if(l->targets[i]){++count;out.targetResource=l->targets[i];out.targetGeneration=l->targetGenerations[i];}if(count!=1||!out.targetGeneration||Buffer(out.targetResource))return out;
    out.targetOwner=reinterpret_cast<ID3D12Resource*>(out.targetResource);
@@ -775,31 +776,32 @@ UiEditorDrawProof InspectEditorUiDraw(ID3D12GraphicsCommandList* list,UINT eleme
   }
   // Cache locks and root deserialization are always outside S().mutex.
   diag.stage="psv-query";diag.reason="query-incomplete";
-  const auto locations=UsedTransferLocations(pipeline,root);
+  const auto locations=UsedTransferLocations(pipeline,root,true);
   diag.ps=locations.shader.psHash;diag.vs=locations.shader.vsHash;diag.used=locations.count;
   diag.stage="psv-layout";diag.reason=!locations.shaderKnown?"shader-unknown":!locations.known?"srv-layout-unknown":locations.count!=locations.shader.srvBindingCount?"srv-layout-count":!locations.shader.colorOutputsKnown?"color-outputs-unknown":"color-output-mask";
   if(!locations.shaderKnown||!locations.known||locations.count!=locations.shader.srvBindingCount||!locations.shader.colorOutputsKnown||locations.shader.colorOutputMask!=1)return out;
   diag.reason="non-singleton-or-non-texture2d-srv";
-  for(uint32_t i=0;i<locations.shader.srvBindingCount;++i)if(locations.shader.srvBindings[i].resourceKind!=2||locations.shader.srvBindings[i].firstRegister!=locations.shader.srvBindings[i].lastRegister)return out;
-  // The observed editor VS has no texture reads; unknown vertex shader texture
-  // usage cannot provide a negative proof from pixel PSV alone.
-  diag.stage="vertex-shader";diag.reason="vs-not-exact-qualified-ui";
-  if(locations.shader.vsHash!=0x8D749B2D19263CDFull||locations.shader.vsBytes!=3042)return out;
-  struct Binding {RootTable table{};NativeBind intent{},fresh{};uintptr_t cpu{};UiDescriptorEntry descriptor{};bool present{};};
+  const auto shaderLayout=EditorUiShaderLayout(locations.shader);
+   const bool bink=shaderLayout==UiEditorShaderLayout::BinkColorConvert;
+   // Both exact VS readsets are independently CB-only. Original geometry/CB
+   // bindings remain unchanged; the old transform diagnostics stay old-only.
+   diag.stage="vertex-shader";diag.reason="vs-or-typed-layout-not-qualified";
+   if(shaderLayout==UiEditorShaderLayout::Unknown)return out;
+   struct Binding {RootTable table{};Heap heap{};NativeBind intent{},fresh{};uintptr_t cpu{};UiDescriptorEntry descriptor{};bool present{};};
   std::array<Binding,16> bindings{};std::array<uintptr_t,4> heaps{};uintptr_t aliasCPU{};UiDescriptorEntry aliasDescriptor{};
   diag.stage="binding-snapshot";diag.reason="list-or-alias-changed";
-  {std::lock_guard lock(S().mutex);auto* l=FindList(out.list);if(!l||l->objectGeneration!=out.objectGeneration||l->generation!=out.recordingGeneration||l->closed||l->submitted||l->root!=root||l->pipeline!=pipeline||S().alias.get()!=out.aliasLifetime.get())return out;
+  {std::lock_guard lock(S().mutex);Drain();auto* l=FindList(out.list);if(!l||l->objectGeneration!=out.objectGeneration||l->generation!=out.recordingGeneration||l->closed||l->submitted||l->root!=root||l->pipeline!=pipeline||S().alias.get()!=out.aliasLifetime.get())return out;
    heaps=l->heaps;aliasCPU=S().alias->readCPU;if(const auto* a=GetDescriptor(aliasCPU))aliasDescriptor=*a;
     for(uint32_t n=0;n<locations.count;++n){const auto loc=locations.rows[n];if(loc.rootIndex>=l->tables.size()){diag.reason="root-index-out-of-range";diag.first=n;diag.srvRoot=loc.rootIndex;diag.offset=loc.descriptorOffset;return out;}auto& b=bindings[n];b.table=l->tables[loc.rootIndex];
-     for(const auto& intent:l->native)if(intent.id&&intent.stage==2&&intent.rootIndex==loc.rootIndex&&intent.relative==loc.descriptorOffset){if(b.intent.id){diag.reason="multiple-native-intents";diag.first=n;diag.srvRoot=loc.rootIndex;diag.offset=loc.descriptorOffset;return out;}b.intent=intent;}
+     if(!bink||locations.shader.srvBindings[n].resourceKind==2)for(const auto& intent:l->native)if(intent.id&&intent.stage==2&&intent.rootIndex==loc.rootIndex&&intent.relative==loc.descriptorOffset){if(b.intent.id){diag.reason="multiple-native-intents";diag.first=n;diag.srvRoot=loc.rootIndex;diag.offset=loc.descriptorOffset;return out;}b.intent=intent;}
     for(const auto& h:S().heaps){bool bound=false;for(auto id:heaps)bound|=id==h.owner;if(!bound||!h.owner||!h.gpu||!h.increment||b.table.gpu<h.gpu)continue;const auto delta=b.table.gpu-h.gpu;
      if(delta%h.increment||delta/h.increment>=h.count||b.table.count>h.count-delta/h.increment||!b.table.proven||b.table.cpu!=h.cpu+delta||loc.descriptorOffset>=b.table.count)continue;
-     b.cpu=b.table.cpu+uintptr_t(loc.descriptorOffset)*h.increment;if(const auto* d=GetDescriptor(b.cpu)){b.descriptor=*d;b.present=true;}break;
+     b.heap=h;b.cpu=b.table.cpu+uintptr_t(loc.descriptorOffset)*h.increment;if(const auto* d=GetDescriptor(b.cpu)){b.descriptor=*d;b.present=true;}break;
     }
    }
   }
   diag.stage="native-binding-refresh";diag.reason="refresh-incomplete";
-  for(uint32_t n=0;n<locations.count;++n)bindings[n].fresh=RefreshEditorNative(out.list,bindings[n].intent);
+  for(uint32_t n=0;n<locations.count;++n)if(!bink||locations.shader.srvBindings[n].resourceKind==2)bindings[n].fresh=RefreshEditorNative(out.list,bindings[n].intent);
   diag.stage="binding-freshness";diag.reason="native-list-node-or-scope-changed";
   if(NativeList()!=out.list||cvr::detail::t_current_node_work!=out.nativeNode||!Current(out.scope))return out;
   EditorDrawEvidence evidence{true,true,true,true,locations.count};
@@ -809,7 +811,7 @@ UiEditorDrawProof InspectEditorUiDraw(ID3D12GraphicsCommandList* list,UINT eleme
    diag.intentID=b.intent.id;diag.freshID=b.fresh.id;diag.freshValid=b.fresh.valid;diag.present=b.present;
    diag.pending=b.descriptor.pending;diag.unordered=b.descriptor.unorderedAccess;diag.cbv=b.descriptor.cbvOnly;diag.overlap=b.descriptor.overlap;};
   diag.stage="binding-revalidation";diag.reason="list-root-heaps-or-alias-changed";
-  {std::lock_guard lock(S().mutex);auto* l=FindList(out.list);if(!l||l->objectGeneration!=out.objectGeneration||l->generation!=out.recordingGeneration||l->closed||l->submitted||l->overflow||l->root!=root||l->pipeline!=pipeline||l->heaps!=heaps||S().alias.get()!=out.aliasLifetime.get())return out;
+  {std::lock_guard lock(S().mutex);Drain();auto* l=FindList(out.list);if(!l||l->objectGeneration!=out.objectGeneration||l->generation!=out.recordingGeneration||l->closed||l->submitted||l->overflow||l->root!=root||l->pipeline!=pipeline||l->heaps!=heaps||S().alias.get()!=out.aliasLifetime.get())return out;
     diag.reason="target-binding-changed";
     uint32_t targets{};for(size_t i=0;i<l->targets.size();++i)if(l->targets[i]){++targets;if(l->targets[i]!=out.targetResource||l->targetGenerations[i]!=out.targetGeneration)return out;}if(targets!=1)return out;
     diag.reason="alias-descriptor-changed";
@@ -817,12 +819,21 @@ UiEditorDrawProof InspectEditorUiDraw(ID3D12GraphicsCommandList* list,UINT eleme
     diag.reason="target-qualification-changed";
     const auto* target=FindTrackedTargetLocked(out.targetResource,out.targetGeneration);if(!target||target->editorSubmission!=out.qualifiedSubmission||!SamePreview(target->editorScope,out.scope))return out;
     for(uint32_t n=0;n<locations.count;++n){auto& b=bindings[n];const auto loc=locations.rows[n];const auto& now=l->tables[loc.rootIndex];if(now.gpu!=b.table.gpu||now.cpu!=b.table.cpu||now.layout!=b.table.layout||now.tableIndex!=b.table.tableIndex||now.count!=b.table.count||now.proven!=b.table.proven){diag.reason="root-table-changed";firstIssue(n);return out;}
-     const auto* d=b.cpu?GetDescriptor(b.cpu):nullptr;if(bool(d)!=b.present||(d&&(d->version!=b.descriptor.version||d->resource!=b.descriptor.resource||d->resourceGeneration!=b.descriptor.resourceGeneration||d->pending!=b.descriptor.pending))){diag.reason="descriptor-version-or-resource-changed";firstIssue(n);return out;}
+     if(bink){bool heapCurrent=false;for(const auto& h:S().heaps)heapCurrent|=h.owner&&h==b.heap;if(!heapCurrent){diag.reason="typed-heap-generation-changed";firstIssue(n);return out;}}
+     const auto* d=b.cpu?GetDescriptor(b.cpu):nullptr;if(bool(d)!=b.present||(d&&(d->version!=b.descriptor.version||d->resource!=b.descriptor.resource||d->resourceGeneration!=b.descriptor.resourceGeneration||d->pending!=b.descriptor.pending||(bink&&d->view!=b.descriptor.view)))){diag.reason="descriptor-version-or-resource-changed";firstIssue(n);return out;}
      if(b.intent.id&&!(l->native[b.intent.stage*128+b.intent.slot]==b.intent)){diag.reason="native-intent-changed";firstIssue(n);return out;}
     // A known overwrite/UAV/CBV conflict defeats even a native-ID negative
     // proof. Missing resource ledger is allowed; known mutation is not.
      if(d&&(d->pending||d->unorderedAccess||d->cbvOnly||d->overlap)){++diag.unknownCount;diag.unknownMask|=1u<<n;if(diag.first==UINT32_MAX)unknownReason="descriptor-mutation-or-kind-conflict";firstIssue(n);evidence.unknown=true;continue;}
-    const bool native=b.cpu&&b.fresh.valid&&UiSelectedBinding(b.fresh.layout,b.fresh.tableIndex,b.fresh.rootIndex,b.fresh.relative,now.layout,now.tableIndex,loc.rootIndex,now.count)&&b.fresh.relative==loc.descriptorOffset;
+    const UiSrvIdentity typedIdentity{d?d->resource:0,d?d->resourceGeneration:0,d?d->version:0,d!=nullptr,d&&d->pending,d&&d->overlap,d&&d->unorderedAccess,d&&d->cbvOnly};
+     if(bink&&locations.shader.srvBindings[n].resourceKind==12){
+      const bool known=d&&UiBinkBufferKnown(d->view,typedIdentity);
+      if(known&&d->resource==aliasDescriptor.resource&&d->resourceGeneration==aliasDescriptor.resourceGeneration){firstIssue(n);evidence.conflict=true;}
+      else if(known){++evidence.nonAlias;++diag.ledgerKnown;}
+      else{++diag.unknownCount;diag.unknownMask|=1u<<n;if(diag.first==UINT32_MAX)unknownReason="structured-buffer-view-unproven";firstIssue(n);evidence.unknown=true;}
+      continue;
+     }
+     const bool native=b.cpu&&b.fresh.valid&&UiSelectedBinding(b.fresh.layout,b.fresh.tableIndex,b.fresh.rootIndex,b.fresh.relative,now.layout,now.tableIndex,loc.rootIndex,now.count)&&b.fresh.relative==loc.descriptorOffset;
     const bool ledger=d&&!d->pending&&!d->unorderedAccess&&d->resource&&d->resourceGeneration&&!aliasDescriptor.pending&&!aliasDescriptor.unorderedAccess&&aliasDescriptor.resource&&aliasDescriptor.resourceGeneration;
      diag.nativeKnown+=unsigned(native);diag.ledgerKnown+=unsigned(ledger);
     const bool nativeAlias=native&&b.fresh.id==out.aliasID&&b.fresh.cpu==aliasCPU;
@@ -831,7 +842,8 @@ UiEditorDrawProof InspectEditorUiDraw(ID3D12GraphicsCommandList* list,UINT eleme
     const bool ledgerOther=ledger&&!ledgerAlias;
      if(native&&(b.fresh.id==out.aliasID)!=(b.fresh.cpu==aliasCPU)){firstIssue(n);evidence.conflict=true;}
      if((nativeAlias&&ledgerOther)||(nativeOther&&ledgerAlias)){firstIssue(n);evidence.conflict=true;}
-    if(nativeAlias||ledgerAlias){++evidence.alias;out.nativeBindingKnown=native;out.nativeID=b.fresh.id;out.descriptorCPU=b.cpu;out.descriptorVersion=d?d->version:0;out.sourceResource=aliasDescriptor.resource;out.sourceGeneration=aliasDescriptor.resourceGeneration;}
+    if(bink&&!nativeAlias&&!ledgerAlias&&(!d||!UiBinkTextureKnown(d->view,typedIdentity))){++diag.unknownCount;diag.unknownMask|=1u<<n;if(diag.first==UINT32_MAX)unknownReason="texture-view-unproven";firstIssue(n);evidence.unknown=true;continue;}
+     if(nativeAlias||ledgerAlias){++evidence.alias;out.nativeBindingKnown=native;out.nativeID=b.fresh.id;out.descriptorCPU=b.cpu;out.descriptorVersion=d?d->version:0;out.sourceResource=aliasDescriptor.resource;out.sourceGeneration=aliasDescriptor.resourceGeneration;}
      else if(nativeOther||ledgerOther)++evidence.nonAlias;else {++diag.unknownCount;diag.unknownMask|=1u<<n;if(diag.first==UINT32_MAX)unknownReason=!b.cpu?"table-or-heap-unproven":!b.intent.id?"native-intent-missing-and-ledger-unknown":!b.fresh.valid?"native-refresh-invalid-and-ledger-unknown":"native-range-unproven-and-ledger-unknown";firstIssue(n);evidence.unknown=true;}
    }
    if(out.sourceResource)for(size_t i=0;i<S().portraitPins.size();++i)if(reinterpret_cast<uintptr_t>(S().portraitPins[i].Get())==out.sourceResource&&S().portraitGenerations[i]==out.sourceGeneration)out.sourceOwner=S().portraitPins[i];
@@ -993,8 +1005,8 @@ void UiDescriptorHeapCreated(ID3D12Device* device,ID3D12DescriptorHeap* heap)noe
  for(const auto& h:S().heaps)registeredCount+=unsigned(h.owner!=0);
  if(next.generation&&!registered)Fail("shader-visible-heap-capacity");
  if(emit)Log("[MenuPreviewUI] ui-heap-created owner=%llx unknown=%llx qi=%X generation=%llu cpu=%llx gpu=%llx count=%u increment=%u flags=%X registered=%u registeredHeapCount=%u; live COM args, identity released\n",next.owner,reinterpret_cast<uintptr_t>(identity.Get()),unsigned(qi),next.generation,next.cpu,next.gpu,next.count,next.increment,unsigned(d.Flags),unsigned(registered),registeredCount);});}
-UiDescriptorMutation BeginUiSrvWrite(D3D12_CPU_DESCRIPTOR_HANDLE handle)noexcept{UiDescriptorMutation result;Safe([&]{std::lock_guard lock(S().mutex);Drain();DropPersistentSourceLocked(handle.ptr);auto* d=GetDescriptor(handle.ptr,true);if(!d)return;result=NewMutation(1);auto m=result.state;if(!m)return;m->destinations[0]=handle.ptr;UiBeginDescriptorMutation(d->version,d->inFlight,d->overlap,m->token);m->enlisted[0]=1;d->pending=true;if(UiRasterDiagnosticsEnabled()){d->cbvOnly=false;d->cbv={};}d->resource=0;d->resourceGeneration=0;d->unorderedAccess=false;});return result;}
-UiDescriptorMutation BeginUiDescriptorOverwrite(D3D12_CPU_DESCRIPTOR_HANDLE handle)noexcept{UiDescriptorMutation result;Safe([&]{std::lock_guard lock(S().mutex);Drain();DropPersistentSourceLocked(handle.ptr);if(auto* d=GetDescriptor(handle.ptr)){result=NewMutation(1);auto m=result.state;if(!m)return;m->destinations[0]=handle.ptr;UiBeginDescriptorMutation(d->version,d->inFlight,d->overlap,m->token);m->enlisted[0]=1;d->pending=true;if(UiRasterDiagnosticsEnabled())d->cbv={};d->resource=0;d->resourceGeneration=0;d->unorderedAccess=false;}});return result;}
+UiDescriptorMutation BeginUiSrvWrite(D3D12_CPU_DESCRIPTOR_HANDLE handle)noexcept{UiDescriptorMutation result;Safe([&]{std::lock_guard lock(S().mutex);Drain();DropPersistentSourceLocked(handle.ptr);auto* d=GetDescriptor(handle.ptr,true);if(!d)return;result=NewMutation(1);auto m=result.state;if(!m)return;m->destinations[0]=handle.ptr;UiBeginDescriptorMutation(d->version,d->inFlight,d->overlap,m->token);m->enlisted[0]=1;d->pending=true;if(UiRasterDiagnosticsEnabled()){d->cbvOnly=false;d->cbv={};}d->view={};d->resource=0;d->resourceGeneration=0;d->unorderedAccess=false;});return result;}
+UiDescriptorMutation BeginUiDescriptorOverwrite(D3D12_CPU_DESCRIPTOR_HANDLE handle)noexcept{UiDescriptorMutation result;Safe([&]{std::lock_guard lock(S().mutex);Drain();DropPersistentSourceLocked(handle.ptr);if(auto* d=GetDescriptor(handle.ptr)){result=NewMutation(1);auto m=result.state;if(!m)return;m->destinations[0]=handle.ptr;UiBeginDescriptorMutation(d->version,d->inFlight,d->overlap,m->token);m->enlisted[0]=1;d->pending=true;if(UiRasterDiagnosticsEnabled())d->cbv={};d->view={};d->resource=0;d->resourceGeneration=0;d->unorderedAccess=false;}});return result;}
 UiDescriptorMutation BeginUiCbvWrite(D3D12_CPU_DESCRIPTOR_HANDLE handle)noexcept{
  if(!UiRasterDiagnosticsEnabled()||!UiConsumerEnabled()||S().failed.load())return {};
  Lease lease;if(!TryAcquireCurrent(lease)||lease.metadata.screen!=2)return BeginUiDescriptorOverwrite(handle);
@@ -1004,7 +1016,7 @@ UiDescriptorMutation BeginUiCbvWrite(D3D12_CPU_DESCRIPTOR_HANDLE handle)noexcept
   if(next.state)if(auto* d=GetUiCbvDescriptorLocked(handle.ptr)){
    DropPersistentSourceLocked(handle.ptr);result=std::move(next);auto& m=*result.state;m.cbvDiagnostic=true;m.destinations[0]=handle.ptr;
    UiBeginDescriptorMutation(d->version,d->inFlight,d->overlap,m.token);m.enlisted[0]=1;
-   d->pending=true;d->cbvOnly=true;d->cbv={};d->resource=0;d->resourceGeneration=0;d->unorderedAccess=false;
+   d->pending=true;d->cbvOnly=true;d->cbv={};d->view={};d->resource=0;d->resourceGeneration=0;d->unorderedAccess=false;
   }
  }catch(...){} // Diagnostic capacity/allocation loss must not fail the pixel observer.
  if(!result)return BeginUiDescriptorOverwrite(handle); // Preserve ordinary overwrite revocation even when diagnostic capture drops.
@@ -1020,13 +1032,22 @@ void FinishUiCbvWrite(UiDescriptorMutation token,const D3D12_CONSTANT_BUFFER_VIE
   std::lock_guard lock(S().mutex);Drain();if(m->finished)return;m->finished=true;if(!m->enlisted[0])return;
   auto* d=GetDescriptor(handle.ptr);if(!d||m->destinations[0]!=handle.ptr)return;
   const bool accepted=UiFinishEnlistedMutation(true,d->version,d->inFlight,d->overlap,m->token);
-  d->pending=d->inFlight!=0;d->cbv={};d->resource=0;d->resourceGeneration=0;d->unorderedAccess=false;
+  d->pending=d->inFlight!=0;d->cbv={};d->view={};d->resource=0;d->resourceGeneration=0;d->unorderedAccess=false;
   if(accepted&&!d->pending){d->cbv=payload;d->originCPU=handle.ptr;d->originVersion=m->token;}
   // CBVs never enter the resource/SRV persistent source registry. Eviction is unknown.
  });
 }
-void FinishUiSrvWrite(UiDescriptorMutation token,ID3D12Resource* resource,D3D12_CPU_DESCRIPTOR_HANDLE handle,bool unorderedAccess)noexcept{Safe([&]{auto m=std::move(token.state);if(!m)return;const auto generation=TrackObject(resource,ObjectKind::Resource);std::lock_guard lock(S().mutex);Drain();if(m->finished)return;m->finished=true;if(!m->enlisted[0])return;auto* d=GetDescriptor(handle.ptr);if(!d||m->destinations[0]!=handle.ptr)return;
- const bool accepted=UiFinishEnlistedMutation(m->enlisted[0]!=0,d->version,d->inFlight,d->overlap,m->token);if(UiRasterDiagnosticsEnabled())d->cbv={};d->pending=d->inFlight!=0;if(accepted){d->resource=generation?reinterpret_cast<uintptr_t>(resource):0;d->resourceGeneration=generation;d->originCPU=handle.ptr;d->originVersion=m->token;d->unorderedAccess=unorderedAccess;if(!d->pending){PutPersistentSourceLocked(*d);if(!unorderedAccess)RememberTargetDescriptorLocked(d->resource,generation,d->cpu,d->version,false);}}else{if(UiRasterDiagnosticsEnabled())d->cbv={};d->resource=0;d->resourceGeneration=0;d->unorderedAccess=false;}
+void FinishUiSrvWrite(UiDescriptorMutation token,ID3D12Resource* resource,D3D12_CPU_DESCRIPTOR_HANDLE handle,bool unorderedAccess,const D3D12_SHADER_RESOURCE_VIEW_DESC* desc)noexcept{Safe([&]{auto m=std::move(token.state);if(!m)return;const auto generation=TrackObject(resource,ObjectKind::Resource);
+ UiSrvView view;
+ if(resource&&desc&&!unorderedAccess){view.known=true;view.resourceGeneration=generation;view.dimension=desc->ViewDimension;view.format=desc->Format;
+  if(desc->ViewDimension==D3D12_SRV_DIMENSION_BUFFER){view.firstElement=desc->Buffer.FirstElement;view.elements=desc->Buffer.NumElements;view.stride=desc->Buffer.StructureByteStride;view.flags=desc->Buffer.Flags;
+   // Caller-valid CreateSRV context only; classification never dereferences a
+   // retained resource pointer or reads parameter/GPU bytes.
+   if(view.format==DXGI_FORMAT_UNKNOWN&&view.stride==96&&view.flags==D3D12_BUFFER_SRV_FLAG_NONE&&view.elements){const auto resourceDesc=resource->GetDesc();view.resourceDimension=resourceDesc.Dimension;view.resourceWidth=resourceDesc.Width;}
+  }
+ }
+ std::lock_guard lock(S().mutex);Drain();if(m->finished)return;m->finished=true;if(!m->enlisted[0])return;auto* d=GetDescriptor(handle.ptr);if(!d||m->destinations[0]!=handle.ptr)return;
+ const bool accepted=UiFinishEnlistedMutation(m->enlisted[0]!=0,d->version,d->inFlight,d->overlap,m->token);if(UiRasterDiagnosticsEnabled())d->cbv={};d->pending=d->inFlight!=0;if(accepted){d->view=d->pending?UiSrvView{}:view;d->resource=generation?reinterpret_cast<uintptr_t>(resource):0;d->resourceGeneration=generation;d->originCPU=handle.ptr;d->originVersion=m->token;d->unorderedAccess=unorderedAccess;if(!d->pending){PutPersistentSourceLocked(*d);if(!unorderedAccess)RememberTargetDescriptorLocked(d->resource,generation,d->cpu,d->version,false);}}else{if(UiRasterDiagnosticsEnabled())d->cbv={};d->view={};d->resource=0;d->resourceGeneration=0;d->unorderedAccess=false;}
  if(S().alias){bool writerMatch=false;for(size_t i=0;i<S().portraitPins.size();++i)if(resource&&S().portraitPins[i].Get()==resource&&S().portraitGenerations[i]==generation)writerMatch=true;
   if(accepted&&writerMatch&&!S().nativeDiagnostic.writerDescriptorKnown){S().nativeDiagnostic.writerDescriptorKnown=true;++S().nativeDiagnostic.lineageRevision;}
   if(S().nativeDiagnostic.srvRows<8)
@@ -1037,7 +1058,7 @@ UiDescriptorMutation BeginUiDescriptorCopy(ID3D12Device* device,UINT dc,const D3
  if(UiCanSkipInactiveSingleCopy(dc,ds,dz,state.descriptorIndex,state.persistentSources,
      []()noexcept{return CurrentPreviewObservationEpoch();}))return;
  const auto inc=device->GetDescriptorHandleIncrementSize(type);std::lock_guard lock(state.mutex);Drain();
- auto invalidate=[&]{for(auto& d:S().descriptors){bool affected=!inc||dc>128||!ds;for(UINT i=0;!affected&&i<dc;++i){const uint64_t n=dz?dz[i]:1;const auto start=ds[i].ptr;if(d.cpu>=start&&(d.cpu-start)/inc<n&&(d.cpu-start)%inc==0)affected=true;}if(affected){if(UiRasterDiagnosticsEnabled())d.cbv={};d.resource=0;d.resourceGeneration=0;d.overlap=d.inFlight!=0;d.pending=d.inFlight!=0;d.version=++S().serial;}}
+ auto invalidate=[&]{for(auto& d:S().descriptors){bool affected=!inc||dc>128||!ds;for(UINT i=0;!affected&&i<dc;++i){const uint64_t n=dz?dz[i]:1;const auto start=ds[i].ptr;if(d.cpu>=start&&(d.cpu-start)/inc<n&&(d.cpu-start)%inc==0)affected=true;}if(affected){if(UiRasterDiagnosticsEnabled())d.cbv={};d.view={};d.resource=0;d.resourceGeneration=0;d.overlap=d.inFlight!=0;d.pending=d.inFlight!=0;d.version=++S().serial;}}
   if(!inc||dc>128||!ds){S().persistentSources.clear();S().sourcesByResource.clear();return;}
   for(auto it=S().persistentSources.begin();it!=S().persistentSources.end();){bool affected=false;for(UINT i=0;!affected&&i<dc;++i){const auto start=ds[i].ptr;const uint64_t n=dz?dz[i]:1;affected=it->first>=start&&(it->first-start)%inc==0&&(it->first-start)/inc<n;}const auto cpu=it->first;++it;if(affected)DropPersistentSourceLocked(cpu);}
  };
@@ -1051,10 +1072,11 @@ UiDescriptorMutation BeginUiDescriptorCopy(ID3D12Device* device,UINT dc,const D3
  if(trackNewDestinations)for(UINT i=0;i<sc&&!observed;++i){const UINT n=sz?sz[i]:1;for(UINT j=0;j<n;++j)if(GetDescriptor(ss[i].ptr+uintptr_t(j)*inc)){observed=true;break;}}
  for(UINT i=0;i<dc&&!observed;++i){const UINT n=dz?dz[i]:1;for(UINT j=0;j<n;++j)if(GetDescriptor(ds[i].ptr+uintptr_t(j)*inc)){observed=true;break;}}
  if(!observed)return;
- result=NewMutation(size_t(totalD));auto m=result.state;if(!m)return;size_t index{};for(UINT i=0;i<sc;++i){const UINT n=sz?sz[i]:1;for(UINT j=0;j<n;++j){if(auto* d=GetDescriptor(ss[i].ptr+uintptr_t(j)*inc);d&&!d->pending)m->sources[index]=*d;++index;}}index=0;for(UINT i=0;i<dc;++i){const UINT n=dz?dz[i]:1;for(UINT j=0;j<n;++j)m->destinations[index++]=ds[i].ptr+uintptr_t(j)*inc;}for(size_t i=0;i<m->destinations.size();++i){const bool knownDestination=GetDescriptor(m->destinations[i])!=nullptr;DropPersistentSourceLocked(m->destinations[i]);const bool cbvSource=UiRasterDiagnosticsEnabled()&&!m->sources[i].resource&&m->sources[i].cbv.known;auto* d=cbvSource&&!knownDestination?(trackNewDestinations?GetUiCbvDescriptorLocked(m->destinations[i]):nullptr):GetDescriptor(m->destinations[i],knownDestination||(trackNewDestinations&&m->sources[i].resource!=0));if(!d)continue;UiBeginDescriptorMutation(d->version,d->inFlight,d->overlap,m->token);m->enlisted[i]=1;d->pending=true;if(UiRasterDiagnosticsEnabled())d->cbv={};d->resource=0;d->resourceGeneration=0;}});return result;}
+ result=NewMutation(size_t(totalD));auto m=result.state;if(!m)return;size_t index{};for(UINT i=0;i<sc;++i){const UINT n=sz?sz[i]:1;for(UINT j=0;j<n;++j){if(auto* d=GetDescriptor(ss[i].ptr+uintptr_t(j)*inc);d&&!d->pending)m->sources[index]=*d;++index;}}index=0;for(UINT i=0;i<dc;++i){const UINT n=dz?dz[i]:1;for(UINT j=0;j<n;++j)m->destinations[index++]=ds[i].ptr+uintptr_t(j)*inc;}for(size_t i=0;i<m->destinations.size();++i){const bool knownDestination=GetDescriptor(m->destinations[i])!=nullptr;DropPersistentSourceLocked(m->destinations[i]);const bool cbvSource=UiRasterDiagnosticsEnabled()&&!m->sources[i].resource&&m->sources[i].cbv.known;auto* d=cbvSource&&!knownDestination?(trackNewDestinations?GetUiCbvDescriptorLocked(m->destinations[i]):nullptr):GetDescriptor(m->destinations[i],knownDestination||(trackNewDestinations&&m->sources[i].resource!=0));if(!d)continue;UiBeginDescriptorMutation(d->version,d->inFlight,d->overlap,m->token);m->enlisted[i]=1;d->pending=true;if(UiRasterDiagnosticsEnabled())d->cbv={};d->view={};d->resource=0;d->resourceGeneration=0;}});return result;}
 void FinishUiDescriptorCopy(UiDescriptorMutation token)noexcept{Safe([&]{auto m=std::move(token.state);if(!m)return;std::lock_guard lock(S().mutex);Drain();if(m->finished)return;m->finished=true;for(size_t i=0;i<m->destinations.size();++i){if(!m->enlisted[i])continue;auto* dest=GetDescriptor(m->destinations[i]);const auto* original=GetDescriptor(m->sources[i].cpu);if(!dest)continue;const bool accepted=UiFinishEnlistedMutation(m->enlisted[i]!=0,dest->version,dest->inFlight,dest->overlap,m->token);dest->pending=dest->inFlight!=0;if(UiRasterDiagnosticsEnabled())dest->cbv={};
   const bool sourceCurrent=original&&!original->pending&&original->version==m->sources[i].version;
-  if(accepted&&sourceCurrent){if(UiRasterDiagnosticsEnabled()&&!m->sources[i].resource){dest->cbv=m->sources[i].cbv;if(dest->cbv.known)dest->cbvOnly=true;}if(UiRasterDiagnosticsEnabled()&&m->sources[i].resource)dest->cbvOnly=false;dest->resource=m->sources[i].resource;dest->resourceGeneration=m->sources[i].resourceGeneration;dest->originCPU=m->sources[i].originCPU;dest->originVersion=m->sources[i].originVersion;dest->unorderedAccess=m->sources[i].unorderedAccess;if(!dest->pending&&!dest->unorderedAccess)RememberTargetDescriptorLocked(dest->resource,dest->resourceGeneration,dest->cpu,dest->version,true);}else{dest->resource=0;dest->resourceGeneration=0;dest->unorderedAccess=false;}
+  dest->view=UiCopiedSrvView(m->sources[i].view,accepted,sourceCurrent,dest->pending);
+  if(accepted&&sourceCurrent){if(UiRasterDiagnosticsEnabled()&&!m->sources[i].resource){dest->cbv=m->sources[i].cbv;if(dest->cbv.known)dest->cbvOnly=true;}if(UiRasterDiagnosticsEnabled()&&m->sources[i].resource)dest->cbvOnly=false;dest->resource=m->sources[i].resource;dest->resourceGeneration=m->sources[i].resourceGeneration;dest->originCPU=m->sources[i].originCPU;dest->originVersion=m->sources[i].originVersion;dest->unorderedAccess=m->sources[i].unorderedAccess;if(!dest->pending&&!dest->unorderedAccess)RememberTargetDescriptorLocked(dest->resource,dest->resourceGeneration,dest->cpu,dest->version,true);}else{dest->view={};dest->resource=0;dest->resourceGeneration=0;dest->unorderedAccess=false;}
   if(S().alias){const auto& source=m->sources[i];bool writerMatch=false;for(size_t p=0;p<S().portraitPins.size();++p)if(S().portraitPins[p]&&source.resource==reinterpret_cast<uintptr_t>(S().portraitPins[p].Get())&&source.resourceGeneration==S().portraitGenerations[p])writerMatch=true;
    if(accepted&&sourceCurrent&&writerMatch&&!S().nativeDiagnostic.writerDescriptorKnown){S().nativeDiagnostic.writerDescriptorKnown=true;++S().nativeDiagnostic.lineageRevision;}
    if(accepted&&sourceCurrent&&writerMatch&&source.originCPU==S().alias->readCPU){auto& diag=S().nativeDiagnostic;diag.offscreenCopies[diag.offscreenCursor++%diag.offscreenCopies.size()]={m->destinations[i],dest->version,dest->resourceGeneration};diag.offscreenReady=true;++diag.offscreenRevision;

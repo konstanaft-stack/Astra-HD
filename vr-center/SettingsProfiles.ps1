@@ -1,4 +1,5 @@
 . "$PSScriptRoot/Components.ps1"
+. "$PSScriptRoot/NativeRequiredIni.ps1"
 function Get-SettingsModePaths($Config,$State){
     $version=[string]$State.receipt.version
     if(-not $version){throw 'Сначала установи VR-порт.'}
@@ -18,7 +19,41 @@ function Initialize-FirstPortSettings($Config,$State){
     $paths=Get-SettingsModePaths $Config $State
     # Apply the selected author's preset once. A saved choice, including Custom,
     # belongs to the player and survives later applies and launches.
-    if((Test-Path -LiteralPath $paths.state) -or -not(Test-Path -LiteralPath $paths.player)){return $false}
+    if(Test-Path -LiteralPath $paths.state){
+        # A restored profile can bring back first_launch=1 independently of the
+        # saved manager choice. Honor that choice without reapplying a preset.
+        Set-RecommendedSettingsMode $Config $State (Get-RecommendedSettingsMode $Config $State) -BeforeLaunch
+        return $false
+    }
+    if(-not(Test-Path -LiteralPath $paths.player)){return $false}
+    # The installer records a validated direct native update independently of
+    # which INI wins. Validate again before inheriting preset consent; a saved
+    # child INI must not silently enable Recommended when its mode is absent.
+    $parent=[string]$State.receipt.settingsInheritedFrom
+    if($State.receipt.kind -eq 'native' -and $parent -match '^[a-zA-Z0-9_-]+$'){
+        $bundle=Read-Json (Join-Path $Config.bundle 'bundle.json')
+        $child=@($bundle.versions|Where-Object id -CEQ $paths.version)
+        $source=@($bundle.versions|Where-Object id -CEQ $parent)
+        if($child.Count -eq 1 -and $source.Count -eq 1 -and $child[0].kind -eq 'native' -and
+           $source[0].kind -eq 'native' -and [string]$child[0].parentId -ceq $parent){
+            $oldPaths=Get-SettingsModePaths $Config @{receipt=@{version=$parent;kind='native'}}
+            if(Test-Path -LiteralPath $oldPaths.state -PathType Leaf){
+                $oldMode=Read-Json $oldPaths.state
+                if([string]$oldMode.version -cne $parent -or $oldMode.recommended -isnot [bool]){
+                    throw 'Не удалось проверить сохранённый выбор настроек предыдущей сборки.'
+                }
+                $changes=@()
+                if(Test-Path -LiteralPath $oldPaths.custom -PathType Leaf){
+                    $changes+=@{path=$paths.custom;text=[IO.File]::ReadAllText($oldPaths.custom)}
+                }elseif($oldMode.recommended){throw 'Не найдена копия своих настроек предыдущей сборки.'}
+                $changes+=@{path=$paths.state;text=(@{version=$paths.version;recommended=$oldMode.recommended;inheritedFrom=$parent}|ConvertTo-Json)}
+                Write-SettingsModeFiles $Config $State $changes
+                Set-RecommendedSettingsMode $Config $State $oldMode.recommended -BeforeLaunch
+                # False means no author preset was applied (Backend's message).
+                return $false
+            }
+        }
+    }
     Set-RecommendedSettingsMode $Config $State $true
     return $true
 }
@@ -85,8 +120,27 @@ function Write-SettingsModeFiles($Config,$State,$Changes){
     }
     Write-Json (Join-Path $backup 'complete.json') @{count=$records.Count;utc=[DateTime]::UtcNow.ToString('o')}
 }
+function Get-RequiredNativeSettingsVersion($Config,$State){
+    if($State.receipt.kind -cne 'native'){return $null}
+    $bundle=Read-Json (Join-Path $Config.bundle 'bundle.json')
+    $versions=@($bundle.versions|Where-Object id -CEQ ([string]$State.receipt.version))
+    if($versions.Count -ne 1 -or $versions[0].kind -cne 'native'){throw 'Invalid installed native settings version'}
+    $null=Get-NativeRequiredIniPolicy $versions[0]
+    return $versions[0]
+}
+function Sync-NativeRequiredIni($Config,$State){
+    $v=Get-RequiredNativeSettingsVersion $Config $State
+    if(-not $v -or -not(Get-NativeRequiredIniPolicy $v)){return}
+    $paths=Get-SettingsModePaths $Config $State
+    if(-not(Test-Path -LiteralPath $paths.ini -PathType Leaf)){throw 'Required native INI missing'}
+    $ini=Read-NativeRequiredIniText $paths.ini
+    $updated=Update-NativeRequiredIniText $ini $v
+    if($updated -cne $ini){Write-SettingsModeFiles $Config $State @(@{path=$paths.ini;text=$updated})}
+}
 function Set-RecommendedSettingsMode($Config,$State,[bool]$Enabled,[switch]$BeforeLaunch){
     $paths=Get-SettingsModePaths $Config $State
+    $nativeVersion=Get-RequiredNativeSettingsVersion $Config $State
+    if($nativeVersion -and (Get-NativeRequiredIniPolicy $nativeVersion) -and -not(Test-Path -LiteralPath $paths.ini -PathType Leaf)){throw 'Required native INI missing'}
     $previous=Get-RecommendedSettingsMode $Config $State
     $changes=@()
     # A launch honors preset consent but preserves subsequent in-game changes.
@@ -102,10 +156,11 @@ function Set-RecommendedSettingsMode($Config,$State,[bool]$Enabled,[switch]$Befo
     }
     # The manager owns preset consent. A first-launch flag may not override Custom.
     if($State.receipt.kind -eq 'native' -and (Test-Path -LiteralPath $paths.ini)){
-        $ini=[IO.File]::ReadAllText($paths.ini)
+        $ini=if($nativeVersion -and (Get-NativeRequiredIniPolicy $nativeVersion)){Read-NativeRequiredIniText $paths.ini}else{[IO.File]::ReadAllText($paths.ini)}
         $updated=if($ini -match '(?m)^first_launch\s*='){
             [regex]::Replace($ini,'(?m)^first_launch\s*=[^\r\n]*','first_launch=0')
         }else{$ini+"`r`nfirst_launch=0`r`n"}
+        if($nativeVersion){$updated=Update-NativeRequiredIniText $updated $nativeVersion}
         if($updated -cne $ini){$changes+=@{path=$paths.ini;text=$updated}}
     }
     if(-not $BeforeLaunch -or -not(Test-Path -LiteralPath $paths.state)){

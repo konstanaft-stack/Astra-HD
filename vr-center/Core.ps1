@@ -69,7 +69,9 @@ function Get-PortVersionDates($Config,$Bundle,$Receipt){
             # Snapshot ids are created from local Get-Date; this is save time, never build time.
             $saved=Convert-PortTime ($Matches[1]+'-'+$Matches[2]+'-000')
         }
-        $result[$v.id]=@{builtUtc=(Convert-PortTime $v.builtUtc);downloadedUtc=(Convert-PortTime $v.downloadedUtc);installedUtc=$null;addedUtc=(Convert-PortTime $v.importedUtc);savedUtc=$saved}
+        $added=Convert-PortTime $v.addedUtc
+        if(-not $added){$added=Convert-PortTime $v.importedUtc}
+        $result[$v.id]=@{builtUtc=(Convert-PortTime $v.builtUtc);downloadedUtc=(Convert-PortTime $v.downloadedUtc);installedUtc=$null;addedUtc=$added;savedUtc=$saved}
     }
     $byHash=@{}
     foreach($f in @(Get-ChildItem -LiteralPath (Join-Path $Config.bundle 'downloads') -Filter '*.download.json' -Recurse -File -ErrorAction SilentlyContinue)){
@@ -147,6 +149,17 @@ function Get-PortState($Config){
     $loader=Join-Path $game 'bin/x64/dbghelp.dll'
     if(Test-Path $loader){$info=[Diagnostics.FileVersionInfo]::GetVersionInfo($loader);if(($info.ProductName+' '+$info.FileDescription) -match 'OptiScaler'){$components+=@{name='OptiScaler — DLL';path='bin/x64/dbghelp.dll';present=$true;version=$info.FileVersion;state='Файл установлен'}}}
     $versions=@($bundle.versions|Where-Object {-not $_.archived}|ForEach-Object { @{id=$_.id;label=$_.label;sourceLabel=$_.sourceLabel;note=$_.note;family=$_.family;tag=$_.tag;repository=$_.repository;sourceRepoId=$_.sourceRepoId;parentId=$_.parentId;available=[bool]$_.available;allowOpti=[bool]$_.allowOpti;allowFG=[bool]$_.allowFG;handsAvailable=[bool]$_.handsAvailable;kind=$_.kind;installed=($receipt -and $_.id -eq $receipt.version);libraryHashes=@{'nvngx_dlss.dll'=$_.files['bin/x64/nvngx_dlss.dll'];'nvngx_dlssg.dll'=$_.files['bin/x64/nvngx_dlssg.dll'];'nvngx_dlssd.dll'=$_.files['bin/x64/nvngx_dlssd.dll']}} })
+    # New-port selectors must propose the effective shared payload, not older bundle defaults.
+    # Installed-port selectors still use Get-LibraryCatalog.current in the UI.
+    if(Get-Command Get-SharedEnhancementDefinition -ErrorAction SilentlyContinue){
+        $shared=Get-SharedEnhancementDefinition $Config
+        foreach($file in $shared.files){
+            if($file.path -in @('bin/x64/nvngx_dlss.dll','bin/x64/nvngx_dlssd.dll','bin/x64/nvngx_dlssg.dll')){
+                $name=[IO.Path]::GetFileName([string]$file.path)
+                foreach($version in $versions){$version.libraryHashes[$name]=[string]$file.sha256}
+            }
+        }
+    }
     $byId=@{};foreach($entry in $bundle.versions){$byId[$entry.id]=$entry}
     foreach($version in $versions){
         if($version.id -notlike 'saved-*'){continue}

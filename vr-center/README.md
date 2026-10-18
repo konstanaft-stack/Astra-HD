@@ -1,5 +1,7 @@
 <!-- JOINT-USE-20261018-BEGIN -->
 
+**R30 / Center05 experimental status:** NewGame and mirror-editor SIM checks showed both eyes, avatar and UI. After cancelling the editor in Night City, the monitor returns to the world but both composed eyes remain black; this is unresolved. R30 cross-profile continuity, HMD comfort and FPS are not accepted. The prior user HMD acceptance applies to the R29 mirror editor.
+
 No mode is declared finished. Features, controls and architecture may change or disappear following testing; this is not a promised roadmap or complete feature list.
 
 ## VR-CENTR + Astra HD: install and use together
@@ -10,9 +12,9 @@ We want Cyberpunk 2077 to become a complete VR experience: from spatial menus an
 
 This is an unfinished experimental combination, not a finished stable VR port. Astra HD sends the game to the headset; VR-CENTR manages installation contents and profiles. Profiles were created because repeated VR, mod and library tests left mixed, nonworking file combinations. They support repeatable tests and restoring a chosen state without manually deleting several game folders, downloading the game again through Steam or reinstalling after each test. 
 
-**No ready combined installation archive is available yet.** [Astra HD Releases](https://github.com/konstanaft-stack/Astra-HD/releases) is the future download location. The automatic Source ZIP contains source code, not an installer; a checkout alone does not restore a working installation.
+**Use the experimental runtime archives from [Astra HD Releases](https://github.com/konstanaft-stack/Astra-HD/releases).** Availability does not mean that VR quality, performance or profile portability is complete. The automatic Source ZIP contains source code, not an installer; a checkout alone does not restore a working installation.
 
-Once a verified installation archive is published:
+After obtaining the matching experimental runtime archives:
 
 1. Install your own Cyberpunk 2077 through Steam. The public package does not include the game, paid third-party ports or personal saves.
 2. Download the ready archive from Releases, extract it, run its included installer and select your game folder.

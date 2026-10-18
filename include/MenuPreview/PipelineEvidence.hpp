@@ -44,5 +44,5 @@ bool ResolveVertexConstantRoot(uintptr_t root,uint32_t shaderRegister,uint32_t r
 struct VertexConstantLocation {uint32_t rootIndex=UINT32_MAX;uint64_t descriptorOffset{};bool table{};};
 // Unique vertex-visible direct or table CBV; never root constants or a guessed index.
 bool ResolveVertexConstantLocation(uintptr_t root,uint32_t shaderRegister,uint32_t registerSpace,VertexConstantLocation&)noexcept;
-bool ResolvePixelSrvLocations(uintptr_t root,const PipelineShaderEvidence&,std::array<ShaderSrvLocation,16>&,uint32_t& count)noexcept;
+bool ResolvePixelSrvLocations(uintptr_t root,const PipelineShaderEvidence&,std::array<ShaderSrvLocation,16>&,uint32_t& count,bool includeStructuredBuffer=false)noexcept;
 }

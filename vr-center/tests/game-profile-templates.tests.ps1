@@ -109,6 +109,7 @@ try{
   $roundtripRoot=Join-Path $fixture 'mode-roundtrip'
   $modeConfig=@{data=(Join-Path $roundtripRoot 'data');game=(Join-Path $roundtripRoot 'game');settingsFile=(Join-Path $roundtripRoot 'player/UserSettings.json')}
   $modeReceipt=@{receipt=@{version='tofu-aer-v1-candidate';kind='native'}}
+  $modeConfig.bundle=$bundleRoot
   $paths=Get-SettingsModePaths $modeConfig $modeReceipt
   Write-Fixture $paths.player $authoredSettings
   Write-Fixture $paths.custom ([IO.File]::ReadAllText((Join-Path $data ('profile-store/objects/'+$custom.sha256))))
