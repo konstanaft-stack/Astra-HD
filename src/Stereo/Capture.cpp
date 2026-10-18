@@ -1,3 +1,6 @@
+#include "MenuPreview/UiConsumer.hpp"
+#include "MenuPreview/DescriptorProvenance.hpp"
+#include "MenuPreview/PixelReadback.hpp"
 #include "Utils/DebugGate.hpp"
 #include "Render/NativeStereoProbe.hpp"
 #include "Render/StereoSceneState.hpp"
@@ -31,6 +34,11 @@
 #include "Stereo/VrcamConfig.hpp"   // vrcam.json access + CName hashing, shared with the launcher
 #include "Render/ColorBlit.hpp"   // HUD debug overlay on the mirror image
 #include "Render/DescriptorCache.hpp"
+#include "Render/NativeColorSource.hpp"
+#include "MenuPreview/ImageLineage.hpp"
+#include "Framegen/NativeFgObservation.hpp"
+#include "Render/CommandResources.hpp"
+#include "../Render/AerPixelEvidence.hpp"
 #include <windows.h>
 #include <d3d12.h>
 #include <d3d11.h>
@@ -50,6 +58,7 @@
 #include "Utils/LogThrottle.hpp"
 #include "Stereo/StereoInternal.hpp"
 #include "Stereo/EngineRvas.hpp"
+#include "Stereo/CetOverlayLayer.hpp"
 #include "Stereo/DetourRegistry.hpp"
 #include "Stereo/StereoInternal.hpp"
 #include "Stereo/EngineRvas.hpp"
@@ -426,6 +435,263 @@ static ID3D12Resource* mirror_find_bound_rtv(SIZE_T handle,
 // Keep active RTVs by use, not creation age. Main swapchain targets are pinned
 // before the engine creates their descriptors, including startup resource churn.
 static cvr::render::DescriptorCache<RtvDescriptorCapacity> rtvDescriptors;
+namespace {
+std::atomic<bool> colorPathAuditDone{false};
+bool ColorPathAuditEnabled() {
+    static const bool enabled=[] {
+        char value[8]{};
+        return GetEnvironmentVariableA("CPVR_AER_COLOR_PATH_AUDIT",value,sizeof(value))==1 && value[0]=='1';
+    }();
+    return enabled&&!colorPathAuditDone.load(std::memory_order_relaxed);
+}
+struct ColorPathBinding {
+    uintptr_t resource{};
+    D3D12_RESOURCE_DESC desc{};
+    uint32_t node{};
+    cvr::camera::PoseIdentity pose;
+    D3D12_RESOURCE_STATES state{};
+    bool stateKnown{};
+    bool pendingSplit{},stateFromReference{};
+};
+struct ColorPathList {
+    ID3D12GraphicsCommandList* list{};
+    uint64_t generation{};
+    ColorPathBinding previous;
+    ColorPathBinding nativeColor;
+};
+std::mutex colorPathMutex;
+std::array<uintptr_t,16> colorPathBackbuffers{};
+std::array<ColorPathList,64> colorPathLists{};
+size_t colorPathNext{};
+uint32_t colorPathRecords{};
+enum class ColorCopyStage {Recorded,Prepared,Submitted,Unknown,Cancelled,Saved};
+struct ColorPathPixels {
+    ColorCopyStage stage=ColorCopyStage::Recorded;
+    ColorPathBinding binding;
+    cvr::render::pixel_evidence::Surface pixels;
+    Microsoft::WRL::ComPtr<ID3D12Resource> source;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list;
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;
+    Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+    std::filesystem::path directory;
+    uint64_t generation{};
+    bool listRetired{};
+};
+std::array<std::unique_ptr<ColorPathPixels>,2> colorPathPixels;
+std::atomic<bool> colorPathHasPixels{false};
+std::array<uint64_t,9> ColorPathIdentity(const cvr::camera::PoseIdentity& pose){
+    const auto& r=pose.mainEyeSource;
+    return {r.epochs.renderer,r.epochs.gameWorld,r.epochs.hmdWorld,r.requestRevision,
+        r.latchRevision,r.clockGeneration,pose.renderFrameId,pose.poseId,pose.writeId};
+}
+void RecordColorPathPixels(ID3D12GraphicsCommandList* list,uint64_t generation,
+                          const ColorPathBinding& native,const ColorPathBinding& current) noexcept {
+    // One immutable readback per physical eye. Require a tracked state or the
+    // explicitly marked reference contract; never wait on the recording thread.
+    try {
+        static const bool enabled=[] {char flag[8]{};return GetEnvironmentVariableA(
+            "CPVR_AER_NATIVE_COLOR_CAPTURE",flag,sizeof(flag))==1&&flag[0]=='1';}();
+        static const cvr::render::pixel_evidence::Configuration configuration;
+        if(!enabled||configuration.directory.empty()||!configuration.directory.is_absolute())return;
+        if((!native.stateKnown&&!native.stateFromReference)||native.pendingSplit)return;
+        if(!native.pose||!native.pose.mainEyeSource||!native.pose.hasRenderFrameId||
+           !current.pose||!current.pose.hasRenderFrameId||
+           native.pose.mainEyeSource!=current.pose.mainEyeSource||
+           ColorPathIdentity(native.pose)!=ColorPathIdentity(current.pose)||
+           native.desc.MipLevels!=1||native.desc.DepthOrArraySize!=1||
+           native.desc.SampleDesc.Count!=1){
+            log("[COLOR-PATH-PIXELS] rejected identity/shape source=%lld nativeFrameKnown=%d currentFrameKnown=%d nativeFrame=%u currentFrame=%u",
+                static_cast<long long>(native.pose.mainEyeSource.sourceId),int(native.pose.hasRenderFrameId),int(current.pose.hasRenderFrameId),
+                native.pose.renderFrameId,current.pose.renderFrameId);return;
+        }
+        const unsigned eye=unsigned(native.pose.mainEyeSource.physicalEye);
+        if(eye>1||colorPathPixels[eye])return;
+        auto copy=std::make_unique<ColorPathPixels>();copy->binding=native;
+        copy->source=reinterpret_cast<ID3D12Resource*>(native.resource);
+        copy->source->SetName(L"CVR_native_color_reference_source");
+        copy->list=list;copy->generation=generation;copy->directory=configuration.directory;
+        Microsoft::WRL::ComPtr<ID3D12Device> device;
+        Microsoft::WRL::ComPtr<ID3D12Device> sourceDevice;
+        Microsoft::WRL::ComPtr<IUnknown> deviceIdentity,sourceDeviceIdentity;
+        if(FAILED(list->GetDevice(IID_PPV_ARGS(&device)))||
+           FAILED(copy->source->GetDevice(IID_PPV_ARGS(&sourceDevice)))||
+           FAILED(device.As(&deviceIdentity))||FAILED(sourceDevice.As(&sourceDeviceIdentity))||
+           deviceIdentity.Get()!=sourceDeviceIdentity.Get()){
+            log("[COLOR-PATH-PIXELS] rejected device identity source=%lld",static_cast<long long>(native.pose.mainEyeSource.sourceId));return;
+        }
+        if(
+           FAILED(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&copy->fence)))||
+           !cvr::render::pixel_evidence::Allocate(device.Get(),copy->source.Get(),copy->pixels)){
+            log("[COLOR-PATH-PIXELS] allocation failed source=%lld",static_cast<long long>(native.pose.mainEyeSource.sourceId));return;
+        }
+        if(!cvr::gpu::KeepCommandResources(list,{copy->source.Get(),copy->pixels.readback.Get(),copy->fence.Get()}))return;
+        {
+            cvr::stereo::probe::Scope internal;
+            cvr::render::pixel_evidence::Copy(list,copy->source.Get(),native.state,copy->pixels);
+        }
+        colorPathPixels[eye]=std::move(copy);colorPathHasPixels.store(true,std::memory_order_release);
+        log("[COLOR-PATH-PIXELS] recorded eye=%u source=%lld state=%u referenceState=%d list=%p generation=%llu",
+            eye,static_cast<long long>(native.pose.mainEyeSource.sourceId),unsigned(native.state),
+            int(native.stateFromReference),list,static_cast<unsigned long long>(generation));
+    }catch(...){log("[COLOR-PATH-PIXELS] capture preparation failed");}
+}
+ColorPathList& ColorPathListFor(ID3D12GraphicsCommandList* list) {
+    for(auto& entry:colorPathLists)if(entry.list==list)return entry;
+    auto& entry=colorPathLists[colorPathNext++%colorPathLists.size()];
+    entry={};entry.list=list;return entry;
+}
+void ColorPathAuditBuffers(std::span<const uintptr_t> resources) {
+    if(!ColorPathAuditEnabled())return;
+    std::array<uintptr_t,16> next{};
+    for(size_t i=0;i<resources.size()&&i<next.size();++i)next[i]=resources[i];
+    std::lock_guard lock(colorPathMutex);
+    if(next!=colorPathBackbuffers){colorPathBackbuffers=next;colorPathLists={};}
+}
+void ColorPathAuditBind(ID3D12GraphicsCommandList* list,ID3D12Resource* resource,
+                       bool noDepth,const cvr::camera::PoseIdentity& pose) {
+    if(!ColorPathAuditEnabled()||!list||!resource||!noDepth)return;
+    D3D12_RESOURCE_DESC desc{};if(!mirror_get_resource_desc(resource,&desc))return;
+    const auto node=t_current_node_work>reinterpret_cast<uintptr_t>(g_exe_base)
+        ?uint32_t(t_current_node_work-reinterpret_cast<uintptr_t>(g_exe_base)):0;
+    const ColorPathBinding current{reinterpret_cast<uintptr_t>(resource),desc,node,pose};
+    std::lock_guard lock(colorPathMutex);
+    if(colorPathRecords>=16)return;
+    auto& entry=ColorPathListFor(list);
+    const bool backbuffer=std::find(colorPathBackbuffers.begin(),colorPathBackbuffers.end(),current.resource)!=colorPathBackbuffers.end();
+    if(backbuffer) {
+        const auto& prior=entry.previous;const auto& native=entry.nativeColor;
+        const auto source=native.pose.mainEyeSource;
+        if(source&&source.sourceId>=800) {
+            ++colorPathRecords;
+            // These are recorded bindings, not GPU completion or pixel equivalence.
+            // The log uses copied metadata; the separately gated readback below
+            // retains the selected resource and validates GPU completion.
+            log("[COLOR-PATH] record=%u list=%p generation=%llu source=%lld eye=%u "
+                "native=%p size=%llux%u fmt=%u node=%x pose=%llu write=%llu "
+                "previous=%p size=%llux%u fmt=%u node=%x "
+                "backbuffer=%p size=%llux%u fmt=%u node=%x currentSource=%lld stateKnown=%d state=%u",
+                colorPathRecords,list,static_cast<unsigned long long>(entry.generation),
+                static_cast<long long>(source.sourceId),unsigned(source.physicalEye),
+                reinterpret_cast<void*>(native.resource),static_cast<unsigned long long>(native.desc.Width),native.desc.Height,unsigned(native.desc.Format),native.node,
+                static_cast<unsigned long long>(native.pose.poseId),static_cast<unsigned long long>(native.pose.writeId),
+                reinterpret_cast<void*>(prior.resource),static_cast<unsigned long long>(prior.desc.Width),prior.desc.Height,unsigned(prior.desc.Format),prior.node,
+                resource,static_cast<unsigned long long>(desc.Width),desc.Height,unsigned(desc.Format),node,
+                static_cast<long long>(pose.mainEyeSource?pose.mainEyeSource.sourceId:-1),
+                int(native.stateKnown),unsigned(native.state));
+            auto selected=native;
+            if(!selected.stateKnown&&!selected.pendingSplit&&selected.node==0x209ff0&&current.node==0x209ff0&&
+               selected.desc.Format==DXGI_FORMAT_R8G8B8A8_TYPELESS){
+                // Reproduce the explicit state supplied by Luke42DA AF1F1F ->
+                // AEA090 (0x40), at the independently observed same native node.
+                // This is a reference contract, NOT an observed local barrier.
+                // The diagnostic run validates the named source at Execute.
+                selected.state=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                selected.stateFromReference=true;
+            }
+            RecordColorPathPixels(list,entry.generation,selected,current);
+            if(colorPathRecords==16)colorPathAuditDone.store(true,std::memory_order_relaxed);
+        }
+        entry.nativeColor={};
+    } else if(desc.Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.Format==DXGI_FORMAT_R8G8B8A8_TYPELESS) {
+        // Candidate only. The diagnostic intentionally does not claim that
+        // matching a format/dimension reproduces Luke's complete classifier.
+        entry.nativeColor=current;
+    }
+    entry.previous=current;
+}
+void ColorPathAuditBarriers(ID3D12GraphicsCommandList* list,UINT count,const D3D12_RESOURCE_BARRIER* barriers){
+    if(!ColorPathAuditEnabled()||cvr::stereo::probe::internalCommands||!list||!barriers)return;
+    std::lock_guard lock(colorPathMutex);
+    auto& entry=ColorPathListFor(list);
+    for(UINT i=0;i<count;++i){
+        const auto& b=barriers[i];
+        for(auto* binding:{&entry.previous,&entry.nativeColor}){
+            if(!binding->resource)continue;
+            if(b.Type==D3D12_RESOURCE_BARRIER_TYPE_ALIASING){
+                if(!b.Aliasing.pResourceBefore||!b.Aliasing.pResourceAfter||
+                   reinterpret_cast<uintptr_t>(b.Aliasing.pResourceBefore)==binding->resource||
+                   reinterpret_cast<uintptr_t>(b.Aliasing.pResourceAfter)==binding->resource)*binding={};
+            } else if(b.Type==D3D12_RESOURCE_BARRIER_TYPE_TRANSITION&&
+                      reinterpret_cast<uintptr_t>(b.Transition.pResource)==binding->resource){
+                const bool complete=b.Transition.Subresource==D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES||
+                    (b.Transition.Subresource==0&&binding->desc.MipLevels==1&&binding->desc.DepthOrArraySize==1);
+                binding->stateKnown=complete&&(b.Flags&D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY)==0;
+                binding->pendingSplit=(b.Flags&D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY)!=0;
+                binding->state=b.Transition.StateAfter;
+            }
+        }
+    }
+}
+}
+void ColorPathAuditReset(ID3D12GraphicsCommandList* list) {
+    if((!ColorPathAuditEnabled()&&!colorPathHasPixels.load(std::memory_order_acquire))||!list)return;
+    std::lock_guard lock(colorPathMutex);
+    for(auto& copy:colorPathPixels)if(copy&&copy->list.Get()==list){
+        copy->listRetired=true;
+        if(copy->stage==ColorCopyStage::Recorded)copy->stage=ColorCopyStage::Cancelled;
+    }
+    for(auto& entry:colorPathLists)if(entry.list==list){
+        ++entry.generation;entry.previous={};entry.nativeColor={};return;
+    }
+}
+void ColorPathAuditBeforeSubmit(ID3D12CommandQueue* queue,UINT count,ID3D12CommandList* const* lists){
+    if(!colorPathHasPixels.load(std::memory_order_acquire)||!queue||!lists)return;
+    std::lock_guard lock(colorPathMutex);
+    for(auto& copy:colorPathPixels)if(copy&&!copy->listRetired&&
+        (copy->stage==ColorCopyStage::Recorded||copy->stage==ColorCopyStage::Submitted)){
+        for(UINT i=0;i<count;++i)if(lists[i]==copy->list.Get()){
+            if(copy->stage==ColorCopyStage::Submitted){
+                copy->stage=ColorCopyStage::Unknown;
+                log("[COLOR-PATH-PIXELS] replay rejected source=%lld",static_cast<long long>(copy->binding.pose.mainEyeSource.sourceId));
+                break;
+            }
+            // Called under the existing ImageSubmissionMutex immediately before
+            // the actual Execute. Later Reset cannot relabel this frozen copy.
+            copy->queue=queue;copy->stage=ColorCopyStage::Prepared;break;
+        }
+    }
+}
+void ColorPathAuditSubmitted(ID3D12CommandQueue* queue){
+    if(!colorPathHasPixels.load(std::memory_order_acquire)||!queue)return;
+    std::lock_guard lock(colorPathMutex);
+    for(auto& copy:colorPathPixels)if(copy&&copy->stage==ColorCopyStage::Prepared&&copy->queue.Get()==queue){
+        const auto result=queue->Signal(copy->fence.Get(),1);
+        copy->stage=SUCCEEDED(result)?ColorCopyStage::Submitted:ColorCopyStage::Unknown;
+        log("[COLOR-PATH-PIXELS] submitted source=%lld signal=%08X",static_cast<long long>(copy->binding.pose.mainEyeSource.sourceId),unsigned(result));
+    }
+}
+extern "C" void CyberpunkVR_ColorPathAuditPoll(){
+    if(!colorPathHasPixels.load(std::memory_order_acquire))return;
+    // Serialize a completed readback against a new/replayed Execute on any
+    // tracked game queue. A replay observed before this read rejects evidence.
+    std::lock_guard submissionLock(cvr::camera::ImageSubmissionMutex());
+    std::lock_guard lock(colorPathMutex);
+    for(auto& copy:colorPathPixels)if(copy&&copy->stage==ColorCopyStage::Submitted){
+        const auto done=copy->fence->GetCompletedValue();
+        if(done==UINT64_MAX){copy->stage=ColorCopyStage::Unknown;continue;}
+        if(done<1)continue;
+        const auto& r=copy->binding.pose.mainEyeSource;bool saved=false;
+        try {
+            std::filesystem::create_directories(copy->directory);
+            const auto name="native-eye"+std::to_string(unsigned(r.physicalEye))+"-source"+std::to_string(r.sourceId);
+            saved=cvr::render::pixel_evidence::SaveSurface(copy->pixels,copy->directory/(name+".raw"));
+            if(saved){
+                std::ofstream file(copy->directory/(name+".json"));
+                file<<"{\"source_id\":"<<r.sourceId<<",\"eye\":"<<unsigned(r.physicalEye)
+                    <<",\"width\":"<<copy->binding.desc.Width<<",\"height\":"<<copy->binding.desc.Height
+                    <<",\"format\":"<<unsigned(copy->binding.desc.Format)<<",\"row_bytes\":"<<copy->pixels.rowBytes
+                    <<",\"rows\":"<<copy->pixels.rows<<",\"copy_state\":"<<unsigned(copy->binding.state)
+                    <<",\"state_from_reference_contract\":"<<(copy->binding.stateFromReference?"true":"false")
+                    <<",\"completed_fence\":1,\"source_identity\":";
+                cvr::render::pixel_evidence::Array(file,ColorPathIdentity(copy->binding.pose));file<<"}\n";
+                file.close();saved=bool(file);
+            }
+        }catch(...){saved=false;}
+        copy->stage=ColorCopyStage::Saved;
+        log("[COLOR-PATH-PIXELS] completed source=%lld eye=%u saved=%d",static_cast<long long>(r.sourceId),unsigned(r.physicalEye),int(saved));
+        copy->source.Reset();copy->list.Reset();copy->queue.Reset();copy->fence.Reset();copy->pixels.readback.Reset();
+    }
+}
 extern "C" void CyberpunkVR_RegisterRtvSwapchain(IDXGISwapChain* swapChain) {
     if(!swapChain)return;
     DXGI_SWAP_CHAIN_DESC desc{};
@@ -437,13 +703,27 @@ extern "C" void CyberpunkVR_RegisterRtvSwapchain(IDXGISwapChain* swapChain) {
         resources[i]=reinterpret_cast<uintptr_t>(buffer);buffer->Release();
     }
     rtvDescriptors.PinResources(std::span(resources.data(),desc.BufferCount));
+    static const bool fgDiagnostic=[] {char value[8]{};return GetEnvironmentVariableA(
+        "CPVR_NATIVE_FG_DIAG",value,sizeof(value))==1&&value[0]=='1';}();
+    if(fgDiagnostic){
+        void** table=*reinterpret_cast<void***>(swapChain);
+        HMODULE module{};char modulePath[MAX_PATH]{};
+        if(GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCSTR>(table[9]),&module))GetModuleFileNameA(module,modulePath,MAX_PATH);
+        log("[NATIVE-FG-BUFFERS] chain=%p thread=%lu hwnd=%p size=%ux%u count=%u getBuffer=%p module=%s",
+            swapChain,GetCurrentThreadId(),desc.OutputWindow,desc.BufferDesc.Width,desc.BufferDesc.Height,desc.BufferCount,table[9],modulePath);
+        for(UINT i=0;i<desc.BufferCount;++i)log("[NATIVE-FG-BUFFER] chain=%p index=%u resource=%p",swapChain,i,reinterpret_cast<void*>(resources[i]));
+    }
+    cvr::render::NativeColorBackbuffers(std::span(resources.data(),desc.BufferCount));
+    ColorPathAuditBuffers(std::span(resources.data(),desc.BufferCount));
 }
-static void rtv_dim_register(D3D12_CPU_DESCRIPTOR_HANDLE handle,ID3D12Resource* res) {
+static void rtv_dim_register(D3D12_CPU_DESCRIPTOR_HANDLE handle,ID3D12Resource* res,const D3D12_RENDER_TARGET_VIEW_DESC* view) {
     if(!handle.ptr)return;
     D3D12_RESOURCE_DESC desc{};
     cvr::render::DescriptorTarget target{};
     if(res && mirror_get_resource_desc(res,&desc) && desc.Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE2D)
-        target={reinterpret_cast<uintptr_t>(res),uint32_t(desc.Width),desc.Height};
+        target={reinterpret_cast<uintptr_t>(res),uint32_t(desc.Width),desc.Height,uint32_t(desc.Format),
+            view?uint32_t(view->ViewDimension):0,view?view->Texture2D.MipSlice:0,view!=nullptr};
     bool evicted=false;
     rtvDescriptors.Store(handle.ptr,target,&evicted);
     g_rtv_dim_count.store(uint32_t(rtvDescriptors.Size()),std::memory_order_relaxed);
@@ -586,7 +866,11 @@ extern "C" __declspec(dllexport) uint64_t CyberpunkVR_DebugHudSnapSkips = 0;
 
  void STDMETHODCALLTYPE hk_CreateCBV(ID3D12Device* self,
         const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE dst) {
+    const bool uiCbvTrace=cvr::menu_preview::UiRasterDiagnosticsEnabled();
+    const auto uiWrite=uiCbvTrace?cvr::menu_preview::BeginUiCbvWrite(dst):cvr::menu_preview::BeginUiDescriptorOverwrite(dst);
     g_orig_CreateCBV(self, desc, dst);
+    if(uiCbvTrace)cvr::menu_preview::FinishUiCbvWrite(uiWrite,desc,dst);
+    else cvr::menu_preview::FinishUiSrvWrite(uiWrite,nullptr,dst);
     if(CyberpunkVR_SinglePassTwinUpload.load(std::memory_order_relaxed))
         cvr::stereo::camera_upload::CreatedCbv(desc,dst);
     // ---- the camera constant buffer, per view -------------------------------------------------
@@ -647,9 +931,13 @@ extern "C" __declspec(dllexport) uint64_t CyberpunkVR_DebugHudSnapSkips = 0;
 
  void STDMETHODCALLTYPE hk_CreateRTV(ID3D12Device* self, ID3D12Resource* res,
         const D3D12_RENDER_TARGET_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE dst) {
+    const void* const caller = _ReturnAddress();
+    const auto descriptorMutation=cvr::menu_preview::BeginPreviewDescriptorRtv(self,dst);
     g_orig_CreateRTV(self, res, desc, dst);
+    cvr::menu_preview::FinishPreviewDescriptorRtv(self,res,dst,descriptorMutation,desc);
+    CetOverlayNoteRtvCreated(self, res, dst, caller);
     if(cvr::stereo::probe::internalCommands)return;
-    rtv_dim_register(dst, res);   // broad map (any format) for the crop-blit RT-size probe
+    rtv_dim_register(dst, res, desc);   // also preserves original native-color descriptor class
     cvr::stereo::scene_state::RtvCreated(res,desc,dst);
     hud_register_rtv(res, desc, dst);
     DXGI_FORMAT format = desc ? desc->Format : DXGI_FORMAT_UNKNOWN;
@@ -786,6 +1074,18 @@ void STDMETHODCALLTYPE hk_OMSetRenderTargets(
     PFN_OMSetRenderTargets original = command_list_original_om(self);
     if (!original) return;
     if(cvr::stereo::probe::internalCommands){original(self,count,handles,contiguous,depth);return;}
+    if(count==1 && handles && handles[0].ptr && !depth && cvr::camera::MainEyeSourceRequested()) {
+        const auto target=rtvDescriptors.Read(handles[0].ptr);
+        const auto description=target?cvr::render::NativeColorDescription{target->width,target->height,target->format,
+            target->viewDimension,target->mip,target->explicitView}:cvr::render::NativeColorDescription{};
+        cvr::render::NativeColorTarget(self,target?reinterpret_cast<ID3D12Resource*>(target->resource):nullptr,
+            description,cvr::camera::CurrentNodePoseIdentity());
+    }
+    if(ColorPathAuditEnabled()&&count==1&&handles) {
+        ID3D12Resource* target=nullptr;
+        __try {target=rtv_resource_lookup(handles[0].ptr);}__except(EXCEPTION_EXECUTE_HANDLER){target=nullptr;}
+        ColorPathAuditBind(self,target,depth==nullptr,cvr::camera::CurrentNodePoseIdentity());
+    }
     if(CyberpunkVR_NativeStereoProbeState.load(std::memory_order_relaxed)==1)
         cvr::stereo::native_probe::Targets(self,count,handles,contiguous,depth);
     if(count==1 && handles && t_active_view_known &&
@@ -793,7 +1093,12 @@ void STDMETHODCALLTYPE hk_OMSetRenderTargets(
         ID3D12Resource* target=nullptr;
         __try { target=rtv_resource_lookup(handles[0].ptr); }
         __except(EXCEPTION_EXECUTE_HANDLER) { target=nullptr; }
-        if(target)cvr::camera::RecordImagePose(self,target,cvr::camera::CurrentNodePoseIdentity());
+        if(target){
+            const auto imagePose=cvr::camera::CurrentNodePoseIdentity();
+            if(!imagePose)cvr::render::NativeColorUnknownPoseDiagnostic(self,target,
+                uint32_t(t_current_node_work-reinterpret_cast<uintptr_t>(g_exe_base)),t_active_view_key);
+            cvr::camera::RecordImagePose(self,target,imagePose);
+        }
     }
     // The cascade pass binds a DEPTH target and usually no colour one, so this is deliberately ahead of the
     // `count >= 1` gate below -- inside it the probe would never fire.
@@ -851,9 +1156,18 @@ void STDMETHODCALLTYPE hk_OMSetRenderTargets(
     //  is too early: the glow mips do not exist yet. It now hangs off the barrier that releases
     //  the last mip -- see hk_ResourceBarrier.)
 
-    D3D12_CPU_DESCRIPTOR_HANDLE sub[8];
     const D3D12_CPU_DESCRIPTOR_HANDLE* use = handles;
     BOOL use_contig = contiguous;
+    D3D12_CPU_DESCRIPTOR_HANDLE cetSub[8];
+    if (handles && count && count <= 8 && CetOverlayOwnsCommandList(self)) {
+        BOOL cetContig = contiguous;
+        if (CetOverlayRewriteRenderTargets(self, count, handles, contiguous, cetSub, &cetContig)) {
+            use = cetSub;
+            use_contig = cetContig;
+        }
+    }
+
+    D3D12_CPU_DESCRIPTOR_HANDLE sub[8];
     bool subbed = false;
     if (CyberpunkVR_VrcamOwnTarget && t_mirror_copy_node_active && handles && count &&
             count <= 8 && g_game_device) {
@@ -876,7 +1190,46 @@ void STDMETHODCALLTYPE hk_OMSetRenderTargets(
             subbed = false; use = handles; use_contig = contiguous;
         }
     }
+    const auto descriptorBefore=(cvr::menu_preview::PreviewObservationRequested()&&count==1&&use)?cvr::menu_preview::ReadPreviewDescriptor(use[0].ptr):std::optional<cvr::menu_preview::PreviewDescriptorProof>{};
+    std::array<std::optional<cvr::menu_preview::PreviewDescriptorProof>,8> uiBefore{};
+    UINT uiIncrement=0;
+    if(cvr::menu_preview::UiStereoRequested()&&use&&count<=8){
+        if(use_contig&&g_game_device)uiIncrement=g_game_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        if(!use_contig||count<=1||uiIncrement)for(UINT i=0;i<count;++i)
+            uiBefore[i]=cvr::menu_preview::ReadPreviewDescriptor(use_contig?use[0].ptr+SIZE_T(uiIncrement)*i:use[i].ptr);
+    }
     original(self, count, use, use_contig, depth);
+    if(cvr::menu_preview::UiStereoRequested()){
+        std::array<ID3D12Resource*,8> uiTargets{};
+        if(use&&count<=8)for(UINT i=0;i<count;++i)if(uiBefore[i]){
+            const auto after=cvr::menu_preview::ReadPreviewDescriptor(uiBefore[i]->handle);
+            if(after&&*after==*uiBefore[i])uiTargets[i]=reinterpret_cast<ID3D12Resource*>(after->resource);
+        }
+        cvr::menu_preview::UiTargets(self,count<=8?count:0,uiTargets.data());
+        // Keep CPU-known target identity even if independent preview provenance
+        // is not available yet; an unknown prefix must not become a full UI.
+        if(cvr::menu_preview::EditorUiSeparationEnabled()){
+            const auto editorRawTarget=rtvDescriptors.Read(count==1&&use?use[0].ptr:0);
+            cvr::menu_preview::ObserveEditorUiTargets(self,count,use,use_contig,depth,
+                count==1?(uiTargets[0]?uiTargets[0]:editorRawTarget?reinterpret_cast<ID3D12Resource*>(editorRawTarget->resource):nullptr):nullptr);
+        }
+    }
+    const auto descriptorAfter=descriptorBefore?cvr::menu_preview::ReadPreviewDescriptor(use[0].ptr):std::optional<cvr::menu_preview::PreviewDescriptorProof>{};
+    cvr::menu_preview::PreviewPixelTargetsBegin(self,count,count==1&&use?use[0].ptr:0);
+    if(descriptorBefore&&descriptorAfter&&*descriptorBefore==*descriptorAfter)
+        cvr::menu_preview::PreviewPixelTargetFromDescriptor(self,*descriptorAfter);
+    // Observe actual descriptors after existing redirects: RTV bind only.
+    if(use && count<=D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT &&
+       cvr::menu_preview::PreviewRtvTrackingActive()) {
+        const UINT previewIncrement=(use_contig && g_game_device)?
+            g_game_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV):0;
+        if(!use_contig || count==1 || previewIncrement)for(UINT i=0;i<count;++i) {
+            const SIZE_T handle=use_contig?use[0].ptr+SIZE_T(previewIncrement)*i:use[i].ptr;
+            const auto target=rtvDescriptors.Read(handle);
+            if(target)cvr::menu_preview::ObservePreviewRtvBind(self,
+                reinterpret_cast<ID3D12Resource*>(target->resource));
+        }
+    }
     if (subbed) {
         CVR_DIAGNOSTIC(++CyberpunkVR_DebugOwnTargetSubs);
         if (g_own_target)
@@ -1223,17 +1576,31 @@ extern "C" __declspec(dllexport) ID3D12Resource* CyberpunkVR_GetVrcamEyeTexture(
 // than dropping to mono. Age also drives the overlay's status line.
 
 extern "C" __declspec(dllexport) ID3D12Resource* CyberpunkVR_GetVrcamEyeTextureFresh() {
-    const uint64_t last = g_stable_tick.load(std::memory_order_acquire);
-    if (!last) { CyberpunkVR_DebugVrcamEyeAgeMs = 0xFFFFFFFFu; return nullptr; }
-    // THE GATE RUNS ON THE COARSE CLOCK, exactly as it did before: same unit, same epoch, same
-    // behaviour. The REPORTED age runs on the fine one, which is the only thing that needed changing --
-    // GetTickCount64's 15.6 ms granularity cannot express a 14 ms staleness, and reported max 16.0 ms
-    // in every window because that is one tick.
-    const uint64_t age = GetTickCount64() - last;
+    // The normal source is the submitted stable copy. g_stable_tick is written
+    // while recording, potentially long before ExecuteCommandLists (or before
+    // the recording is discarded). Do not pair that newer clock with old pixels.
+    // Keep the experimental own-target path's existing lifetime policy separate.
+    const bool ownTarget = CyberpunkVR_VrcamOwnTarget != 0;
+    const auto submitted = ownTarget ? cvr::camera::ImagePoseIdentity{}
+                                    : cvr::camera::LatestSubmittedVrcamImageIdentity();
+    const uint64_t last = ownTarget ? g_stable_tick.load(std::memory_order_acquire)
+                                   : submitted.stampMs;
+    const uint64_t nowMs = GetTickCount64();
+    if ((!ownTarget && (!submitted || !submitted.resource)) || !last || last > nowMs) {
+        CyberpunkVR_DebugVrcamEyeAgeMs = 0xFFFFFFFFu;
+        CyberpunkVR_DebugVrcamEyeAgeUs = 0xFFFFFFFFu;
+        return nullptr;
+    }
+    const uint64_t age = nowMs - last;
     if(cvr::RuntimeDiagnosticsEnabled()) {
-    const uint64_t lastUs = g_stable_tick_us.load(std::memory_order_acquire);
-    const uint64_t nowUs = (uint64_t)(StableNowMs() * 1000.0);
-    const uint64_t ageUs = (lastUs && nowUs > lastUs) ? nowUs - lastUs : 0;
+    // Submitted metadata currently has millisecond precision. Report that
+    // quantized age in microseconds, never the unrelated recording timestamp.
+    uint64_t ageUs = age > 0xFFFFFFFEull / 1000 ? 0xFFFFFFFEull : age * 1000;
+    if (ownTarget) {
+        const uint64_t lastUs = g_stable_tick_us.load(std::memory_order_acquire);
+        const uint64_t nowUs = (uint64_t)(StableNowMs() * 1000.0);
+        ageUs = (lastUs && nowUs > lastUs) ? nowUs - lastUs : 0;
+    }
     CyberpunkVR_DebugVrcamEyeAgeUs = ageUs > 0xFFFFFFFEull ? 0xFFFFFFFEu : (uint32_t)ageUs;
     }
     // Coarse age also drives the normal stereo-status display.
@@ -1283,7 +1650,10 @@ extern "C" __declspec(dllexport) ID3D12Resource* CyberpunkVR_GetVrcamEyeTextureF
         }
         return nullptr;
     }
-    return CyberpunkVR_GetVrcamEyeTexture();
+    // Return the exact image whose timestamp was checked, not a second lookup
+    // that could select another publication with a different age.
+    return ownTarget ? CyberpunkVR_GetVrcamEyeTexture()
+                     : reinterpret_cast<ID3D12Resource*>(submitted.resource);
 }
 
 // Append (into the game's OWN list) a copy dtex -> g_d12_mtex. Called from the
@@ -1399,8 +1769,20 @@ void STDMETHODCALLTYPE hk_ResourceBarrier(ID3D12GraphicsCommandList* self,
         UINT count, const D3D12_RESOURCE_BARRIER* barriers) {
     const CommandListVtableHook* e = command_list_hook_entry(self);
     PFN_ResourceBarrier orig = e ? e->barrier_original : nullptr;
-    if (orig) orig(self, count, barriers);
+    const D3D12_RESOURCE_BARRIER* use = barriers;
+    std::vector<D3D12_RESOURCE_BARRIER> cetBarriers;
+    if (barriers && count && CetOverlayOwnsCommandList(self)) {
+        cetBarriers.resize(count);
+        if (CetOverlayRewriteBarriers(self, count, barriers, cetBarriers.data()))
+            use = cetBarriers.data();
+    }
+    if (orig) orig(self, count, use);
+    ColorPathAuditBarriers(self,count,use);
     if(cvr::stereo::probe::internalCommands)return;
+    cvr::render::NativeColorBarriers(self,count,use);
+    cvr::menu_preview::ObservePreviewImageBarriers(self,count,use);
+    cvr::menu_preview::UiResourceBarriers(self,count,use);
+    cvr::framegen::ObserveNativeFgBarriers(self,count,use);
     // Gated on the same demand as the snapshot, NOT on the mirror window alone. This hook is
     // where t_mirror_src_state is refined (below): the OM bind seeds it as RENDER_TARGET and
     // every later transition of that target is tracked here, so the inline copy can name the
@@ -1435,9 +1817,15 @@ void STDMETHODCALLTYPE hk_ResourceBarrier(ID3D12GraphicsCommandList* self,
     //
     // Identification is by exhaustion. Of every full-size candidate in that frame only this one is
     // R8G8B8A8_TYPELESS with both RENDER_TARGET and UNORDERED_ACCESS allowed: the HUD layer is the same
-    // 3072x3072 but SRGB and render-target-only, and the half-resolution TYPELESS pair is UAV-only and
-    // so cannot make this transition at all.
+    // size but SRGB and render-target-only, and the half-resolution TYPELESS pair is UAV-only and
+    // so cannot make this transition at all. Reject half-size relative to the selected VRCAM
+    // resolution, not a fixed threshold derived from the original 3072x3072 capture. If selection
+    // is unknown, leave the finished-frame path unarmed and retain the existing fallback.
     if (CyberpunkVR_FinalGrab && barriers && t_vrcam_node_active) {
+        const UINT vrcam_w = g_vrcam_sel_w.load(std::memory_order_relaxed);
+        const UINT vrcam_h = g_vrcam_sel_h.load(std::memory_order_relaxed);
+        const UINT half_w = (vrcam_w / 2u) + (vrcam_w & 1u);
+        const UINT half_h = (vrcam_h / 2u) + (vrcam_h & 1u);
         for (UINT i = 0; i < count; ++i) {
             const D3D12_RESOURCE_BARRIER& fb = barriers[i];
             if (fb.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION || !fb.Transition.pResource) continue;
@@ -1447,7 +1835,8 @@ void STDMETHODCALLTYPE hk_ResourceBarrier(ID3D12GraphicsCommandList* self,
             if (!mirror_get_resource_desc(fb.Transition.pResource, &fd) ||
                     fd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
                     fd.Format != DXGI_FORMAT_R8G8B8A8_TYPELESS ||
-                    fd.Width < 2048 || fd.Height < 2048) continue;
+                    !vrcam_w || !vrcam_h ||
+                    fd.Width <= half_w || fd.Height <= half_h) continue;
             if (!(fd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ||
                     !(fd.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) continue;
             t_final_res = fb.Transition.pResource;
@@ -1783,3 +2172,4 @@ void STDMETHODCALLTYPE hk_ResourceBarrier(ID3D12GraphicsCommandList* self,
 
 }  // namespace detail
 }  // namespace cvr
+#include "MenuPreview/EditorUiSurface.hpp"

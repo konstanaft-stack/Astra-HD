@@ -1,4 +1,23 @@
+#include "MenuPreview/UiCameraCycle.hpp"
+#include "MenuPreview/UiConsumer.hpp"
+#include "MenuPreview/SpatialEditor.hpp"
+#include "Core/LiveControls.hpp"
+#include "Overlay/ImGuiOverlay.hpp"
+#include "MenuPreview/EditorSceneImage.hpp"
+#include "Runtimes/EditorSceneCapturePolicy.hpp"
+#include "Runtimes/EditorUiFallbackPolicy.hpp"
 #include "Utils/DebugGate.hpp"
+#include "Framegen/NativeGenerationBridge.hpp"
+#include "Framegen/NativeFgOutput.hpp"
+#include "Framegen/PairedImageContract.hpp"
+#include "Framegen/NativeFgObservation.hpp"
+#include "Framegen/AerModeOwner.hpp"
+#include "Framegen/SourceFrameSystem.hpp"
+#include "Framegen/AerCaptureDiagnostics.hpp"
+#include "Framegen/AerConsumerDiagnostics.hpp"
+#include "Overlay/PpdPanel.hpp"
+#include "Framegen/ColorRead.hpp"
+#include "Framegen/ColorCopy.hpp"
 #include "Render/CommandResources.hpp"
 #include "Render/GpuStageProfile.hpp"
 // openxr_frameloop.cpp - the XR frame loop (PumpInlineFrame / FrameThreadMain).
@@ -29,6 +48,67 @@
 #include <atomic>
 #include <dxgi1_4.h>
 #include "Utils/LogThrottle.hpp"
+
+namespace cvr::menu_preview {
+namespace {EditorFreshnessRecorder freshnessRecorder;std::atomic<bool> freshnessExhausted{};
+uint64_t FreshnessQpc()noexcept{LARGE_INTEGER v{};return QueryPerformanceCounter(&v)?uint64_t(v.QuadPart):0;}}
+bool EditorFreshnessEnabled()noexcept{static const bool enabled=[] {char v[2]{};return GetEnvironmentVariableA("CPVR_EDITOR_FRESHNESS_TRACE",v,sizeof(v))==1&&v[0]=='1';}();return enabled&&!freshnessExhausted.load(std::memory_order_relaxed);}
+void EditorFreshnessScope(uint32_t epoch)noexcept{if(!EditorFreshnessEnabled())return;try{freshnessRecorder.Scope(true,epoch,GetTickCount64());}catch(...){}}
+void NoteEditorFreshness(FreshnessEvent event,FreshnessStage stage,const FreshnessSample& value)noexcept{
+ if(!EditorFreshnessEnabled())return;try{auto sample=value;sample.qpc=FreshnessQpc();freshnessRecorder.Note(true,event,stage,sample);}catch(...){}
+}
+void NoteEditorPublication(const CameraApplication* previous,const CameraApplication* incoming,bool duplicate,bool older)noexcept{
+ if(!EditorFreshnessEnabled()||!incoming||incoming->metadata.screen!=2)return;
+ FreshnessSample s;s.epoch=incoming->metadata.screenEpoch;s.setup=incoming->metadata.setupID;s.nativeFrame=incoming->frame.nativeFrame;s.eye=incoming->frame.eye;s.source=incoming->frame.sourceSequence;s.revision=incoming->localPoseRevision;s.control=incoming->editorControlRevision;s.origin=incoming->projection.origin;s.previousPointer=reinterpret_cast<uintptr_t>(previous);s.nextPointer=reinterpret_cast<uintptr_t>(incoming);
+ bool sameSource=false;if(previous){s.otherSource=previous->frame.sourceSequence;s.otherRevision=previous->localPoseRevision;s.flags|=unsigned(previous!=incoming);
+  sameSource=previous->frame.key==incoming->frame.key&&previous->frame.nativeFrame==incoming->frame.nativeFrame&&previous->frame.sourceSequence==incoming->frame.sourceSequence&&previous->frame.eye==incoming->frame.eye;
+  if(!duplicate){const auto f=[](float a,float b){return std::bit_cast<uint32_t>(a)!=std::bit_cast<uint32_t>(b);};const auto& a=previous->projection.pose;const auto& b=incoming->projection.pose;
+   if(previous->eyeDescriptor!=incoming->eyeDescriptor)s.flags|=2;if(previous->baseDescriptor!=incoming->baseDescriptor)s.flags|=4;
+   if(f(a.position.x,b.position.x)||f(a.position.y,b.position.y)||f(a.position.z,b.position.z)||f(a.orientation.x,b.orientation.x)||f(a.orientation.y,b.orientation.y)||f(a.orientation.z,b.orientation.z)||f(a.orientation.w,b.orientation.w))s.flags|=8;
+   if(previous->editorControlRevision!=incoming->editorControlRevision)s.flags|=16;
+   if(previous->nativeContext!=incoming->nativeContext||previous->nativeDestination!=incoming->nativeDestination||previous->sourceDescriptor!=incoming->sourceDescriptor)s.flags|=32;
+   if(previous->metadata.publicationSerial!=incoming->metadata.publicationSerial||previous->metadata.publishedAtMs!=incoming->metadata.publishedAtMs)s.flags|=64;
+   if(!older&&(s.flags&~1u)==0)s.flags|=128;
+  }
+ }
+ NoteEditorFreshness(older?FreshnessEvent::OlderReject:duplicate?FreshnessEvent::Duplicate:sameSource?FreshnessEvent::SameSourceReplace:FreshnessEvent::OtherReplace,FreshnessStage::Publication,s);
+}
+void EmitEditorFreshness()noexcept{
+ if(!EditorFreshnessEnabled())return;try{FreshnessSnapshot snapshot;if(!freshnessRecorder.Take(true,GetTickCount64(),snapshot)){
+ static bool waitingLogged{};if(!waitingLogged&&!freshnessRecorder.Armed()){waitingLogged=true;Log("[EDITOR-FRESH-STATE] enabled=1 state=WAITING_EDITOR; no armed rows means NOT_ARMED, not a failure cause\n");}return;}
+ if(snapshot.row==32)freshnessExhausted.store(true,std::memory_order_relaxed);
+ // Take released the independent probe mutex. No source or probe lock crosses Log.
+ SYSTEMTIME utc{};GetSystemTime(&utc);LARGE_INTEGER frequency{};QueryPerformanceFrequency(&frequency);const auto qpc=FreshnessQpc();const auto& c=snapshot.counts;const auto& p=snapshot.last[0];const auto& w=snapshot.last[1];const auto& a=snapshot.last[2];const auto& e=snapshot.last[3];
+ Log("[EDITOR-FRESH] utc=%04u-%02u-%02uT%02u:%02u:%02u.%03uZ qpc=%llu frequency=%lld row=%u epoch=%u armedEpoch=%u intervalMs=%llu intervalKnown=%u counts(dup,sameReplace,otherReplace,older,wMatch,wMismatch,pairOK,pairReadMiss,pairAdmissionReject,rawUnavailable,fresh,repeat,replay,empty,endError,otherAccepted,retained,scopeAbsent)=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu pub(qpc,epoch,setup,frame,eye,source,rev,ctrl,origin,prev,next,flags)=%llu,%u,%u,%u,%u,%llu,%llu,%llu,%llu,%llx,%llx,%x writer(qpc,epoch,setup,source,currentSource,prev,next,resource,generation)=%llu,%u,%u,%llu,%llu,%llx,%llx,%llx,%llu pair(qpc,epoch,setup,leftSource,rightSource,leftCtrl,rightCtrl,selectedCtrl,origin,rawL,rawR,flags)=%llu,%u,%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%x end(qpc,epoch,setup,displayTime,serial,flags)=%llu,%u,%u,%lld,%llu,%x; interval counts; tuples last-observed QPC may predate interval/epoch; projectionPoseChanged not raw head token\n",
+ utc.wYear,utc.wMonth,utc.wDay,utc.wHour,utc.wMinute,utc.wSecond,utc.wMilliseconds,qpc,frequency.QuadPart,snapshot.row,snapshot.epoch,snapshot.armedEpoch,snapshot.intervalMs,unsigned(snapshot.intervalKnown),
+ c[0],c[1],c[2],c[3],c[4],c[5],c[6],c[7],c[8],c[9],c[10],c[11],c[12],c[13],c[14],c[15],c[16],c[17],
+ p.qpc,p.epoch,p.setup,p.nativeFrame,p.eye,p.source,p.revision,p.control,p.origin,p.previousPointer,p.nextPointer,p.flags,w.qpc,w.epoch,w.setup,w.source,w.otherSource,w.previousPointer,w.nextPointer,w.resource,w.generation,a.qpc,a.epoch,a.setup,a.source,a.otherSource,a.revision,a.otherRevision,a.control,a.origin,a.rawLeft,a.rawRight,a.flags,e.qpc,e.epoch,e.setup,e.displayTime,e.source,e.flags);
+ }catch(...){}
+}
+}
+
+extern "C" {
+__declspec(dllexport) std::atomic<uint64_t> CyberpunkVR_AerConsumerStatusSeq{0};
+__declspec(dllexport) cvr::framegen::AerConsumerTelemetry CyberpunkVR_AerConsumerStatus{};
+}
+namespace {
+std::mutex s_aerConsumerTelemetryMutex;
+cvr::framegen::PairedImageIdentity PairedIdentity(const cvr::framegen::Frame& frame) {
+    cvr::framegen::PairedImageIdentity out;out.serial=frame.identity.serial;out.origin=frame.identity.origin;
+    out.resourceEpoch=frame.nativeStamp.resourceEpoch;out.producerSignalKnown=frame.colorCompletion.HasScheduledCopySource();
+    for(unsigned eye=0;eye<2;++eye){const auto& stamp=frame.nativeStamp.eyes[eye];
+        out.eyes[eye]={reinterpret_cast<uintptr_t>(frame.color[eye]),stamp.sourceSerial,
+            stamp.poseId==frame.identity.pose[eye]?stamp.poseId:0,stamp.poseWriteId,stamp.spaceEpoch,
+            stamp.engineView==frame.engineView[eye]?stamp.engineView:0,stamp.nativeFrame,stamp.nativeFrameKnown};}
+    return out;
+}
+template<class F> void RecordAerConsumer(F&& record) {
+    std::lock_guard lock(s_aerConsumerTelemetryMutex);
+    CyberpunkVR_AerConsumerStatusSeq.fetch_add(1,std::memory_order_acq_rel);
+    record(CyberpunkVR_AerConsumerStatus);
+    CyberpunkVR_AerConsumerStatusSeq.fetch_add(1,std::memory_order_release);
+}
+}
 
 // Shared physical-body heading in tracking space; the getter refreshes suspension state.
 extern float BodyYawFollowOffset();
@@ -298,6 +378,49 @@ double XrDiagNowMs() {
 }
 
 namespace {
+
+// Opt-in timing only: no renderer behavior, GPU waits or broad DEBUG probes added.
+struct XrLightTiming {
+    static bool Enabled(){static const bool on=[] {char v[8]{};return GetEnvironmentVariableA("CPVR_XR_LIGHT_TIMING",v,sizeof(v))==1&&v[0]=='1';}();return on;}
+    inline static thread_local double previousEnd{};
+    bool enabled=Enabled(),xr{};
+    double start=enabled?XrDiagNowMs():0,gap=enabled&&previousEnd?start-previousEnd:0;
+    double wait{},allocator{},images{},end{};
+    bool allocatorSample{},selectedBusy{},otherReady{},allBusy{},invalidFence{};
+    unsigned pendingSlots{};
+    uint64_t pendingSignals{};
+    void ObserveAllocator(uint64_t completed,const std::array<uint64_t,3>& required,unsigned selected,uint64_t submitted) {
+        if(!enabled)return;
+        allocatorSample=true;invalidFence=completed==UINT64_MAX;
+        for(unsigned i=0;i<required.size();++i){
+            const bool ready=cvr::capture::SubmitFenceValueComplete(completed,required[i]);
+            pendingSlots+=!ready;
+            if(i==selected)selectedBusy=!ready;else otherReady|=ready;
+            invalidFence|=required[i]==UINT64_MAX;
+        }
+        allBusy=pendingSlots==required.size();
+        if(!invalidFence&&submitted>=completed)pendingSignals=submitted-completed;
+    }
+    double Stamp()const{return enabled?XrDiagNowMs():0;}
+    double Since(double value)const{return enabled?XrDiagNowMs()-value:0;}
+    ~XrLightTiming(){
+        if(!enabled||!xr)return;
+        struct Totals{unsigned n{},sampled{},busy{},avoidable{},allBusy{},invalid{},pendingPeak{};uint64_t pending{},signalPeak{};
+            double cycle{},gap{},wait{},allocator{},images{},end{},peak{};};
+        static thread_local Totals t;
+        const auto now=XrDiagNowMs(),cycle=now-start;previousEnd=now;
+        ++t.n;t.cycle+=cycle;t.gap+=gap;t.wait+=wait;t.allocator+=allocator;t.images+=images;t.end+=end;t.peak=std::max(t.peak,cycle);
+        if(allocatorSample){++t.sampled;t.busy+=selectedBusy;t.avoidable+=selectedBusy&&otherReady;t.allBusy+=allBusy;
+            t.invalid+=invalidFence;t.pending+=pendingSlots;t.pendingPeak=std::max(t.pendingPeak,pendingSlots);t.signalPeak=std::max(t.signalPeak,pendingSignals);}
+        if(t.n>=180){const double n=t.n;
+            Log("[XR-LIGHT-TIMING] cycles=%u cycleHz=%.2f cycleMs=%.3f gapMs=%.3f waitFrameMs=%.3f allocatorMs=%.3f swapchainMs=%.3f endFrameMs=%.3f otherMs=%.3f peakMs=%.3f\n",
+                t.n,1000*n/(t.cycle+t.gap),t.cycle/n,t.gap/n,t.wait/n,t.allocator/n,t.images/n,t.end/n,
+                (t.cycle-t.wait-t.allocator-t.images-t.end)/n,t.peak);
+            Log("[XR-SUBMIT-QUEUE] cycles=%u sampled=%u selectedBusy=%u otherReadyWhileBusy=%u allBusy=%u invalidFence=%u pendingSlotsMean=%.3f pendingSlotsMax=%u pendingSignalsMax=%llu\n",
+                t.n,t.sampled,t.busy,t.avoidable,t.allBusy,t.invalid,t.sampled?double(t.pending)/t.sampled:0,t.pendingPeak,t.signalPeak);t={};
+        }
+    }
+};
 
 // QPC milliseconds. GetTickCount64 is used for the one-second window (where its ~15 ms
 // granularity is irrelevant) but not for anything inside a cycle: 15 ms is a whole display
@@ -842,6 +965,57 @@ void OpenXRManager::ReportXrFrameRates() {
 }
 
 DWORD OpenXRManager::FrameThreadMain() {
+    // Bounded whole-chain evidence for the existing log collector, including
+    // runtime-unready ticks. No per-frame file dump or synthetic FPS constant.
+    static uint64_t nextAerDiagnostic=0;
+    const auto diagnosticNow=GetTickCount64();
+    if(diagnosticNow>=nextAerDiagnostic && cvr::framegen::GetSettings().aerV2) {
+        nextAerDiagnostic=diagnosticNow+1000;
+        const auto owner=cvr::framegen::ReadAerModeSnapshot();
+        const auto scene=cvr::framegen::ReadSourceFrameSystemStatus();
+        const auto panel=cvr::ppd::ReadPpdPanelSnapshot();
+        const auto native=cvr::ppd::ReadNativeApplyStatus();
+        const auto& sources=m_aerRealPresenter.PolicyState().sourceIds;
+        Log("[AER] session=%d installed=%d frameBegin=%llu callbackErrors=%llu world=%llu generation=%llu ready=%d camera=%d held=%u sourceL=%lld sourceR=%lld clockSamples=%llu ppdStage=%u nativeStage=%u nativeRevision=%llu\n",
+            m_sessionRunning.load(std::memory_order_acquire)?1:0,scene.installed?1:0,
+            scene.frameBeginCalls,scene.callbackErrors,owner.epochs.gameWorld,owner.generation,owner.ready?1:0,owner.cameraActive?1:0,
+            m_aerRealPresenter.HeldEyeCount(),sources[0],sources[1],owner.fit.samples,unsigned(panel.stage),unsigned(native.stage),native.revision);
+        Log("[AER-DIAG] registrations=%llu requestedSource=%lld sceneOrdinal=%llu targetNs=%lld runtimeNs=%lld fit=%d slope=%.12g offset=%.12g publishedSerial=%llu publishedSource=%lld convert=%d admission=%d sourceGeneration=%llu calibration=%llu capOk=%llu noSlot=%llu noView=%llu noRes=%llu noFence=%llu noReset=%llu\n",
+            scene.registrations,owner.lastPublishedSourceId,owner.lastSceneOrdinal,owner.lastRequestedPoseTimeNs,owner.lastRuntimeTimeNs,
+            owner.fit.valid?1:0,owner.fit.secondsPerSourceId,owner.fit.offsetSeconds,m_aerLastCaptureSerial,m_aerLastCaptureSource,
+            m_aerLastConvertedCode,m_aerLastAdmissionCode,m_aerLastSourceGeneration,m_aerLastCalibrationRevision,
+            CyberpunkVR_DebugCapOk.load(),CyberpunkVR_DebugCapSkipNoSlot.load(),CyberpunkVR_DebugCapSkipNoView.load(),
+            CyberpunkVR_DebugCapSkipNoRes.load(),CyberpunkVR_DebugCapSkipFence.load(),CyberpunkVR_DebugCapSkipReset.load());
+        const auto capture=cvr::framegen::ReadAerCaptureDiagnostics();
+        using Reason=cvr::framegen::AerCaptureReason;
+        Log("[AER-CAP] coherent=%d reason=%u serial=%llu source=%lld epoch=%llu pool=%llu publishedSlot=%llu writerSlot=%llu pins=0x%llx writes=0x%llx fence=%llu completed=%llu unknown=%llu receiptFlags=0x%llx guides=0x%llx attempts=%llu published=%llu noSlot=%llu rejectedReceipt=%llu missingStamp=%llu missingGuides=%llu signalFailed=%llu\n",
+            capture.coherent?1:0,unsigned(capture.reason),capture.last.captureSerial,capture.last.sourceId,capture.last.rendererEpoch,
+            capture.last.poolCount,capture.last.publishedSlot,capture.last.writerSlot,capture.last.pinnedMask,capture.last.writingMask,
+            capture.last.captureFenceValue,capture.last.captureFenceCompleted,capture.last.producerUnknown,capture.last.receiptFlags,capture.last.guidesMask,
+            capture.counts[size_t(Reason::Attempt)],capture.counts[size_t(Reason::Published)],capture.counts[size_t(Reason::NoSlot)],
+            capture.counts[size_t(Reason::MainReceiptRejected)],capture.counts[size_t(Reason::NativeStampMissing)],
+            capture.counts[size_t(Reason::GuidesMissing)],capture.counts[size_t(Reason::SignalFailed)]);
+    }
+    bool aerContextHandled=false;
+    const auto invalidateUnavailableContext=[this] {
+        const auto settings=cvr::framegen::GetSettings();
+        cvr::framegen::UpdateAerModeRuntime({settings.aerV2,false,0,GetTrackingOriginSerial(),0});
+        m_aerRealPresenter.Reset();
+        const auto scene=cvr::framegen::ReadSourceFrameSystemStatus().scene;
+        const auto native=cvr::ppd::ReadNativeApplyStatus();
+        // Swapchain recreation temporarily has no output; preserve the pending
+        // transaction until new source descriptors and both XR eyes confirm it.
+        if(!native.OwnsDimensions()||!scene.valid||scene.paused||!IsSessionRunning()||ExternalPoseResetPending())
+            cvr::ppd::InvalidatePpdSourceContext();
+        m_gameFgPresenter.Reset();
+        if(m_aerReconstruction)m_aerReconstruction->Collect();
+        m_framegen.Reset("unavailable-context");
+    };
+    struct ContextExit {
+        const decltype(invalidateUnavailableContext)& invalidate;
+        const bool& handled;
+        ~ContextExit(){if(!handled)invalidate();}
+    } contextExit{invalidateUnavailableContext,aerContextHandled};
     uint64_t monoWaitLogCounter = 0;
     uint64_t steamVrStartupWaitLogCounter = 0;
     uint64_t displayFrameIndex = 0;
@@ -950,6 +1124,7 @@ DWORD OpenXRManager::FrameThreadMain() {
 
     if (m_stopFrameThread.load(std::memory_order_relaxed)) return 0;
     do {
+        XrLightTiming lightTiming;
         PollEvents();
         TickAutoCalibration();
 
@@ -1006,7 +1181,7 @@ DWORD OpenXRManager::FrameThreadMain() {
         //
         // The old wait is kept behind the flag: its comment was written when the pose WAS
         // re-located per submit, and under that condition it was right.
-        if (!CyberpunkVR_XrPaceByRuntime && !cvr::framegen::Enabled() &&
+        if (!CyberpunkVR_XrPaceByRuntime && !cvr::framegen::CaptureProjectionEnabled() &&
             m_monoSubmitEnabled.load(std::memory_order_relaxed) &&
             m_monoPresentEvent) {
             uint64_t latestMonoSerial = 0;
@@ -1067,8 +1242,10 @@ DWORD OpenXRManager::FrameThreadMain() {
         XrMark('W');
         CVR_DIAGNOSTIC(CyberpunkVR_DebugXrWaits.fetch_add(1, std::memory_order_relaxed));
         const double waitEnterMs = CyberpunkVR_XrRateLog ? XrDiagNowMs() : 0;
+        const auto timedWaitFrame=lightTiming.Stamp();
         XrResult res = xrWaitFrame(m_session, &waitInfo, &frameState);
         const double waitMs = CyberpunkVR_XrRateLog ? XrDiagNowMs() - waitEnterMs : 0;
+        lightTiming.wait=lightTiming.Since(timedWaitFrame);lightTiming.xr=XR_SUCCEEDED(res);
         CVR_DIAGNOSTIC(CyberpunkVR_DebugXrWaitsReturned.fetch_add(1, std::memory_order_relaxed));
         if (XR_FAILED(res)) {
             CVR_DIAGNOSTIC(CyberpunkVR_DebugXrWaitFailed.fetch_add(1, std::memory_order_relaxed));
@@ -1081,6 +1258,7 @@ DWORD OpenXRManager::FrameThreadMain() {
         // Advance the local 90 Hz slot index (only used to
         // ping-pong the synth scratch slot + stride logs). The blendFactor itself
         // is computed from QPC capture timestamps, not this counter.
+        RefreshSourceClock();
         ++displayFrameIndex;
         if (frameState.predictedDisplayPeriod > 0) {
             cvr::framegen::DisplayPeriod(frameState.predictedDisplayPeriod);
@@ -1165,6 +1343,34 @@ DWORD OpenXRManager::FrameThreadMain() {
         uint32_t viewCountOutput = 0;
         const bool monoEnabled = m_monoSubmitEnabled.load(std::memory_order_relaxed);
         const bool menuRectActive = (GetMenuRectMode() != 0) || (GetMenuMode() != 0);
+        const bool editorUiEnabled=cvr::menu_preview::EditorUiSeparationEnabled();
+        bool editorControllerSampled=false;
+        cvr::menu_preview::Lease editorUiCurrent;
+        const bool editorUiCurrentKnown=editorUiEnabled&&cvr::menu_preview::TryAcquireCurrent(editorUiCurrent);
+        if(editorUiEnabled&&(!menuRectActive||(editorUiCurrentKnown&&editorUiCurrent.metadata.screen!=2)||
+           (m_editorUiLifecycleEpoch&&!cvr::menu_preview::IsPreviewEpochOpen(m_editorUiLifecycleEpoch)))){
+            const bool hadEditorUi=m_editorUiLifecycleEpoch||m_editorUiDisplay||m_editorUiPreparedSerial||m_editorUiAnchor.Valid();
+            m_worldFrameReplay.Invalidate();m_editorUiDisplay.reset();m_editorUiDisplayOrigin=0;m_editorUiDisplaySwapchain=XR_NULL_HANDLE;m_editorUiAnchor.Reset();
+            if(hadEditorUi){m_editorUiQuad.Shutdown();m_editorUiPreparedSerial=0;
+                std::lock_guard captureLock(m_captureMutex);
+                if(m_editorSceneResample){m_editorSceneResample->Collect();if(m_editorSceneResample->TryShutdown())m_editorSceneResample.reset();}}
+            m_editorUiLifecycleEpoch=0;cvr::menu_preview::ClearEditorUiSurfaces();
+            cvr::menu_preview::ClearEditorSceneImages();
+        }
+        if(editorUiCurrentKnown&&editorUiCurrent.metadata.screen==2)m_editorUiLifecycleEpoch=editorUiCurrent.metadata.screenEpoch;
+        if(cvr::menu_preview::EditorFreshnessEnabled())cvr::menu_preview::EditorFreshnessScope(m_editorUiLifecycleEpoch);
+        const auto freshnessTerminal=[&](cvr::menu_preview::FreshnessEvent event,uint64_t serial=0,bool retained=false){
+            if(!cvr::menu_preview::EditorFreshnessEnabled())return;
+            cvr::menu_preview::FreshnessSample p;p.epoch=m_editorUiLifecycleEpoch;p.setup=editorUiCurrentKnown?editorUiCurrent.metadata.setupID:0;p.source=serial;p.displayTime=frameState.predictedDisplayTime;p.flags=unsigned(retained);
+            cvr::menu_preview::NoteEditorFreshness(event,cvr::menu_preview::FreshnessStage::Terminal,p);cvr::menu_preview::EmitEditorFreshness();
+        };
+        static int lastMenuState=-1;
+        static unsigned menuTransitionLogs=0;
+        if(lastMenuState!=int(menuRectActive)){
+            lastMenuState=int(menuRectActive);
+            if(menuTransitionLogs++<64)Log("[MENU-MODE] active=%d native=%d rect=%d worldMap=%.0f origin=%llu\n",
+                int(menuRectActive),GetMenuMode(),GetMenuRectMode(),GetSharedSlot(81),GetTrackingOriginSerial());
+        }
         // Menu closed -> drop the latched panel anchors so the NEXT menu re-anchors in
         // front of wherever the player is looking at open time.
         if (!menuRectActive) {
@@ -1173,6 +1379,19 @@ DWORD OpenXRManager::FrameThreadMain() {
             m_menuEyeAnchorValid = false;
         }
         const bool monoReady = monoEnabled && EnsureMonoSubmitResources() && !m_eyeSwapchains.empty();
+        bool replayWorldWhenBusy=false;
+        cvr::framegen::OwnSelectionWitness ownReplayWitness;
+        cvr::xr::WorldFrameKey replayWorldKey{};
+        if(!monoReady||!frameState.shouldRender||ExternalPoseResetPending())m_worldFrameReplay.Invalidate();
+        {
+            cvr::framegen::InstallAerModeOwner();
+            uint64_t rendererEpoch{};
+            {std::lock_guard lock(m_presentMutex);rendererEpoch=m_captureResourceEpoch;}
+            const auto settings=cvr::framegen::GetSettings();
+            cvr::framegen::UpdateAerModeRuntime({settings.aerV2,
+                monoReady && !menuRectActive && m_sessionRunning.load(std::memory_order_acquire) && !ExternalPoseResetPending(),
+                rendererEpoch,GetTrackingOriginSerial(),frameState.predictedDisplayTime});
+        }
         if (monoReady && !m_views.empty()) {
             XrViewLocateInfo viewLocateInfo{XR_TYPE_VIEW_LOCATE_INFO};
             viewLocateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -1407,6 +1626,7 @@ DWORD OpenXRManager::FrameThreadMain() {
                     filteredHeadPose.orientation.y, filteredHeadPose.orientation.z,
                     filteredHeadPose.orientation.w, true,
                     m_trackingOriginSerial.load(std::memory_order_acquire)};
+                m_coherentHeadPose.locatedTime=locateTime;
             }
             m_externalPoseReset.Applied(externalResetSerial);
             externalResetLock.unlock();
@@ -1437,12 +1657,65 @@ DWORD OpenXRManager::FrameThreadMain() {
                 cvr::vrui::Tracking uiTracking{};
                 uiTracking.time=frameState.predictedDisplayTime;uiTracking.origin=GetTrackingOriginSerial();
                 uiTracking.head=location.pose;uiTracking.valid=headPoseLocated;
-                // D-PAD chord state (left hand is processed first, right second):
-                // HOLD the LEFT stick click, pick the direction with the RIGHT stick.
-                bool leftStickClicked  = false;
-                bool dpadUsedThisFrame = false;
+                float stickX[2]{};
+                float stickY[2]{};
+                bool stickClicked[2]{};
+                bool primaryPressed[2]{};
+                bool secondaryPressed[2]{};
+                // Scalar editor controls do not require a located hand pose.
+                // Reuse these same left-hand values in the ordinary snapshot.
+                cvr::menu_preview::EditorControllerSample editorControl;
+                editorControl.timeNs=frameState.predictedDisplayTime;editorControl.origin=GetTrackingOriginSerial();
+                editorControl.deadzone=g_liveControls.xrLeftStickDeadzone;
+                XrActionStateGetInfo editorGet{XR_TYPE_ACTION_STATE_GET_INFO};editorGet.subactionPath=m_handPaths[0];
+                XrActionStateFloat editorGrip{XR_TYPE_ACTION_STATE_FLOAT};editorGet.action=m_gripAction;
+                const bool leftGripActive=m_gripAction!=XR_NULL_HANDLE&&XR_SUCCEEDED(xrGetActionStateFloat(m_session,&editorGet,&editorGrip))&&editorGrip.isActive;
+                XrActionStateVector2f editorStick{XR_TYPE_ACTION_STATE_VECTOR2F};editorGet.action=m_thumbstickAction;
+                const bool leftStickActive=m_thumbstickAction!=XR_NULL_HANDLE&&XR_SUCCEEDED(xrGetActionStateVector2f(m_session,&editorGet,&editorStick))&&editorStick.isActive;
+                XrActionStateBoolean editorClick{XR_TYPE_ACTION_STATE_BOOLEAN};editorGet.action=m_thumbstickClickAction;
+                const bool editorClickActive=m_thumbstickClickAction!=XR_NULL_HANDLE&&XR_SUCCEEDED(xrGetActionStateBoolean(m_session,&editorGet,&editorClick))&&editorClick.isActive;
+                if(editorClickActive)editorControl.stickClick=editorClick.currentState!=XR_FALSE;
+                if(leftGripActive)editorControl.grip=editorGrip.currentState;
+                if(leftStickActive){editorControl.stickX=editorStick.currentState.x;editorControl.stickY=editorStick.currentState.y;}
+                editorControl.available=syncRes==XR_SUCCESS&&gameplayInputActive&&leftGripActive&&leftStickActive;
+                editorControl.orbitDeadzone=g_liveControls.xrRightStickDeadzone;
+                XrActionStateVector2f editorRightStick{XR_TYPE_ACTION_STATE_VECTOR2F};editorGet.subactionPath=m_handPaths[1];editorGet.action=m_thumbstickAction;
+                const bool rightStickActive=m_thumbstickAction!=XR_NULL_HANDLE&&XR_SUCCEEDED(xrGetActionStateVector2f(m_session,&editorGet,&editorRightStick))&&editorRightStick.isActive;
+                if(rightStickActive)editorControl.orbitX=editorRightStick.currentState.x;
 
-                std::lock_guard<std::mutex> handLock(m_handMutex);
+                constexpr uint16_t XB_DPAD_UP     = 0x0001;
+                constexpr uint16_t XB_DPAD_DOWN   = 0x0002;
+                constexpr uint16_t XB_DPAD_LEFT   = 0x0004;
+                constexpr uint16_t XB_DPAD_RIGHT  = 0x0008;
+                constexpr uint16_t XB_START       = 0x0010;
+                constexpr uint16_t XB_BACK        = 0x0020;
+                constexpr uint16_t XB_LEFT_THUMB  = 0x0040;
+                constexpr uint16_t XB_RIGHT_THUMB = 0x0080;
+                constexpr uint16_t XB_LEFT_SHOULDER  = 0x0100;
+                constexpr uint16_t XB_RIGHT_SHOULDER = 0x0200;
+                constexpr uint16_t XB_A           = 0x1000;
+                constexpr uint16_t XB_B           = 0x2000;
+                constexpr uint16_t XB_X           = 0x4000;
+                constexpr uint16_t XB_Y           = 0x8000;
+
+                bool rightThumbrestTouched=false;
+                bool rightThumbrestAvailable=m_rightThumbrestAvailable.load(std::memory_order_relaxed);
+                if(gameplayInputActive && !m_rightThumbrestProfileKnown.load(std::memory_order_relaxed)){
+                    RefreshRightThumbrestAvailability();
+                    rightThumbrestAvailable=m_rightThumbrestAvailable.load(std::memory_order_relaxed);
+                }
+                if(gameplayInputActive && m_rightThumbrestAction!=XR_NULL_HANDLE){
+                    XrActionStateGetInfo gi{XR_TYPE_ACTION_STATE_GET_INFO};
+                    gi.action=m_rightThumbrestAction;gi.subactionPath=XR_NULL_PATH;
+                    XrActionStateBoolean st{XR_TYPE_ACTION_STATE_BOOLEAN};
+                    if(XR_SUCCEEDED(xrGetActionStateBoolean(m_session,&gi,&st)) && st.isActive){
+                        rightThumbrestAvailable=true;
+                        m_rightThumbrestProfileKnown.store(true,std::memory_order_relaxed);
+                        rightThumbrestTouched=st.currentState!=XR_FALSE;
+                    }
+                }
+
+                std::unique_lock<std::mutex> handLock(m_handMutex);
                 // ONE INSTANT: the head position that goes with these controller poses, plus the
                 // age stamp, both taken inside the hand lock. The head atomics are written a few
                 // lines above in this same iteration but OUTSIDE the lock, so a flush landing
@@ -1654,10 +1927,10 @@ DWORD OpenXRManager::FrameThreadMain() {
                     };
 
                     const float trig = getFloat(m_triggerAction);
-                    const float grip = getFloat(m_gripAction);
+                    const float grip = i==0?editorControl.grip:getFloat(m_gripAction);
                     float sx = 0.0f, sy = 0.0f;
-                    getVec2(m_thumbstickAction, sx, sy);
-                    const bool sclick = getBool(m_thumbstickClickAction);
+                    if(i==0){sx=editorControl.stickX;sy=editorControl.stickY;}else if(rightStickActive){sx=editorRightStick.currentState.x;sy=editorRightStick.currentState.y;}
+                    const bool sclick = i==0?editorControl.stickClick:getBool(m_thumbstickClickAction);
                     auto& uiHand=uiTracking.hands[i];
                     uiHand.stickClick=sclick;uiHand.trigger=trig;uiHand.grip=grip;uiHand.stickY=sy;
                     uiHand.valid=poseValid;
@@ -1671,61 +1944,26 @@ DWORD OpenXRManager::FrameThreadMain() {
                     const bool sec    = getBool(m_secondaryButtonAction);
                     const bool frameBumper=m_steamFrameActions.bumper!=XR_NULL_HANDLE && getBool(m_steamFrameActions.bumper);
 
-                    // XInput-compatible button bits so the hook can OR them into
-                    // XINPUT_GAMEPAD.wButtons directly (XINPUT_GAMEPAD_*).
-                    constexpr uint16_t XB_A              = 0x1000;
-                    constexpr uint16_t XB_B              = 0x2000;
-                    constexpr uint16_t XB_X              = 0x4000;
-                    constexpr uint16_t XB_Y              = 0x8000;
-                    constexpr uint16_t XB_LEFT_SHOULDER  = 0x0100;
-                    constexpr uint16_t XB_RIGHT_SHOULDER = 0x0200;
-                    constexpr uint16_t XB_LEFT_THUMB     = 0x0040;
-                    constexpr uint16_t XB_RIGHT_THUMB    = 0x0080;
-                    constexpr uint16_t XB_DPAD_UP        = 0x0001;
-                    constexpr uint16_t XB_DPAD_DOWN      = 0x0002;
-                    constexpr uint16_t XB_DPAD_LEFT     = 0x0004;
-                    constexpr uint16_t XB_DPAD_RIGHT     = 0x0008;
-                    (void)XB_LEFT_THUMB;
+                    stickX[i]=sx;
+                    stickY[i]=sy;
+                    stickClicked[i]=sclick;
+                    primaryPressed[i]=prim;
+                    secondaryPressed[i]=sec;
 
                     if (i == 0) {
                         ctrl.leftTrigger = trig;
                         ctrl.leftGrip    = grip;
                         ctrl.leftThumbX  = sx;
                         ctrl.leftThumbY  = sy;
-                        if (prim)   ctrl.buttons |= XB_X;
-                        if (sec)    ctrl.buttons |= XB_Y;
                         if(frameBumper)ctrl.buttons|=XB_LEFT_SHOULDER;
                         // Only Frame's separate bumper emits LB here. The grip
                         // remains available for magazine grabs and VR gestures.
-
-                        // LEFT stick click = D-Pad modifier (direction picked with the
-                        // RIGHT stick, see the right-hand branch). The vanilla L3
-                        // (sprint) is emitted DEFERRED, after the loop: only when the
-                        // click is released without a D-Pad direction having been used.
-                        leftStickClicked = sclick;
                     } else {
                         ctrl.rightTrigger = trig;
                         ctrl.rightGrip    = grip;
                         ctrl.rightThumbX  = sx;
                         ctrl.rightThumbY  = sy;
-                        if (sclick) ctrl.buttons |= XB_RIGHT_THUMB;
-                        if (prim)   ctrl.buttons |= XB_A;
-                        if (sec)    ctrl.buttons |= XB_B;
                         if(frameBumper)ctrl.buttons|=XB_RIGHT_SHOULDER;
-
-                        // D-PAD CHORD: while the LEFT stick click is held, the RIGHT
-                        // stick picks the D-Pad direction. The right axes are zeroed for
-                        // the whole hold so snap-turn/camera cannot fire during selection.
-                        if (leftStickClicked) {
-                            float threshold = CyberpunkVR_DpadChordStick;
-                            if (!(threshold > 0.05f) || threshold > 1.0f) threshold = 0.90f;
-                            if (sy > threshold)  { ctrl.buttons |= XB_DPAD_UP;    dpadUsedThisFrame = true; }
-                            if (sy < -threshold) { ctrl.buttons |= XB_DPAD_DOWN;  dpadUsedThisFrame = true; }
-                            if (sx < -threshold) { ctrl.buttons |= XB_DPAD_LEFT;  dpadUsedThisFrame = true; }
-                            if (sx > threshold)  { ctrl.buttons |= XB_DPAD_RIGHT; dpadUsedThisFrame = true; }
-                            ctrl.rightThumbX = 0.0f;
-                            ctrl.rightThumbY = 0.0f;
-                        }
 
 
                         // Right grip is RESERVED for the hand-to-holster equip system: a CET mod reads
@@ -1736,35 +1974,42 @@ DWORD OpenXRManager::FrameThreadMain() {
                     }
                 }
 
-                // The overlay reads RAW clicks first: L3+R3 takes priority over
-                // cyberware even when the left grip is held too.
+                // Native editor scope/offset locks must never nest inside hand/input locks.
+                handLock.unlock();
+                editorControl.blocked=OverlayIsVisible()||cvr::vrui::Visible()||cvr::vrui::CapturesInput();
+                const bool editorClaimed=cvr::menu_preview::HandleSpatialEditorController(editorControl);editorControllerSampled=true;
+                // A consumed reset click remains ours until its physical release.
+                static bool editorConsumedLeftClick=false;
+                if(editorClickActive&&!editorControl.stickClick)editorConsumedLeftClick=false;
+                if(editorClaimed&&editorControl.stickClick)editorConsumedLeftClick=true;
+                const bool editorLeftClickClaimed=editorClaimed||editorConsumedLeftClick;
+                if(editorLeftClickClaimed){stickClicked[0]=false;uiTracking.hands[0].stickClick=false;ctrl.buttons&=~XB_LEFT_THUMB;}
+                cvr::menu_preview::ConsumeEditorOrbitX(editorClaimed,ctrl.rightThumbX,stickX[1]);
+                if(editorClaimed){
+                    ctrl.leftGrip=ctrl.leftThumbX=ctrl.leftThumbY=0;ctrl.buttons&=~XB_LEFT_THUMB;
+                    stickX[0]=stickY[0]=0;stickClicked[0]=false;
+                    uiTracking.hands[0].grip=uiTracking.hands[0].stickY=0;uiTracking.hands[0].stickClick=false;
+                    static uint64_t claims{};if(++claims<=8||claims%180==0)Log("[SpatialEditor-Controller] claimed left grip/stick/click time=%lld origin=%llu x=%g y=%g reset=%u; other controls and physical trigger values preserved\n",editorControl.timeNs,editorControl.origin,double(editorControl.stickX),double(editorControl.stickY),unsigned(editorControl.stickClick));
+                }
                 cvr::vrui::UpdateTracking(uiTracking);
-                const bool cyberwareClaim=cvr::input::UpdateCyberwareChord(leftStickClicked,ctrl.leftGrip,
-                    uiTracking.hands[1].stickClick,gameplayInputActive);
-                if(cyberwareClaim) {
-                    ctrl.leftGrip=0.f;
-                    ctrl.buttons &= static_cast<uint16_t>(~0x000f); // no D-pad from the same chord
-                }
 
-                // DEFERRED L3 (sprint): the left stick click doubles as the D-Pad
-                // modifier. Emit the vanilla stick-click press only when the click is
-                // RELEASED without any D-Pad direction having been used during the hold
-                // (one-frame press; the game latches button edges per poll).
-                {
-                    static bool s_l3Held = false;
-                    static bool s_l3UsedForDpad = false;
-                    if(cyberwareClaim)s_l3UsedForDpad=true;
-                    if(uiTracking.hands[0].stickClick && uiTracking.hands[1].stickClick)s_l3UsedForDpad=true;
-                    if (leftStickClicked) {
-                        if (dpadUsedThisFrame) s_l3UsedForDpad = true;
-                        s_l3Held = true;
-                    } else {
-                        if (s_l3Held && !s_l3UsedForDpad)
-                            ctrl.buttons |= 0x0040;   // XINPUT_GAMEPAD_LEFT_THUMB
-                        s_l3Held = false;
-                        s_l3UsedForDpad = false;
-                    }
-                }
+                struct ChordRuntimeState {
+                    int effectiveMode=-1;
+                    bool modifierHeld=false;
+                    bool modifierPassthrough=false;
+                    bool modifierDeferred=false;
+                    bool chordConsumed=false;
+                    bool dpadArmed=false;
+                    bool menuDown=false;
+                    bool menuChorded=false;
+                    bool faceWasDown[4]{};
+                    bool faceChordLatched[4]{};
+                    bool leftGripDown=false;
+                    bool cyberwareGripLatched=false;
+                    uint16_t deferredTapButton=0;
+                    uint64_t deferredTapUntilMs=0;
+                };
+                static ChordRuntimeState s_chord{};
 
                 auto getGlobalBool=[&](XrAction action) -> bool {
                     if(action==XR_NULL_HANDLE)return false;
@@ -1773,17 +2018,161 @@ DWORD OpenXRManager::FrameThreadMain() {
                     XrActionStateBoolean st{XR_TYPE_ACTION_STATE_BOOLEAN};
                     return XR_SUCCEEDED(xrGetActionStateBoolean(m_session,&gi,&st)) && st.isActive && st.currentState;
                 };
-                if(gameplayInputActive)ctrl.buttons|=m_steamFrameActions.GlobalButtons(getGlobalBool);
+
+                if(gameplayInputActive){
+                    const bool menuPressed=getGlobalBool(m_menuButtonAction);
+                    const int configuredMode=GetChordActivationMethod();
+                    const int effectiveMode=(configuredMode==2 && !rightThumbrestAvailable)?0:configuredMode;
+                    const bool extraChordActionsEnabled=GetExtraChordActionsEnabled()!=0;
+                    const bool facePressed[4]={
+                        primaryPressed[0],secondaryPressed[0],
+                        primaryPressed[1],secondaryPressed[1]
+                    };
+                    const uint16_t faceBits[4]={XB_X,XB_Y,XB_A,XB_B};
+                    float dpadThreshold=CyberpunkVR_DpadChordStick;
+                    if(!(dpadThreshold>0.05f) || dpadThreshold>1.0f)dpadThreshold=0.90f;
+                    constexpr float dpadNeutralThreshold=0.35f;
+                    const int dpadStick=effectiveMode==0?1:0;
+                    const int recenterButton=effectiveMode==0?2:0;
+                    const int overlayButton=effectiveMode==0?3:1;
+                    const bool modifierPressed=effectiveMode==0?stickClicked[0]:
+                        (effectiveMode==1?stickClicked[1]:rightThumbrestTouched);
+                    const bool gameMenuActive=GetMenuMode()!=0 || GetSharedSlot(81)!=0.0f;
+                    const bool thumbModifier=effectiveMode==0 || effectiveMode==1;
+                    if(editorLeftClickClaimed){
+                        if(effectiveMode==0){
+                            s_chord.modifierHeld=false;s_chord.modifierDeferred=false;s_chord.modifierPassthrough=false;
+                            s_chord.chordConsumed=false;s_chord.dpadArmed=false;
+                        }
+                        if(s_chord.deferredTapButton==XB_LEFT_THUMB){s_chord.deferredTapButton=0;s_chord.deferredTapUntilMs=0;}
+                    }
+                    const bool modifierWasHeld=s_chord.effectiveMode==effectiveMode && s_chord.modifierHeld;
+                    const bool gripPressed=std::isfinite(ctrl.leftGrip) &&
+                        (s_chord.leftGripDown?ctrl.leftGrip>0.4f:ctrl.leftGrip>=0.7f);
+                    const bool chordInputAlreadyActive=
+                        std::abs(stickX[dpadStick])>=dpadNeutralThreshold ||
+                        std::abs(stickY[dpadStick])>=dpadNeutralThreshold ||
+                        (effectiveMode==0 &&
+                            (std::abs(stickX[0])>=dpadNeutralThreshold ||
+                             std::abs(stickY[0])>=dpadNeutralThreshold)) ||
+                        (effectiveMode==1 &&
+                            (std::abs(stickX[1])>=dpadNeutralThreshold ||
+                             std::abs(stickY[1])>=dpadNeutralThreshold)) ||
+                        menuPressed ||
+                        (extraChordActionsEnabled &&
+                            (facePressed[recenterButton] || facePressed[overlayButton] || gripPressed));
+
+                    if(s_chord.effectiveMode!=effectiveMode){
+                        s_chord.effectiveMode=effectiveMode;
+                        s_chord.modifierHeld=modifierPressed;
+                        s_chord.modifierPassthrough=modifierPressed && chordInputAlreadyActive;
+                        s_chord.modifierDeferred=modifierPressed && thumbModifier && gameMenuActive;
+                        s_chord.chordConsumed=false;
+                        s_chord.dpadArmed=false;
+                        s_chord.deferredTapButton=0;
+                        s_chord.deferredTapUntilMs=0;
+                    }else if(modifierPressed){
+                        if(!s_chord.modifierHeld){
+                            s_chord.modifierHeld=true;
+                            s_chord.modifierPassthrough=chordInputAlreadyActive;
+                            s_chord.modifierDeferred=thumbModifier && gameMenuActive;
+                            s_chord.chordConsumed=false;
+                            s_chord.dpadArmed=false;
+                            s_chord.deferredTapButton=0;
+                            s_chord.deferredTapUntilMs=0;
+                        }
+                    }else if(s_chord.modifierHeld){
+                        if(s_chord.modifierDeferred && !s_chord.chordConsumed){
+                            s_chord.deferredTapButton=effectiveMode==0?XB_LEFT_THUMB:XB_RIGHT_THUMB;
+                            s_chord.deferredTapUntilMs=GetTickCount64()+50;
+                        }
+                        s_chord.modifierHeld=false;
+                        s_chord.modifierPassthrough=false;
+                        s_chord.modifierDeferred=false;
+                        s_chord.chordConsumed=false;
+                        s_chord.dpadArmed=false;
+                    }
+                    const bool chordReady=modifierPressed && modifierWasHeld && !s_chord.modifierPassthrough;
+
+                    // Thumb clicks keep their native gameplay meaning. In native menus the
+                    // selected click modifier is deferred until release so a completed chord
+                    // cannot also activate the menu's normal thumb-click action.
+                    const bool suppressLeftThumb=effectiveMode==0 && s_chord.modifierDeferred;
+                    const bool suppressRightThumb=effectiveMode==1 && s_chord.modifierDeferred;
+                    if(stickClicked[0] && !suppressLeftThumb)ctrl.buttons|=XB_LEFT_THUMB;
+                    if(stickClicked[1] && !suppressRightThumb)ctrl.buttons|=XB_RIGHT_THUMB;
+                    if(s_chord.deferredTapButton!=0){
+                        if(GetTickCount64()<s_chord.deferredTapUntilMs)ctrl.buttons|=s_chord.deferredTapButton;
+                        else{s_chord.deferredTapButton=0;s_chord.deferredTapUntilMs=0;}
+                    }
+
+                    if(chordReady){
+                        const float sx=stickX[dpadStick],sy=stickY[dpadStick];
+                        if(!s_chord.dpadArmed && std::abs(sx)<dpadNeutralThreshold && std::abs(sy)<dpadNeutralThreshold)
+                            s_chord.dpadArmed=true;
+                        if(s_chord.dpadArmed){
+                            if(sy>dpadThreshold){ctrl.buttons|=XB_DPAD_UP;s_chord.chordConsumed=true;}
+                            if(sy<-dpadThreshold){ctrl.buttons|=XB_DPAD_DOWN;s_chord.chordConsumed=true;}
+                            if(sx<-dpadThreshold){ctrl.buttons|=XB_DPAD_LEFT;s_chord.chordConsumed=true;}
+                            if(sx>dpadThreshold){ctrl.buttons|=XB_DPAD_RIGHT;s_chord.chordConsumed=true;}
+                            if(dpadStick==0){ctrl.leftThumbX=0;ctrl.leftThumbY=0;}
+                            else{ctrl.rightThumbX=0;ctrl.rightThumbY=0;}
+                        }
+                    }
+
+                    if(menuPressed && !s_chord.menuDown){
+                        s_chord.menuChorded=chordReady;
+                        if(s_chord.menuChorded)s_chord.chordConsumed=true;
+                    }
+                    if(menuPressed)ctrl.buttons|=s_chord.menuChorded?XB_BACK:XB_START;
+                    else s_chord.menuChorded=false;
+                    s_chord.menuDown=menuPressed;
+
+                    for(int button=0;button<4;++button)
+                        if(!facePressed[button])s_chord.faceChordLatched[button]=false;
+
+                    if(extraChordActionsEnabled && chordReady){
+                        if(facePressed[recenterButton] && !s_chord.faceWasDown[recenterButton]){
+                            s_chord.faceChordLatched[recenterButton]=true;
+                            s_chord.chordConsumed=true;
+                            RequestRecenter();
+                        }
+                        if(facePressed[overlayButton] && !s_chord.faceWasDown[overlayButton]){
+                            s_chord.faceChordLatched[overlayButton]=true;
+                            s_chord.chordConsumed=true;
+                            cvr::vrui::Toggle();
+                        }
+                    }
+
+                    if(!gripPressed)s_chord.cyberwareGripLatched=false;
+                    if(extraChordActionsEnabled && chordReady && gripPressed && !s_chord.leftGripDown &&
+                        !gameMenuActive && cvr::input::RequestCyberwareChord()){
+                        s_chord.cyberwareGripLatched=true;
+                        s_chord.chordConsumed=true;
+                    }
+                    if(s_chord.cyberwareGripLatched && gripPressed)ctrl.leftGrip=0.0f;
+                    s_chord.leftGripDown=gripPressed;
+
+                    for(int button=0;button<4;++button){
+                        if(facePressed[button] && !s_chord.faceChordLatched[button])ctrl.buttons|=faceBits[button];
+                        s_chord.faceWasDown[button]=facePressed[button];
+                    }
+
+                    // Steam Frame's physical D-pad/View/X/Y remain independent hardware
+                    // buttons and are merged after the configurable Touch-style chords.
+                    ctrl.buttons|=m_steamFrameActions.GlobalButtons(getGlobalBool);
+                }else{
+                    s_chord={};
+                }
+
+                if(editorLeftClickClaimed)ctrl.buttons&=~XB_LEFT_THUMB;
                 // The extra physical Frame buttons obey the same overlay capture
                 // as Touch controls. Menu/Start retains the existing escape path.
                 if(cvr::vrui::CapturesInput())ctrl={};
-                if (gameplayInputActive) {
-                    if(getGlobalBool(m_menuButtonAction))ctrl.buttons|=0x0010; // XINPUT_GAMEPAD_START
-
-                    // Publish the snapshot for the XInput hook.
-                    std::lock_guard<std::mutex> inLock(m_inputMutex);
-                    m_controllerState = ctrl;
-                }
+                // Always publish a fresh snapshot so disabling gameplay actions cannot
+                // leave a previous button or axis latched in the XInput merge.
+                std::lock_guard<std::mutex> inLock(m_inputMutex);
+                m_controllerState=ctrl;
             }
 
             // Rotate the head velocity into the same base-recentered frame as the
@@ -1811,12 +2200,34 @@ DWORD OpenXRManager::FrameThreadMain() {
             if (resetStable) m_coherentHeadPose.valid = false;
         }
 
+        if(!editorControllerSampled){cvr::menu_preview::EditorControllerSample unavailable;
+            unavailable.timeNs=frameState.predictedDisplayTime;unavailable.origin=GetTrackingOriginSerial();
+            cvr::menu_preview::HandleSpatialEditorController(unavailable);}
+        {cvr::menu_preview::Lease diag;if(cvr::menu_preview::TryAcquireCurrent(diag)&&diag.metadata.screen==2){static unsigned rows{};if(rows++<8)Log("[MenuPreviewUiPair] xr-entry enabled=%u ready=%u views=%u swaps=%zu menu=%u render=%u\n",unsigned(monoEnabled),unsigned(monoReady),viewCountOutput,m_eyeSwapchains.size(),unsigned(menuRectActive),unsigned(frameState.shouldRender));}}
+        if(!monoReady || viewCountOutput!=m_eyeSwapchains.size() || viewCountOutput<2) {
+            invalidateUnavailableContext();
+        } else {
+            if(m_aerReconstruction)m_aerReconstruction->Collect();
+            const auto context=cvr::framegen::ReadAerModeSnapshot();
+            if(!context.requested || !context.ready || menuRectActive) {
+                m_aerRealPresenter.Reset();
+                const auto scene=cvr::framegen::ReadSourceFrameSystemStatus().scene;
+                if(menuRectActive||(context.requested&&!context.ready)||!scene.valid||scene.paused)cvr::ppd::InvalidatePpdSourceContext();
+            }
+        }
+        aerContextHandled=true;
+        if(m_ownGenerationBridge && !cvr::framegen::GetSettings().aerV2)
+            m_ownGenerationBridge->Maintain({frameState.predictedDisplayTime,frameState.predictedDisplayPeriod});
         if (monoReady && viewCountOutput == m_eyeSwapchains.size()) {
             {
+                std::optional<MenuUiSelection> menuUi;bool menuUiSelected=false;
+                const XrCompositionLayerBaseHeader* editorUiLayer=nullptr;
+                bool editorUiBlocked=false,editorUiRetained=false;
                 ID3D12Resource* monoSource = nullptr;
                 ID3D12Resource* monoDepthSource = nullptr;
                 ID3D12Resource* vrcamEye=nullptr;
                 uint64_t capturedReadFence=0;
+                bool capturedCopySubmitted=false,capturedCopySignaled=false;
                 uint64_t presentSerial = 0;
                 uint64_t monoDepthFence = 0;   // writer-queue fence guarding monoDepthSource
                 XrPosef monoPoses[2]{};
@@ -1827,31 +2238,61 @@ DWORD OpenXRManager::FrameThreadMain() {
                 bool monoHasDepth = false;
                 cvr::framegen::Frame fgFrame;
                 cvr::framegen::Selection fgSelection;
-                bool fgSelected=false;
+                bool fgSelected=false,fgGameSelected=false;
+                const auto aerMode=cvr::framegen::ReadAerModeSnapshot();
+                const auto generationSettings=cvr::framegen::GetSettings();
+                const bool generationOwnerReady=!cvr::framegen::NativeFgStereoRequested()&&UpdateOwnedGeneration(generationSettings);
+                const bool aerActive=aerMode.requested && aerMode.ready && !menuRectActive;
+                const auto pairedScene=cvr::framegen::ReadSourceFrameSystemStatus().scene;
+                const bool pairedWorld=CyberpunkVR_StereoSubmit!=0&&!generationSettings.aerV2&&!menuRectActive&&pairedScene.valid&&!pairedScene.paused;
+                if((pairedWorld||menuRectActive)&&m_eyeSwapchains.size()==2){
+                    replayWorldKey={m_session,m_localSpace,pairedScene.worldEpoch,GetTrackingOriginSerial(),0,
+                        {m_eyeSwapchains[0].handle,m_eyeSwapchains[1].handle},m_worldReplaySessionRun.load(std::memory_order_acquire),menuRectActive};
+                }else m_worldFrameReplay.Invalidate();
+                bool pairedSelected=false;
+                bool pairedBaselineCalibration=false;
+                if(!pairedWorld)m_pairedDisplayHistory={};
+                std::array<cvr::framegen::AerRealGeometry,2> pairedGeometry{};
+                std::shared_ptr<cvr::framegen::Selection> pairedOwner;
+                if(!aerActive&&!pairedWorld)m_gameFgPresenter.Reset();
+                // FG can stop while the stereo world remains active. Selection
+                // then stops polling its leases, but completed consumers must
+                // still be retired without resetting the current eye history.
+                m_gameFgPresenter.Collect();
+                cvr::framegen::AerRealSelection aerSelection;
+                std::optional<cvr::ppd::PpdSourceObservation> ppdObservation;
+                std::optional<cvr::framegen::AerNativePair> aerNativePair;
+                std::array<cvr::render::AerRecordTicket,2> aerTickets{};
+                bool aerSelected=false;
                 {
                     std::lock_guard<std::mutex> lock(m_presentMutex);
                     if (m_monoCapturedFrame.texture &&
                         m_monoCapturedFrame.serial != 0 &&
-                        m_monoCapturedFrame.hasView[0] &&
-                        m_monoCapturedFrame.hasView[1] &&
+                        ((m_monoCapturedFrame.hasView[0] && m_monoCapturedFrame.hasView[1]) ||
+                         (aerActive && (m_monoCapturedFrame.hasView[0] || m_monoCapturedFrame.hasView[1]))) &&
                         m_captureLeases.Pin(reinterpret_cast<uintptr_t>(m_monoCapturedFrame.texture))) {
                         monoSource = m_monoCapturedFrame.texture;
                         monoSource->AddRef();
                         presentSerial = m_monoCapturedFrame.serial;
                         monoCaptureMs = m_monoCapturedFrame.captureMs;
+                        fgFrame.colorCompletion=m_monoCapturedFrame.colorCompletion;
+                        replayWorldKey.resources=m_captureResourceEpoch;
+                        fgFrame.nativeStamp=m_monoCapturedFrame.nativeStamp;
                         for (int eye = 0; eye < 2; ++eye) {
-                            if(!cvr::framegen::Enabled())m_monoCapturedFrame.framegenInputs[eye].reset();
+                            if(!cvr::framegen::CaptureInputsEnabled())m_monoCapturedFrame.framegenInputs[eye].reset();
                             monoPoses[eye] = m_monoCapturedFrame.poses[eye];
                             monoPoseIds[eye]=m_monoCapturedFrame.poseIds[eye];
                             monoFovs[eye] = m_monoCapturedFrame.fovs[eye];
                             monoHasView[eye] = m_monoCapturedFrame.hasView[eye];
                             fgFrame.inputs[eye]=m_monoCapturedFrame.framegenInputs[eye];
+                            fgFrame.projection[eye]=m_monoCapturedFrame.projections[eye];
                         }
-                        if(CyberpunkVR_StereoSubmit && viewCountOutput>=2) {
+                        if(!aerActive && CyberpunkVR_StereoSubmit && viewCountOutput>=2) {
                             const auto eye=CyberpunkVR_MainIsRightEye ? 0u : 1u;
                             bool reused=false;
                             vrcamEye=AcquireCapturedVrcamLocked(presentSerial,CyberpunkVR_VrcamEyeReuseMax,
                                 &monoPoses[eye],&monoFovs[eye],&monoPoseIds[eye],&reused);
+                            if(reused)fgFrame.nativeStamp.eyes[eye]={}; // Never borrow current guides/time for an older color slot.
                             if(reused)CVR_DIAGNOSTIC(CyberpunkVR_DebugVrcamEyeReused.fetch_add(1,std::memory_order_relaxed));
                         }
                         // Accept a slightly older depth snapshot instead of dropping the
@@ -1900,11 +2341,17 @@ DWORD OpenXRManager::FrameThreadMain() {
 
                 m_cmdAllocatorIndex = (m_cmdAllocatorIndex + 1) % 3;
                 ID3D12CommandAllocator* currentAllocator = m_cmdAllocators[m_cmdAllocatorIndex];
-                if (m_fenceValue >= 3 && m_fence->GetCompletedValue() < m_fenceValue - 2) {
-                    m_fence->SetEventOnCompletion(m_fenceValue - 2, m_fenceEvent);
-                    WaitForSingleObject(m_fenceEvent, 50);   // 50 ms, not 1000: a display frame is ~11 ms, so a
-                    // full second of waiting here IS the freeze it was meant to prevent. On
-                    // timeout Reset fails, this cycle skips, and the next one submits again.
+                const uint64_t allocatorFence=m_submitAllocatorFences[m_cmdAllocatorIndex];
+                uint64_t allocatorCompleted=m_fence->GetCompletedValue();
+                lightTiming.ObserveAllocator(allocatorCompleted,m_submitAllocatorFences,m_cmdAllocatorIndex,m_fenceValue);
+                bool allocatorReady=cvr::capture::SubmitFenceValueComplete(allocatorCompleted,allocatorFence);
+                if(!allocatorReady&&allocatorCompleted!=UINT64_MAX&&allocatorFence!=UINT64_MAX){
+                    const auto timedWait=lightTiming.Stamp();
+                    if(SUCCEEDED(m_fence->SetEventOnCompletion(allocatorFence,m_fenceEvent)))
+                        WaitForSingleObject(m_fenceEvent,50);
+                    lightTiming.allocator+=lightTiming.Since(timedWait);
+                    allocatorCompleted=m_fence->GetCompletedValue();
+                    allocatorReady=cvr::capture::SubmitFenceValueComplete(allocatorCompleted,allocatorFence);
                 }
 
                 ID3D12GraphicsCommandList* m_cmdList = m_cmdLists[m_cmdAllocatorIndex];
@@ -1925,13 +2372,224 @@ DWORD OpenXRManager::FrameThreadMain() {
                 // full-resolution copy in the engine's own list (~24 MB a frame at 2444x2444),
                 // so it must stop when nothing consumes it. sync_stereo ORs this with its own
                 // mirror-window request, so turning stereo off does not break the mirror.
-                CyberpunkVR_StereoEyeCapture = CyberpunkVR_StereoSubmit ? 1 : 0;
+                CyberpunkVR_StereoEyeCapture = !aerActive && CyberpunkVR_StereoSubmit ? 1 : 0;
+                if(aerActive && viewCountOutput==2) {
+                    unsigned actualEye=2;
+                    for(unsigned i=0;i<2;++i)if(monoHasView[i] && fgFrame.nativeStamp.eyes[i].mainEyeSource)actualEye=i;
+                    m_aerLastCaptureSerial=presentSerial;
+                    m_aerLastCaptureSource=actualEye<2?fgFrame.nativeStamp.eyes[actualEye].mainEyeSource.sourceId:-1;
+                    m_aerLastConvertedCode=actualEye>1?-3:(!aerMode.cameraActive?-4:-2);
+                    // Keep the legacy latest snapshot for fallback ownership, but
+                    // choose AER from all live, GPU-complete cells. A pending
+                    // latest publication must not hide an older ready left eye.
+                    for(auto& input:fgFrame.inputs)input.reset();
+                    std::vector<cvr::framegen::AerRealCandidate> ready;
+                    ready.reserve(cvr::framegen::AerRealPresenter::MaxReadyCandidates);
+                    // After the allocator wait, retire completed ticket owners
+                    // before selecting cells. This does not wait or release an
+                    // unknown completion; callbacks run without presentMutex.
+                    if(m_aerReconstruction)m_aerReconstruction->Collect();
+                    const auto expectedScope=cvr::camera::AcquireMainEyeSourceForWrite(GetTrackingOriginSerial());
+                    // A new latch/clock can arrive while the producer waits for
+                    // old FIFO cells. Revoke them before requiring a new image.
+                    m_aerRealPresenter.ConstrainSourceScope(expectedScope.value_or(cvr::framegen::MainEyeSourceReceipt{}),m_sourceClock.Generation());
+                    if(aerMode.cameraActive && expectedScope) {
+                        auto frames=CollectReadyMainCaptures(*expectedScope);
+                        for(auto& frame:frames) {
+                            unsigned eye=2;
+                            for(unsigned i=0;i<2;++i)if(frame.color[i] && frame.nativeStamp.eyes[i].mainEyeSource)eye=i;
+                            if(eye>=2)continue;
+                            if(!cvr::camera::ValidateMainEyeSourceReceipt(frame.nativeStamp.eyes[eye].mainEyeSource)) {
+                                RecordAerConsumer([&](auto& d){++d.validationRejected[eye];});continue;
+                            }
+                            auto converted=cvr::framegen::AerRealPresenter::FromMainFrame(std::move(frame),cvr::framegen::AerV2Eye(eye));
+                            m_aerLastConvertedCode=int(converted.code);
+                            RecordAerConsumer([&](auto& d){const auto code=uint32_t(converted.code);if(code<12)++d.conversions[eye][code];});
+                            if(converted)ready.push_back(std::move(*converted.candidate));
+                        }
+                        frames.clear(); // no unused frame lease reaches GPU recording
+                    }
+                    if(m_aerCompositorFrame<(std::numeric_limits<int64_t>::max)()) {
+                        cvr::framegen::AerReadyObserver nativeIngress;
+                        if(cvr::framegen::NativeFgStereoRequested())nativeIngress=[&](const cvr::framegen::AerReadyIngress&batch){m_gameFgPresenter.Ingest(batch);};
+                        else if(generationOwnerReady && generationSettings.enabled && m_ownGenerationBridge &&
+                           generationSettings.backend==cvr::framegen::Backend::OwnNvidia) {
+                            nativeIngress=[&](const cvr::framegen::AerReadyIngress& batch) {
+                                if(m_ownAerSourceGeneration!=batch.sourceGeneration || m_ownAerModeGeneration!=batch.generation) {
+                                    m_ownGenerationBridge->Reset();m_ownAerSourceGeneration=batch.sourceGeneration;
+                                    m_ownAerModeGeneration=batch.generation;
+                                }
+                                // Borrowed, scope/calibration-validated candidates,
+                                // ascending in actual source ID (not R/L draw order).
+                                cvr::framegen::IngestAlternatingBatch(batch.candidates,[&](const auto* candidate) {
+                                    const auto eye=unsigned(candidate->receipt.physicalEye);
+                                    auto nativeSource=candidate->frame;
+                                    const auto& stamp=nativeSource.nativeStamp.eyes[eye];
+                                    const auto& projection=nativeSource.projection[eye];
+                                    nativeSource.inputs[eye]=projection ? cvr::framegen::AcquireInputs(1,stamp.nativeFrame,
+                                        stamp.poseId,stamp.spaceEpoch,projection->queue.Get()) : nullptr;
+                                    nativeSource.identity.inputs=bool(nativeSource.inputs[eye]);
+                                    return m_ownGenerationBridge->IngestAlternating(m_d3dDevice,m_d3dQueue,nativeSource,cpvr::Eye(eye));
+                                });
+                            };
+                        }
+                        aerSelection=m_aerRealPresenter.StepReady({++m_aerCompositorFrame,0,-1,aerMode.generation,aerMode.epochs},ready,nativeIngress);
+                    }
+                    ready.clear(); // only the accepted eyes and actual GPU users persist
+                    m_aerLastAdmissionCode=int(aerSelection.candidateCode);m_aerLastSourceGeneration=aerSelection.sourceGeneration;
+                    m_aerLastCalibrationRevision=aerSelection.calibrationRevision;
+                    RecordAerConsumer([&](auto& d){
+                        ++d.selectionTicks;d.selectedSources=aerSelection.sourceIds;d.sourceGeneration=aerSelection.sourceGeneration;
+                        for(unsigned eye=0;eye<2;++eye)if(aerSelection.newlyAccepted[eye])++d.admissions[eye];
+                    });
+                    aerSelected=bool(aerSelection);monoHasDepth=false;
+                    if(aerSelected) {
+                        cvr::ppd::PpdSourceObservation observation;
+                        observation.aerV2=true;
+                        observation.scope={aerSelection.resourceEpoch,aerSelection.epochs.renderer,
+                            aerSelection.epochs.gameWorld,aerSelection.epochs.hmdWorld,aerSelection.generation,aerSelection.sourceGeneration};
+                        const auto nativeRequest=cvr::ppd::ReadNativeApplyStatus();
+                        observation.nativeRevision=nativeRequest.OwnsDimensions()?nativeRequest.revision:0;
+                        for(unsigned eye=0;eye<2;++eye) {
+                            const auto& selected=*aerSelection.eyes[eye];auto& out=observation.eyes[eye];
+                            const auto sourceDesc=selected.frame.color[eye]->GetDesc();
+                            out.mainSource={uint32_t(sourceDesc.Width),sourceDesc.Height};out.actualMainDescriptor=true;
+                            const auto& f=selected.geometry.renderedFov;
+                            out.renderedFov={f.angleLeft,f.angleRight,f.angleUp,f.angleDown};out.nativeSlProjection=true;
+                            const auto& optics=selected.frame.nativeStamp.eyes[eye].referenceOptics;
+                            out.referenceOptics=optics.valid;
+                            if(optics.valid)out.runtimeFov=optics.applied[eye];
+                            out.crop=selected.geometry.crop;out.sourceId=selected.receipt.sourceId;out.sourceSerial=selected.frame.identity.serial;
+                            const auto& projection=selected.frame.projection[eye];
+                            if(projection && projection->srInputKnown) {
+                                out.srInput={projection->srInputWidth,projection->srInputHeight};out.srInputKnown=true;
+                            }
+                            if(!m_eyeSwapchains[eye].images.empty() && m_eyeSwapchains[eye].images[0].texture) {
+                                const auto output=m_eyeSwapchains[eye].images[0].texture->GetDesc();
+                                out.outputEye={uint32_t(output.Width),output.Height};out.actualOutputDescriptor=true;
+                            }
+                        }
+                        ppdObservation=observation;cvr::ppd::ObservePpdSource(observation);
+                    }
+                    for(unsigned i=0;i<2;++i)if(aerSelection.newlyAccepted[i] && aerSelection.eyes[i]) {
+                        const auto& projection=aerSelection.eyes[i]->frame.projection[i];
+                        if(projection && projection->srInputKnown)cvr::framegen::OnInput(i,projection->srInputWidth,projection->srInputHeight);
+                    }
+                    if(m_ownGenerationBridge && aerSelection.sourceGeneration &&
+                       (m_ownAerSourceGeneration!=aerSelection.sourceGeneration || m_ownAerModeGeneration!=aerSelection.generation)) {
+                        m_ownGenerationBridge->Reset();m_ownAerSourceGeneration=aerSelection.sourceGeneration;
+                        m_ownAerModeGeneration=aerSelection.generation;
+                    }
+                    if(generationOwnerReady && generationSettings.enabled &&
+                       generationSettings.backend==cvr::framegen::Backend::OwnNvidia && aerSelected) {
+                        // Selection is independent of whether this tick supplied
+                        // new full guides. Only actual worker products within the
+                        // current two-eye baseline can reach the existing output.
+                        cvr::framegen::NativeAlternatingOutputContext context;
+                        context.scope=aerSelection.referenceReceipt;context.resourceEpoch=aerSelection.resourceEpoch;
+                        context.captureClockGeneration=aerSelection.captureClockGeneration;
+                        context.historyEpoch=m_ownGenerationBridge->HistoryEpoch();context.maximumSourceId=aerSelection.sourceIds;
+                        for(unsigned eye=0;eye<2;++eye) {
+                            const auto desc=aerSelection.eyes[eye]->frame.color[eye]->GetDesc();
+                            context.expectedExtent[eye]={uint32_t(desc.Width),desc.Height};
+                        }
+                        fgSelected=m_ownGenerationBridge->SelectAlternatingReady(m_d3dDevice,context,
+                            {frameState.predictedDisplayTime,frameState.predictedDisplayPeriod},fgSelection);
+                        if(fgSelected) {
+                            const auto ppd=cvr::ppd::ReadPpdPanelSnapshot();
+                            // A size transaction first receives one actually drawn
+                            // real pair. Do not acknowledge its source IDs using a
+                            // different synthesized/interpolated product.
+                            const bool needRealReceipt=!ppd.calibrated || !ppdObservation || ppd.measuredSource.scope!=ppdObservation->scope ||
+                                ppd.stage==cvr::ppd::PpdPanelStage::Requested ||
+                                ppd.stage==cvr::ppd::PpdPanelStage::WaitingNative || ppd.stage==cvr::ppd::PpdPanelStage::WaitingSource ||
+                                ppd.stage==cvr::ppd::PpdPanelStage::WaitingEyes;
+                            if(!needRealReceipt)aerNativePair=cvr::framegen::BuildAerNativePair(aerSelection,fgSelection.native,m_ownGenerationBridge->HistoryEpoch());
+                            if(!aerNativePair) {
+                                m_ownGenerationBridge->Submitted(fgSelection,m_fence,0,false,false,false,0);
+                                fgSelected=false;fgSelection={};
+                            }
+                        }
+                    }
+                    if(aerSelected&&cvr::framegen::NativeFgStereoRequested()){
+                        const auto ppd=cvr::ppd::ReadPpdPanelSnapshot();
+                        const bool needRealReceipt=!ppd.calibrated||!ppdObservation||ppd.measuredSource.scope!=ppdObservation->scope||
+                            ppd.stage==cvr::ppd::PpdPanelStage::Requested||ppd.stage==cvr::ppd::PpdPanelStage::WaitingNative||
+                            ppd.stage==cvr::ppd::PpdPanelStage::WaitingSource||ppd.stage==cvr::ppd::PpdPanelStage::WaitingEyes;
+                        static uint64_t nativeFgTicks{};if(++nativeFgTicks<=8||nativeFgTicks%180==0)Log("[NATIVE-FG-XR-GATE] ticks=%llu needReal=%d calibrated=%d ppdStage=%u sourceL=%lld sourceR=%lld\n",nativeFgTicks,int(needRealReceipt),int(ppd.calibrated),unsigned(ppd.stage),static_cast<long long>(aerSelection.sourceIds[0]),static_cast<long long>(aerSelection.sourceIds[1]));
+                        if(!needRealReceipt&&m_gameFgPresenter.Select(m_d3dDevice,aerSelection,{frameState.predictedDisplayTime,frameState.predictedDisplayPeriod},fgSelection)){
+                            aerNativePair=cvr::framegen::BuildAerNativePair(aerSelection,fgSelection.native,m_gameFgPresenter.Epoch());
+                            if(aerNativePair)fgGameSelected=fgSelected=true;
+                            else{m_gameFgPresenter.Submitted(fgSelection,m_fence,0,false,false,false,0);fgSelection={};}
+                        }
+                    }
+                    monoHasView[0]=monoHasView[1]=aerSelected;
+                    if(aerSelected) {
+                        if(m_aerOutputGeneration!=aerSelection.generation || m_aerOutputSources!=aerSelection.sourceIds) {
+                            ++m_aerOutputSerial;m_aerOutputGeneration=aerSelection.generation;m_aerOutputSources=aerSelection.sourceIds;
+                        }
+                        // Output-pair identity is separate from an eye source ID,
+                        // native frame token and the desktop Present serial.
+                        presentSerial=m_aerOutputSerial;
+                        for(unsigned eye=0;eye<2;++eye) {
+                            monoPoses[eye]=aerNativePair?aerNativePair->submitPose[eye]:aerSelection.submitPose[eye];
+                            monoFovs[eye]=aerNativePair?aerNativePair->fov[eye]:aerSelection.fov[eye];
+                        }
+                        if(!m_aerReconstruction) {
+                            m_aerReconstruction=std::make_unique<cvr::render::AerReconstructionPass>();
+                            if(!m_aerReconstruction->Initialize(m_d3dDevice))m_aerReconstruction.reset();
+                        }
+                        const auto outputView=DXGI_FORMAT(m_eyeViewFmt.load(std::memory_order_acquire));
+                        const auto outputEncoding=(m_decodeSrgbForUnormSwapchain || outputView==DXGI_FORMAT_R16G16B16A16_FLOAT || outputView==DXGI_FORMAT_R32G32B32A32_FLOAT)
+                            ?cvr::render::AerEncoding::Linear:cvr::render::AerEncoding::EncodedSrgb;
+                        // Cold/format-transition preparation precedes command recording.
+                        // Repeated Prepare uses its cache; Record cannot compile a PSO.
+                        for(unsigned eye=0;eye<2 && aerSelected;++eye) {
+                            const auto source=aerNativePair?aerNativePair->color[eye]:aerSelection.eyes[eye]->frame.color[eye];
+                            const auto target=m_eyeSwapchains[eye].images.empty()?nullptr:m_eyeSwapchains[eye].images[0].texture;
+                            const auto transfer=aerNativePair?aerNativePair->transfer[eye]:aerSelection.eyes[eye]->frame.nativeStamp.transfer;
+                            const cvr::render::AerColorRoute route{transfer==cvr::framegen::CaptureTransfer::Linear?
+                                cvr::render::AerEncoding::Linear:cvr::render::AerEncoding::EncodedSrgb,outputEncoding};
+                            if(!m_aerReconstruction || !source || !target ||
+                               !m_aerReconstruction->Prepare(source->GetDesc().Format,target->GetDesc().Format,route))aerSelected=false;
+                            if(aerSelected&&aerSelection.eyes[eye]->frame.nativeStamp.eyes[eye].referenceOptics.valid){
+                                const auto& crop=aerNativePair?aerNativePair->warp[eye].crop:aerSelection.eyes[eye]->geometry.crop;
+                                const auto desc=target->GetDesc();
+                                if(desc.Width!=uint32_t(crop[2]-crop[0])||desc.Height!=uint32_t(crop[3]-crop[1]))aerSelected=false;
+                            }
+                        }
+                        monoHasView[0]=monoHasView[1]=aerSelected;
+                        // The ordinary cleanup reservation must not pin an
+                        // unused latest (often still pending) pool cell through
+                        // this GPU submission. Alias it to an already selected
+                        // color, retaining an independent balanced pin/reference.
+                        if(aerSelected && aerSelection.eyes[0]) {
+                            auto* selectedColor=aerSelection.eyes[0]->frame.color[0];
+                            if(selectedColor && selectedColor!=monoSource) {
+                                bool pinned=false;
+                                {std::lock_guard lock(m_presentMutex);
+                                    pinned=m_captureLeases.Pin(reinterpret_cast<uintptr_t>(selectedColor));
+                                    if(pinned)selectedColor->AddRef();
+                                }
+                                if(pinned) {
+                                    auto* unusedLatest=monoSource;monoSource=selectedColor;
+                                    ReleaseCapturedRead(unusedLatest,0); // no commands recorded yet
+                                }
+                            }
+                        }
+                    }
+                    cvr::framegen::PacingReady(false);
+                    cvr::framegen::Status(fgGameSelected?"Игровая NVIDIA FG: дополнительные кадры для глаз":aerSelected ? "AER v2: согласованы настоящие кадры обоих глаз" : "AER v2: ожидание подтверждённых камеры, проекции и двух глаз",fgGameSelected);
+                }
                 // Keep the existing capture pins. Generation's pending real endpoint
                 // takes one additional lease; ordinary submission cleanup stays intact.
-                if(monoSource && vrcamEye && viewCountOutput==2) {
+                if(!aerActive && monoSource && vrcamEye && viewCountOutput==2) {
                     const unsigned mainEye=CyberpunkVR_MainIsRightEye ? 1u : 0u;
                     fgFrame.color[mainEye]=monoSource;fgFrame.color[mainEye^1]=vrcamEye;
+                    fgFrame.engineView[mainEye]=1;fgFrame.engineView[mainEye^1]=2;
                     fgFrame.identity.serial=presentSerial;fgFrame.identity.origin=GetTrackingOriginSerial();
+                    if(fgFrame.nativeStamp.eyes[mainEye].nativeFrameKnown)
+                        fgFrame.identity.nativeFrame=fgFrame.nativeStamp.eyes[mainEye].nativeFrame;
                     fgFrame.identity.capturedMs=monoCaptureMs;fgFrame.identity.stereo=true;
                     fgFrame.identity.inputs=fgFrame.inputs[0] && fgFrame.inputs[1] &&
                         fgFrame.inputs[0]->frameId==fgFrame.inputs[1]->frameId;
@@ -1944,7 +2602,7 @@ DWORD OpenXRManager::FrameThreadMain() {
                             fgFrame.identity.reset=fgFrame.identity.reset || fgFrame.inputs[eye]->camera.reset;
                         }
                     }
-                    if(cvr::framegen::Enabled() && fgFrame.identity.inputs) {
+                    if(pairedWorld || (cvr::framegen::Enabled() && fgFrame.identity.inputs)) {
                         auto lease=std::make_shared<cvr::framegen::ReadLease>();lease->owner=this;
                         lease->release=[](void* owner,ID3D12Resource* resource,uint64_t fence) {
                             static_cast<OpenXRManager*>(owner)->ReleaseCapturedRead(resource,fence);
@@ -1956,9 +2614,78 @@ DWORD OpenXRManager::FrameThreadMain() {
                         }
                         if(lease->resources[0] && lease->resources[1])fgFrame.lease=std::move(lease);
                     }
-                    fgSelection=m_framegen.Select(m_d3dDevice,m_d3dQueue,std::move(fgFrame),
-                        !menuRectActive && m_sessionRunning.load(std::memory_order_relaxed));
-                    fgSelected=true;
+                    const auto pairedAdmission=cvr::framegen::ValidatePairedImage(PairedIdentity(fgFrame));
+                    const bool ownInitialLease=bool(fgFrame.lease);
+                    pairedSelected=pairedWorld&&pairedAdmission==cvr::framegen::PairedImageAdmission::Ready&&bool(fgFrame.lease);
+                    const bool ownInitialGeometryExamined=pairedSelected;
+                    cvr::framegen::PairedGeometryDiagnostic ownInitialGeometry;
+                    const bool ownInitialDiagnostic=pairedWorld&&m_ownGenerationBridge&&generationSettings.enabled&&generationSettings.backend==cvr::framegen::Backend::OwnNvidia&&cvr::framegen::OwnSelectionWitnessEnabled();
+                    if(pairedSelected)pairedSelected=cvr::framegen::AerRealPresenter::ResolvePairedDisplayGeometry(
+                        fgFrame,pairedGeometry,pairedBaselineCalibration,ownInitialDiagnostic?&ownInitialGeometry:nullptr);
+                    if(pairedSelected)for(unsigned eye=0;eye<2;++eye)fgFrame.fov[eye]=pairedGeometry[eye].renderedFov;
+                    const bool ownInitialGeometryResolved=pairedSelected;
+                    if(pairedWorld&&!pairedSelected&&m_ownGenerationBridge&&generationSettings.enabled&&generationSettings.backend==cvr::framegen::Backend::OwnNvidia&&cvr::framegen::OwnSelectionWitnessEnabled()){
+                        auto& w=fgSelection.ownWitness;w.attempt=cvr::framegen::NextOwnSelectionAttempt();w.target=frameState.predictedDisplayTime;w.period=frameState.predictedDisplayPeriod;w.sourceSerial=w.fallbackSerial=fgFrame.identity.serial;w.resource=fgFrame.nativeStamp.resourceEpoch;w.space=fgFrame.identity.origin;w.clockGeneration=fgFrame.nativeStamp.publicationClockGeneration;w.presenter=cvr::framegen::OwnPresenterPath::PreSelectionReal;w.downstream=ownInitialGeometryExamined?cvr::framegen::OwnDownstreamReason::InitialRealGeometryRejected:cvr::framegen::OwnDownstreamReason::InitialRealAdmissionRejected;
+                    }
+                    if(pairedWorld){
+                        static uint64_t pairedTicks{};
+                        if(++pairedTicks<=6||pairedTicks%180==0){Log("[PAIRED-IMAGE] serial=%llu admission=%u lease=%d frameL=%u frameR=%u viewL=%u viewR=%u optics=%d inputs=%d/%d projection=%d/%d reference=%d/%d\n",
+                            fgFrame.identity.serial,unsigned(pairedAdmission),int(bool(fgFrame.lease)),
+                            fgFrame.nativeStamp.eyes[0].nativeFrame,fgFrame.nativeStamp.eyes[1].nativeFrame,fgFrame.engineView[0],fgFrame.engineView[1],int(pairedSelected),int(bool(fgFrame.inputs[0])),int(bool(fgFrame.inputs[1])),int(bool(fgFrame.projection[0])),int(bool(fgFrame.projection[1])),int(fgFrame.nativeStamp.eyes[0].referenceOptics.valid),int(fgFrame.nativeStamp.eyes[1].referenceOptics.valid));
+                            for(unsigned eye=0;eye<2;++eye)if(fgFrame.projection[eye]){const auto& c=fgFrame.projection[eye]->constants;const auto& stamp=fgFrame.nativeStamp.eyes[eye];
+                                const auto fit=cvr::ppd::CalibrateReferenceOptics(stamp.renderedWidth,stamp.renderedHeight,stamp.referenceOptics);
+                                const auto f=cvr::ppd::ReferenceSourceFov(stamp.renderedWidth,stamp.renderedHeight,fit);
+                                Log("[PAIRED-PROJECTION] eye=%u view=%u source=%ux%u p00=%.9g p11=%.9g expected=%.9g/%.9g optics=%d\n",eye,stamp.engineView,stamp.renderedWidth,stamp.renderedHeight,
+                                    double(c.values[0]),double(c.values[5]),double(1/std::tan(f.angleRight)),double(1/std::tan(f.angleUp)),int(stamp.referenceOptics.valid));}
+                        }
+                    }
+                    const auto pairedPpd=cvr::ppd::ReadPpdPanelSnapshot();
+                    const bool pairedNeedsReal=!pairedPpd.calibrated||pairedPpd.stage==cvr::ppd::PpdPanelStage::Requested||
+                        pairedPpd.stage==cvr::ppd::PpdPanelStage::WaitingNative||pairedPpd.stage==cvr::ppd::PpdPanelStage::WaitingEyes||
+                        pairedPpd.stage==cvr::ppd::PpdPanelStage::WaitingSource;
+                    cvr::framegen::PresentationTime pairedTime{frameState.predictedDisplayTime,frameState.predictedDisplayPeriod};
+                    if(pairedSelected){
+                        const bool wasRealOnly=m_pairedDisplayHistory.realOnly;
+                        const bool realOnly=m_pairedDisplayHistory.Update(pairedBaselineCalibration,frameState.predictedDisplayTime);
+                        if(realOnly!=wasRealOnly){
+                            // A zoom is valid image content, not a new PPD calibration.
+                            // Do not mix generation history across its optics boundary.
+                            m_framegen.Reset("paired-native-projection-change");m_gameFgPresenter.Reset();
+                            Log("[PAIRED-DISPLAY] realOpticsFallback=%d calibrated=%d serial=%llu sourceP00=%.9g/%.9g\n",
+                                int(realOnly),int(pairedBaselineCalibration),fgFrame.identity.serial,fgFrame.projection[0]->constants.values[0],fgFrame.projection[1]->constants.values[0]);
+                        }
+                    }
+                    if(pairedSelected&&!pairedNeedsReal&&cvr::framegen::NativeFgStereoRequested()&&cvr::framegen::NativeFgGameEnabled())
+                        if(const auto now=SampleCameraApplicationTime(fgFrame.identity.origin)){
+                            pairedTime.observedNow=now->xrTime;pairedTime.observedClockGeneration=now->clockGeneration;
+                        }
+                    if(pairedSelected&&m_pairedDisplayHistory.realOnly){
+                        // Submit both current real views while native zoom changes the
+                        // frustum. Keep requested FG settings; ordinary view resumes it.
+                        fgSelection.frame=fgFrame;
+                    }else if(pairedSelected&&!pairedNeedsReal&&cvr::framegen::NativeFgStereoRequested()&&cvr::framegen::NativeFgGameEnabled()&&
+                       m_gameFgPresenter.SelectPaired(m_d3dDevice,fgFrame,pairedScene.worldEpoch,
+                            pairedTime,fgSelection)){
+                        fgGameSelected=true;
+                    }else if(generationOwnerReady && !generationSettings.aerV2 && (!pairedWorld||pairedSelected) &&
+                             (allocatorReady||menuRectActive)) {
+                        // A busy output allocator will replay the last accepted image.
+                        // Do not advance generation and then reject its unrecorded
+                        // submission: that would erase the history on every replay tick.
+                        // Still let menu Select(gameplay=false) reset history/pending.
+                        fgSelection=m_framegen.Select(m_d3dDevice,m_d3dQueue,std::move(fgFrame),
+                            !menuRectActive && m_sessionRunning.load(std::memory_order_relaxed),
+                            {frameState.predictedDisplayTime,frameState.predictedDisplayPeriod});
+                        fgSelected=true;
+                    } else fgSelection.frame=fgFrame;
+                    if(pairedWorld&&m_ownGenerationBridge&&generationSettings.enabled&&generationSettings.backend==cvr::framegen::Backend::OwnNvidia&&cvr::framegen::OwnSelectionWitnessEnabled()){
+                        auto& w=fgSelection.ownWitness;
+                        if(!w.attempt){w.attempt=cvr::framegen::NextOwnSelectionAttempt();w.target=frameState.predictedDisplayTime;w.period=frameState.predictedDisplayPeriod;w.sourceSerial=w.fallbackSerial=fgSelection.frame.identity.serial;w.resource=fgSelection.frame.nativeStamp.resourceEpoch;w.space=fgSelection.frame.identity.origin;w.presenter=cvr::framegen::OwnPresenterPath::PreSelectionReal;}
+                        w.baselineCalibration=pairedBaselineCalibration;w.realOnly=m_pairedDisplayHistory.realOnly;
+                        w.initialPairedAdmission=unsigned(pairedAdmission);w.initialLease=ownInitialLease;w.initialGeometryExamined=ownInitialGeometryExamined;w.initialGeometryResolved=ownInitialGeometryResolved;w.initialGeometry=ownInitialGeometry;
+                        if(w.realOnly)w.downstream=cvr::framegen::OwnDownstreamReason::ForcedRealZoom;
+                    }
+                    if(fgSelection.native)presentSerial=fgSelection.frame.identity.serial;
                     for(unsigned eye=0;eye<2;++eye) {
                         monoPoses[eye]=fgSelection.frame.pose[eye];monoFovs[eye]=fgSelection.frame.fov[eye];
                         monoPoseIds[eye]=fgSelection.frame.identity.pose[eye];
@@ -1966,7 +2693,76 @@ DWORD OpenXRManager::FrameThreadMain() {
                     // Keep the runtime's reprojection mode constant across the pair.
                     // These mono hint depths cannot describe synthetic stereo pixels.
                     if(cvr::framegen::Enabled() || fgSelection.synthetic || m_framegen.Pending())monoHasDepth=false;
-                } else m_framegen.Reset();
+                } else if(!aerActive)m_framegen.Reset("missing-paired-source");
+                if(pairedSelected){
+                    if(!m_aerReconstruction){m_aerReconstruction=std::make_unique<cvr::render::AerReconstructionPass>();
+                        if(!m_aerReconstruction->Initialize(m_d3dDevice))m_aerReconstruction.reset();}
+                    const auto viewFormat=DXGI_FORMAT(m_eyeViewFmt.load(std::memory_order_acquire));
+                    const cvr::render::AerColorRoute route{
+                        fgSelection.frame.nativeStamp.transfer==cvr::framegen::CaptureTransfer::Linear?cvr::render::AerEncoding::Linear:cvr::render::AerEncoding::EncodedSrgb,
+                        (m_decodeSrgbForUnormSwapchain||viewFormat==DXGI_FORMAT_R16G16B16A16_FLOAT||viewFormat==DXGI_FORMAT_R32G32B32A32_FLOAT)?cvr::render::AerEncoding::Linear:cvr::render::AerEncoding::EncodedSrgb};
+                    if(!fgSelection.synthetic&&!fgSelection.native){
+                        pairedSelected=cvr::framegen::AerRealPresenter::ResolvePairedDisplayGeometry(
+                            fgSelection.frame,pairedGeometry,pairedBaselineCalibration);
+                        if(!pairedSelected&&fgSelection.ownWitness.attempt)fgSelection.ownWitness.downstream=cvr::framegen::OwnDownstreamReason::RealFallbackGeometryRejected;
+                    }
+                    for(unsigned eye=0;eye<2&&pairedSelected;++eye){auto* source=fgSelection.frame.color[eye];
+                        auto* target=m_eyeSwapchains[eye].images.empty()?nullptr:m_eyeSwapchains[eye].images[0].texture;
+                        const auto& selectedFrame=fgSelection.frame;
+                        const auto& projection=selectedFrame.projection[eye];
+                        const auto& optics=selectedFrame.nativeStamp.eyes[eye].referenceOptics;
+                        if(fgSelection.ownWitness.attempt)fgSelection.ownWitness.eyes[eye].displayInputMask=(source?1u:0u)|(projection?2u:0u)|(optics.valid?4u:0u);
+                        if(!source||!projection||!optics.valid){if(fgSelection.ownWitness.attempt){fgSelection.ownWitness.downstream=cvr::framegen::OwnDownstreamReason::SelectedIdentityMissing;fgSelection.ownWitness.downstreamEye=eye;}pairedSelected=false;break;}
+                        const auto selectedDesc=source->GetDesc();
+                        pairedGeometry[eye].width=uint32_t(selectedDesc.Width);pairedGeometry[eye].height=selectedDesc.Height;
+                        if((fgSelection.synthetic||fgSelection.native)&&
+                            !cvr::framegen::AerRealPresenter::ResolveCapturedGeometry(projection->constants,optics,eye,pairedGeometry[eye])){if(fgSelection.ownWitness.attempt){auto& w=fgSelection.ownWitness;w.downstream=cvr::framegen::OwnDownstreamReason::SelectedNativeGeometryRejected;w.downstreamEye=eye;w.eyes[eye].displayExamined=true;}pairedSelected=false;break;}
+                        if(fgSelection.ownWitness.attempt){auto& e=fgSelection.ownWitness.eyes[eye];e.displayExamined=e.displayResolved=true;e.displayCrop=pairedGeometry[eye].crop;e.displayFov={pairedGeometry[eye].effectiveFov.angleLeft,pairedGeometry[eye].effectiveFov.angleRight,pairedGeometry[eye].effectiveFov.angleUp,pairedGeometry[eye].effectiveFov.angleDown};if(target){const auto d=target->GetDesc();e.targetWidth=uint32_t(d.Width);e.targetHeight=d.Height;}}
+                        if(!m_aerReconstruction||!source||!target||fgSelection.frame.nativeStamp.transfer==cvr::framegen::CaptureTransfer::Unknown||
+                            !m_aerReconstruction->Prepare(source->GetDesc().Format,target->GetDesc().Format,route)){if(fgSelection.ownWitness.attempt){fgSelection.ownWitness.downstream=cvr::framegen::OwnDownstreamReason::ColorPrepareRejected;fgSelection.ownWitness.downstreamEye=eye;}pairedSelected=false;}
+                        if(pairedSelected){const auto& crop=pairedGeometry[eye].crop;const auto desc=target->GetDesc();
+                            if(desc.Width!=uint32_t(crop[2]-crop[0])||desc.Height!=uint32_t(crop[3]-crop[1])){if(fgSelection.ownWitness.attempt){fgSelection.ownWitness.downstream=cvr::framegen::OwnDownstreamReason::TargetCropExtentRejected;fgSelection.ownWitness.downstreamEye=eye;}pairedSelected=false;}}
+                    }
+                    if(pairedSelected){
+                        const auto& completion=fgSelection.frame.colorCompletion;
+                        if(!fgSelection.native&&!fgSelection.synthetic&&FAILED(m_d3dQueue->Wait(completion.fence.Get(),completion.fenceValue))){if(fgSelection.ownWitness.attempt)fgSelection.ownWitness.downstream=cvr::framegen::OwnDownstreamReason::ProducerWaitFailed;pairedSelected=false;}
+                        else {pairedOwner=std::make_shared<cvr::framegen::Selection>(fgSelection);
+                            if(generationSettings.enabled&&generationSettings.backend==cvr::framegen::Backend::OwnNvidia&&
+                               !fgGameSelected&&!fgSelection.native&&!fgSelection.synthetic) {
+                                // This GPU color owner keeps capture/read fences, not raw FG guides.
+                                for(auto& input:pairedOwner->frame.inputs)input.reset();
+                            }
+                            if(fgSelection.ownWitness.attempt&&fgSelection.ownWitness.downstream==cvr::framegen::OwnDownstreamReason::NotExamined)fgSelection.ownWitness.downstream=cvr::framegen::OwnDownstreamReason::GeometryReady;
+                            for(unsigned eye=0;eye<2;++eye)monoFovs[eye]=pairedGeometry[eye].effectiveFov;}
+                    }
+                    monoHasDepth=false;
+                    if(pairedSelected&&pairedBaselineCalibration&&!fgSelection.synthetic&&!fgSelection.native){
+                        const auto& frame=fgSelection.frame;
+                        cvr::ppd::PpdSourceObservation observation;observation.paired=true;
+                        observation.scope={frame.nativeStamp.resourceEpoch,aerMode.epochs.renderer,pairedScene.worldEpoch,
+                            frame.identity.origin,aerMode.generation,frame.nativeStamp.resourceEpoch};
+                        const auto native=cvr::ppd::ReadNativeApplyStatus();
+                        observation.nativeRevision=native.OwnsDimensions()?native.revision:0;
+                        for(unsigned eye=0;eye<2;++eye){auto& out=observation.eyes[eye];
+                            const auto& stamp=frame.nativeStamp.eyes[eye];const auto desc=frame.color[eye]->GetDesc();
+                            const auto& projection=frame.projection[eye];const auto& g=pairedGeometry[eye];
+                            out.mainSource={stamp.renderedWidth,stamp.renderedHeight};
+                            out.actualMainDescriptor=stamp.renderedWidth==desc.Width&&stamp.renderedHeight==desc.Height;
+                            out.renderedFov={g.renderedFov.angleLeft,g.renderedFov.angleRight,g.renderedFov.angleUp,g.renderedFov.angleDown};
+                            out.nativeSlProjection=bool(projection);out.crop=g.crop;
+                            out.referenceOptics=stamp.referenceOptics.valid;out.runtimeFov=stamp.referenceOptics.applied[eye];
+                            out.engineView=stamp.engineView;out.nativeFrame=stamp.nativeFrame;out.nativeFrameKnown=stamp.nativeFrameKnown;
+                            out.sourceId=stamp.nativeFrame;out.sourceSerial=frame.identity.serial;
+                            if(projection){out.srInput={projection->srInputWidth,projection->srInputHeight};out.srInputKnown=projection->srInputKnown;}
+                            auto* target=m_eyeSwapchains[eye].images.empty()?nullptr:m_eyeSwapchains[eye].images[0].texture;
+                            if(target){const auto d=target->GetDesc();out.outputEye={uint32_t(d.Width),d.Height};out.actualOutputDescriptor=true;}
+                        }
+                        ppdObservation=observation;cvr::ppd::ObservePpdSource(observation);
+                    }
+                }
+                // Never manufacture stereo from MAIN when a real two-camera pair is missing.
+                if(pairedWorld&&!pairedSelected){monoHasView[0]=monoHasView[1]=false;
+                    cvr::framegen::Status("Две камеры: ожидаем согласованную пару игровых кадров",false);}
                 // The image, its own pose, and its read reservation were acquired
                 // together with MAIN above. Reused VRCAM slots keep their own label.
                 if(CyberpunkVR_StereoSubmit && viewCountOutput>=2) {
@@ -1975,11 +2771,105 @@ DWORD OpenXRManager::FrameThreadMain() {
                     } else CVR_DIAGNOSTIC(CyberpunkVR_DebugVrcamEyeUnpaired.fetch_add(1,std::memory_order_relaxed));
                 }
 
-                if (monoSource && monoHasView[0] && monoHasView[1] &&
-                    SUCCEEDED(currentAllocator->Reset()) && SUCCEEDED(m_cmdList->Reset(currentAllocator, nullptr))) {
+                if(menuRectActive&&viewCountOutput==2&&m_eyeSwapchains.size()==2&&cvr::menu_preview::UiStereoRequested()){
+                    menuUi=AcquireMenuUiPair();
+                    const auto retainedAllowed=[&]{return m_editorUiDisplay&&m_editorUiDisplay->editorUi&&
+                        cvr::xr::EditorUiRetainedAllowed(m_editorUiDisplay->editorUi->scope,m_editorUiDisplayOrigin,
+                            GetTrackingOriginSerial(),cvr::menu_preview::IsPreviewEpochOpen(m_editorUiDisplay->editorUi->scope.screenEpoch),
+                            editorUiCurrentKnown?&editorUiCurrent.metadata:nullptr);};
+                    const auto prepareEditorUi=[&](const MenuUiSelection& packet){
+                        if(!packet.editorUiRequired)return true;
+                        const auto& ui=packet.editorUi;if(!ui)return false;
+                        XrPosef base{};uint64_t origin{};bool baseReady{};
+                        {std::lock_guard lock(m_renderPoseMutex);baseReady=m_basePoseSet;base=m_basePose;origin=GetTrackingOriginSerial();}
+                        if(!baseReady||!cvr::menu_preview::IsPreviewEpochOpen(ui->scope.screenEpoch))return false;
+                        const auto pose=m_editorUiAnchor.Pose(ui->scope,origin,base);
+                        const auto size=cvr::xr::EditorUiSize(ui->renderAspect);
+                        XrPosef viewPose;
+                        if(!pose||!cvr::xr::EditorOrbitViewsMatch(packet.projection[0].orbit,packet.projection[1].orbit,origin,packet.editorControlRevision)||
+                           !cvr::xr::ApplyEditorOrbitView(packet.projection[0].orbit,origin,packet.editorControlRevision,*pose,viewPose))return false;
+                        if(!pose||!size)return false;
+                        // UI's last-released image can change independently of the eye images.
+                        if(!ui->image||ui->image->serial!=m_editorUiPreparedSerial)m_worldFrameReplay.Invalidate();
+                        editorUiLayer=m_editorUiQuad.PrepareExplicit(m_session,m_localSpace,m_d3dDevice,m_d3dQueue,
+                            ui->image,viewPose,*size,XR_COMPOSITION_LAYER_CORRECT_CHROMATIC_ABERRATION_BIT|
+                            XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT);
+                        if(editorUiLayer)m_editorUiPreparedSerial=ui->image->serial;
+                        return editorUiLayer!=nullptr;
+                    };
+                    if(editorUiEnabled&&(!menuUi||!allocatorReady)&&retainedAllowed()){menuUi=m_editorUiDisplay;editorUiRetained=true;}
+                    if(menuUi&&menuUi->editorUiRequired&&!prepareEditorUi(*menuUi)){
+                        menuUi.reset();
+                        if(retainedAllowed()){menuUi=m_editorUiDisplay;editorUiRetained=true;if(!prepareEditorUi(*menuUi))menuUi.reset();}
+                    }
+                    if(menuUi){bool ready=true;for(unsigned eye=0;eye<2;++eye){const auto& c=menuUi->completion[eye];if(FAILED(m_d3dQueue->Wait(c.fence.Get(),c.fenceValue))){ready=false;break;}}
+                        if(ready){if(monoSource)ReleaseCapturedRead(monoSource,0);if(vrcamEye)ReleaseCapturedRead(vrcamEye,0);vrcamEye=nullptr;
+                            monoSource=menuUi->color[0];monoHasView[0]=monoHasView[1]=true;monoHasDepth=false;menuUiSelected=true;
+                            presentSerial=menuUi->sourceSerial;replayWorldKey.resources=menuUi->scope.pool;
+                            {std::lock_guard viewLock(m_viewMutex);if(m_views.size()>=2)for(unsigned e=0;e<2;++e){monoPoses[e]=m_views[e].pose;monoFovs[e]=m_views[e].fov;}}
+                        }else menuUi.reset();
+                    }
+                    const bool freshEditor=editorUiCurrentKnown&&editorUiCurrent.metadata.screen==2&&
+                        cvr::menu_preview::IsPreviewEpochOpen(editorUiCurrent.metadata.screenEpoch);
+                    const bool liveEpochOpen=m_editorUiLifecycleEpoch&&
+                        cvr::menu_preview::IsPreviewEpochOpen(m_editorUiLifecycleEpoch);
+                    const bool anchorEpochOpen=m_editorUiAnchor.Valid()&&
+                        cvr::menu_preview::IsPreviewEpochOpen(m_editorUiAnchor.epoch);
+                    editorUiBlocked=cvr::xr::EditorUiFallbackBlock(editorUiEnabled,menuUiSelected,
+                        freshEditor,liveEpochOpen,anchorEpochOpen);
+                    if(editorUiLayer)replayWorldKey.editorUi=reinterpret_cast<const XrCompositionLayerQuad*>(editorUiLayer)->subImage.swapchain;
+                }
+                // A busy allocator is a repeated display frame, not permission
+                // to clear both eyes. Keep the prior accepted XR images only
+                // while the new pair is valid and no XR image was touched yet.
+                replayWorldWhenBusy=!editorUiBlocked&&(pairedSelected||(menuRectActive&&monoSource&&monoHasView[0]&&monoHasView[1]))&&!allocatorReady&&frameState.shouldRender;
+                std::array<cvr::render::AerRecordRequest,2> menuScaleRequests{};
+                std::array<bool,2> menuScale{};
+                bool menuScaleReady=true;
+                if(menuRectActive&&monoSource&&viewCountOutput==2){
+                    const auto viewFormat=DXGI_FORMAT(m_eyeViewFmt.load(std::memory_order_acquire));
+                    const bool rawScenePair=menuUiSelected&&menuUi->rawSceneSerial[0]&&menuUi->rawSceneSerial[1];
+                    const cvr::render::AerColorRoute route{
+                        rawScenePair?cvr::xr::EditorSceneColorRoute(menuUi->color[0]->GetDesc().Format).output:
+                            (fgFrame.nativeStamp.transfer==cvr::framegen::CaptureTransfer::Linear?cvr::render::AerEncoding::Linear:cvr::render::AerEncoding::EncodedSrgb),
+                        (m_decodeSrgbForUnormSwapchain||viewFormat==DXGI_FORMAT_R16G16B16A16_FLOAT||viewFormat==DXGI_FORMAT_R32G32B32A32_FLOAT)?cvr::render::AerEncoding::Linear:cvr::render::AerEncoding::EncodedSrgb};
+                    for(unsigned eye=0;eye<2;++eye){
+                        auto* source=menuUiSelected?menuUi->color[eye]:monoSource;
+                        auto* target=m_eyeSwapchains[eye].images.empty()?nullptr:m_eyeSwapchains[eye].images[0].texture;
+                        if(!target){menuScaleReady=false;break;}
+                        const auto sd=source->GetDesc(),td=target->GetDesc();
+                        menuScale[eye]=cvr::framegen::PlanColorCopy(sd,td,true).kind==cvr::framegen::ColorCopyKind::MenuScale;
+                        if(!menuScale[eye])continue;
+                        if(!m_aerReconstruction){m_aerReconstruction=std::make_unique<cvr::render::AerReconstructionPass>();
+                            if(!m_aerReconstruction->Initialize(m_d3dDevice))m_aerReconstruction.reset();}
+                        if(!m_aerReconstruction||!m_aerReconstruction->Prepare(sd.Format,td.Format,route)){menuScaleReady=false;break;}
+                        auto& request=menuScaleRequests[eye];request.source=source;request.eye=eye;request.color=route;
+                        request.filter={0,0,0,0};request.warp.crop={0,0,float(sd.Width),float(sd.Height)};
+                        request.warp.sourceSpace=request.warp.referenceSpace=GetTrackingOriginSerial();
+                        {std::lock_guard lock(m_presentMutex);
+                            request.warp.sourceEpoch=request.warp.referenceEpoch=m_captureResourceEpoch;
+                            if(!menuUiSelected){
+                                if(!m_captureLeases.Pin(reinterpret_cast<uintptr_t>(source))){menuScaleReady=false;break;}
+                                source->AddRef();
+                            }
+                        }
+                        if(menuUiSelected)request.sourceOwner=menuUi->lease;
+                        else request.sourceOwner=std::shared_ptr<void>(source,[this](void* resource){ReleaseCapturedRead(static_cast<ID3D12Resource*>(resource),0);});
+                    }
+                }
+                if(menuUiSelected){static unsigned rows{};if(rows++<8)Log("[MenuPreviewUiPair] xr-draw-gate source=%p views=%u/%u allocator=%u scale=%u revisions=%llu/%llu\n",monoSource,unsigned(monoHasView[0]),unsigned(monoHasView[1]),unsigned(allocatorReady),unsigned(menuScaleReady),menuUi->cameraRevision[0],menuUi->cameraRevision[1]);}
+                const auto resetSubmitCommands=[&](){const auto ar=currentAllocator->Reset();const auto lr=SUCCEEDED(ar)?m_cmdList->Reset(currentAllocator,nullptr):E_PENDING;
+                    if(fgSelection.ownWitness.attempt&&(FAILED(ar)||FAILED(lr)))fgSelection.ownWitness.output=cvr::framegen::OwnOutputReason::RecordFailed;
+                    if(menuUiSelected&&(FAILED(ar)||FAILED(lr))){static unsigned rows{};if(rows++<8)Log("[MenuPreviewUiPair] command-reset-failed allocator=%08X list=%08X\n",unsigned(ar),unsigned(lr));}return SUCCEEDED(ar)&&SUCCEEDED(lr);};
+                if(fgSelection.ownWitness.attempt&&!allocatorReady)fgSelection.ownWitness.output=cvr::framegen::OwnOutputReason::AllocatorNotReady;
+                if (!editorUiBlocked && monoSource && monoHasView[0] && monoHasView[1] &&
+                    allocatorReady && menuScaleReady && resetSubmitCommands()) {
                     auto gpuProfile = cvr::gpu::profile::Begin(m_cmdList);
                     bool copyReady = true;
-                    bool useDepthLayer = monoHasDepth && m_depthLayerSupported;
+                    // Menu quads have no projection-depth consumer. A stale world
+                    // depth image may also have different calibrated dimensions;
+                    // copying it here poisons the submit list before UI arrives.
+                    bool useDepthLayer = !menuRectActive && monoHasDepth && m_depthLayerSupported;
                     std::vector<bool> acquiredEyes(viewCountOutput, false);
                     std::vector<bool> acquiredDepthEyes(viewCountOutput, false);
                     std::vector<XrCompositionLayerProjectionView> projectionViews(viewCountOutput);
@@ -1994,10 +2884,13 @@ DWORD OpenXRManager::FrameThreadMain() {
                         }
                     }
 
+                    m_worldFrameReplay.Invalidate(); // The next acquire can change last-released images.
                     for (uint32_t eye = 0; eye < viewCountOutput; ++eye) {
                         uint32_t imageIndex = 0;
                         XrSwapchainImageAcquireInfo acquireInfo{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+                        const auto timedAcquire=lightTiming.Stamp();
                         const XrResult acquireRes = xrAcquireSwapchainImage(m_eyeSwapchains[eye].handle, &acquireInfo, &imageIndex);
+                        lightTiming.images+=lightTiming.Since(timedAcquire);
                         if (XR_FAILED(acquireRes)) {
                             Log("OpenXRManager: xrAcquireSwapchainImage failed for eye %u (res=%d)\n", eye, acquireRes);
                             copyReady = false;
@@ -2007,7 +2900,9 @@ DWORD OpenXRManager::FrameThreadMain() {
 
                         XrSwapchainImageWaitInfo waitSwapchainInfo{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
                         waitSwapchainInfo.timeout = 200000000; // 200 ms (was XR_INFINITE_DURATION): never hang the frame loop
+                        const auto timedImageWait=lightTiming.Stamp();
                         const XrResult waitRes = xrWaitSwapchainImage(m_eyeSwapchains[eye].handle, &waitSwapchainInfo);
+                        lightTiming.images+=lightTiming.Since(timedImageWait);
                         if (XR_FAILED(waitRes) || waitRes == XR_TIMEOUT_EXPIRED) {
                             Log("OpenXRManager: xrWaitSwapchainImage failed/timeout for eye %u (res=%d)\n", eye, waitRes);
                             copyReady = false;
@@ -2023,14 +2918,68 @@ DWORD OpenXRManager::FrameThreadMain() {
 
                         {
                         cvr::gpu::profile::Scope colorScope(gpuProfile, cvr::gpu::profile::Stage::SubmitColor);
+                        cvr::framegen::NativeReadScope nativeRead(m_cmdList,fgSelection,eye,aerSelected||pairedSelected);
+                        if(!nativeRead) {if(menuUiSelected){static unsigned rows{};if(rows++<8)Log("[MenuPreviewUiPair] native-read-failed eye=%u native=%u synthetic=%u\n",eye,unsigned(bool(fgSelection.native)),unsigned(fgSelection.synthetic));}copyReady=false;break;}
                         // CAS sharpen: when xr_sharpness>0, draw
                         // the sharpened mono source straight into the swapchain image.
-                        // monoSource is always COMMON here (no synth scratch in mono).
+                        // Author captures retain the shared copy/pixel/compute read mask.
                         const float monoSharp = GetVrSharpness();
                         bool doMonoSharpen = false;
+                        bool didColorConvert = false;
+                        bool didAerReconstruction = false;
+                        if(menuScale[eye]) {
+                            auto& request=menuScaleRequests[eye];request.destination=texture;
+                            request.completion={m_fence,m_fenceValue+1};request.sourceState=nativeRead.ReadState();
+                            aerTickets[eye]=m_aerReconstruction->Record(m_cmdList,request);
+                            if(!aerTickets[eye]){if(menuUiSelected){static unsigned rows{};if(rows++<8){const auto sd=request.source->GetDesc(),td=request.destination->GetDesc();Log("[MenuPreviewUiPair] menu-scale-record-failed eye=%u status=%u state=%X source=%llux%u/%u flags=%X target=%llux%u/%u flags=%X epochs=%llu/%llu spaces=%llu/%llu fence=%llu completed=%llu native=%u synthetic=%u\n",eye,unsigned(aerTickets[eye].status),unsigned(request.sourceState),sd.Width,sd.Height,unsigned(sd.Format),unsigned(sd.Flags),td.Width,td.Height,unsigned(td.Format),unsigned(td.Flags),request.warp.sourceEpoch,request.warp.referenceEpoch,request.warp.sourceSpace,request.warp.referenceSpace,request.completion.value,request.completion.fence->GetCompletedValue(),unsigned(bool(fgSelection.native)),unsigned(fgSelection.synthetic));}}copyReady=false;break;}didAerReconstruction=true;
+                        } else if(pairedSelected) {
+                            const auto& frame=pairedOwner->frame;const auto settings=cvr::framegen::GetSettings();
+                            cvr::render::AerRecordRequest request;request.source=frame.color[eye];request.destination=texture;
+                            const auto& q=frame.pose[eye].orientation;
+                            request.warp.reference=request.warp.captured={q.x,q.y,q.z,q.w};
+                            request.warp.referenceEpoch=request.warp.sourceEpoch=frame.nativeStamp.resourceEpoch;
+                            request.warp.referenceSpace=request.warp.sourceSpace=frame.identity.origin;
+                            request.warp.tangents=pairedGeometry[eye].tangents;
+                            request.warp.crop=pairedGeometry[eye].crop;
+                            request.filter={settings.aerEmphasis,settings.aerDeblur,settings.aerContrast,settings.aerVibrance};
+                            const auto viewFormat=DXGI_FORMAT(m_eyeViewFmt.load(std::memory_order_acquire));
+                            request.color={frame.nativeStamp.transfer==cvr::framegen::CaptureTransfer::Linear?cvr::render::AerEncoding::Linear:cvr::render::AerEncoding::EncodedSrgb,
+                                (m_decodeSrgbForUnormSwapchain||viewFormat==DXGI_FORMAT_R16G16B16A16_FLOAT||viewFormat==DXGI_FORMAT_R32G32B32A32_FLOAT)?cvr::render::AerEncoding::Linear:cvr::render::AerEncoding::EncodedSrgb};
+                            request.completion={m_fence,m_fenceValue+1};request.eye=eye;request.sourceOwner=pairedOwner;request.sourceState=nativeRead.ReadState();
+                            request.evidenceSourceId=frame.nativeStamp.eyes[eye].nativeFrame;request.evidencePairSerial=presentSerial;
+                            aerTickets[eye]=m_aerReconstruction->Record(m_cmdList,request);
+                            if(!aerTickets[eye]){copyReady=false;break;}didAerReconstruction=true;
+                        } else if(aerSelected) {
+                            const auto settings=cvr::framegen::GetSettings();
+                            cvr::render::AerRecordRequest request;
+                            request.source=aerNativePair?aerNativePair->color[eye]:aerSelection.eyes[eye]->frame.color[eye];request.destination=texture;
+                            request.warp=aerNativePair?aerNativePair->warp[eye]:aerSelection.warp[eye];
+                            request.evidenceSourceId=aerSelection.sourceIds[eye];
+                            request.evidenceSourceFloor=std::min(aerSelection.sourceIds[0],aerSelection.sourceIds[1]);
+                            request.evidencePairSerial=presentSerial;
+                            if(!aerNativePair){
+                                const auto& r=aerSelection.eyes[eye]->receipt;
+                                const auto& s=aerSelection.eyes[eye]->frame.nativeStamp.eyes[eye];
+                                request.evidenceIdentity={r.epochs.renderer,r.epochs.gameWorld,r.epochs.hmdWorld,
+                                    r.requestRevision,r.latchRevision,r.clockGeneration,s.nativeFrame,s.poseId,s.poseWriteId};
+                            }
+                            request.filter={settings.aerEmphasis,settings.aerDeblur,settings.aerContrast,settings.aerVibrance};
+                            const auto transfer=aerNativePair?aerNativePair->transfer[eye]:aerSelection.eyes[eye]->frame.nativeStamp.transfer;
+                            const auto viewFormat=DXGI_FORMAT(m_eyeViewFmt.load(std::memory_order_acquire));
+                            request.color={transfer==cvr::framegen::CaptureTransfer::Linear?
+                                cvr::render::AerEncoding::Linear:cvr::render::AerEncoding::EncodedSrgb,
+                                (m_decodeSrgbForUnormSwapchain || viewFormat==DXGI_FORMAT_R16G16B16A16_FLOAT || viewFormat==DXGI_FORMAT_R32G32B32A32_FLOAT)?
+                                cvr::render::AerEncoding::Linear:cvr::render::AerEncoding::EncodedSrgb};
+                            request.completion={m_fence,m_fenceValue+1};request.eye=eye;
+                            request.sourceOwner=aerNativePair?std::shared_ptr<void>(aerNativePair->owner):aerSelection.OwnerForEye(eye);
+                            request.sourceState=nativeRead.ReadState();
+                            aerTickets[eye]=m_aerReconstruction->Record(m_cmdList,request);
+                            if(!aerTickets[eye]) {copyReady=false;break;}
+                            didAerReconstruction=true;
+                        }
                         // DISABLED: in-submit CAS GPU-crashes; needs an
                         // SRV scratch rework before re-enabling.
-                        if (false && monoSharp > 0.0001f && m_d3dDevice && texture && monoSource) {
+                        if (!aerSelected && !m_decodeSrgbForUnormSwapchain && false && monoSharp > 0.0001f && m_d3dDevice && texture && monoSource) {
                             if (!m_sharpenPass) m_sharpenPass = std::make_unique<SharpenPass>();
                             const D3D12_RESOURCE_DESC sd = texture->GetDesc();
                             m_sharpenReady = m_sharpenPass->EnsureInitialized(
@@ -2038,14 +2987,13 @@ DWORD OpenXRManager::FrameThreadMain() {
                                 static_cast<uint32_t>(sd.Width), sd.Height);
                             doMonoSharpen = m_sharpenReady;
                         }
-                        if (doMonoSharpen) {
-                            // monoSource rests in COPY_SOURCE (CaptureMonoPresentedFrame).
+                        if(didAerReconstruction) {
+                            // The proven AER shader also performs the single color
+                            // conversion. Do not copy or decode over its result.
+                        } else if (doMonoSharpen) {
+                            // monoSource already permits the shader read; do not
+                            // narrow its state while the worker may copy it.
                             D3D12_RESOURCE_BARRIER pre[2] = {};
-                            pre[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                            pre[0].Transition.pResource = monoSource;
-                            pre[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-                            pre[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-                            pre[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
                             // THE STATE THIS RUNTIME EXPECTS ITS IMAGES BACK IN.
                             //
                             // Every transition below used to rest the swapchain image in COMMON. The
@@ -2072,7 +3020,7 @@ DWORD OpenXRManager::FrameThreadMain() {
                             pre[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
                             pre[1].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
                             pre[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-                            m_cmdList->ResourceBarrier(2, pre);
+                            m_cmdList->ResourceBarrier(1, pre+1);
 
                             m_sharpenPass->RecordSharpen(m_cmdList, monoSource, texture,
                                                          monoSharp, GetVrSharpmix());
@@ -2083,58 +3031,46 @@ DWORD OpenXRManager::FrameThreadMain() {
                             post[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
                             post[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
                             post[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-                            post[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                            post[1].Transition.pResource = monoSource;
-                            post[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-                            post[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-                            post[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-                            m_cmdList->ResourceBarrier(2, post);
+                            m_cmdList->ResourceBarrier(1, post);
+                        } else if (m_decodeSrgbForUnormSwapchain && m_srgbToLinearPass) {
+                            ID3D12Resource* eyeSource = menuUiSelected?menuUi->color[eye]:fgSelected
+                                ? fgSelection.frame.color[eye]
+                                : ((eye == (CyberpunkVR_MainIsRightEye ? 0u : 1u) && vrcamEye)
+                                    ? vrcamEye : monoSource);
+                            if (!eyeSource) {
+                                copyReady = false;
+                                break;
+                            }
+
+                            const bool decoded = cvr::framegen::RecordColorDecode(*m_srgbToLinearPass,
+                                m_cmdList, eyeSource, texture, m_cmdAllocatorIndex * 2 + eye,nativeRead.ReadState());
+
+                            if (!decoded) {
+                                Log("OpenXRManager: sRGB-to-linear submit failed for eye %u\n", eye);
+                                copyReady = false;
+                                break;
+                            }
+                            didColorConvert = true;
+                            if (eye == (CyberpunkVR_MainIsRightEye ? 0u : 1u) && vrcamEye)
+                                CVR_DIAGNOSTIC(++CyberpunkVR_DebugStereoEyeSubmits);
                         } else if (eye == (CyberpunkVR_MainIsRightEye ? 0u : 1u) && vrcamEye) {
                             {
-                                // Identical in shape to the MAIN branch below -- both operands
-                                // are ours, both already in the swapchain's format and size, so
-                                // this is a plain copy and nothing here reaches into an engine
-                                // resource. m_vrcamEyeTex rests in COPY_SOURCE between frames,
-                                // which is where the capture's own barriers leave it.
-                                D3D12_RESOURCE_BARRIER toCopyDest{};
-                                toCopyDest.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                                toCopyDest.Transition.pResource = texture;
-                                toCopyDest.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-                                toCopyDest.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-                                toCopyDest.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-                                m_cmdList->ResourceBarrier(1, &toCopyDest);
-
-                                m_cmdList->CopyResource(texture,fgSelected ? fgSelection.frame.color[eye] : vrcamEye);
-
-                                D3D12_RESOURCE_BARRIER toCommon{};
-                                toCommon.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                                toCommon.Transition.pResource = texture;
-                                toCommon.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-                                toCommon.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-                                toCommon.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-                                m_cmdList->ResourceBarrier(1, &toCommon);
+                                // Source and target can differ by native alignment after PPD.
+                                // World geometry requires its proven reconstruction above;
+                                // only a mono menu may use the small centered overlap.
+                                if(!cvr::framegen::RecordColorCopy(m_cmdList,
+                                    fgSelected ? fgSelection.frame.color[eye] : vrcamEye,texture,menuRectActive)){
+                                    copyReady=false;break;
+                                }
                                 CVR_DIAGNOSTIC(++CyberpunkVR_DebugStereoEyeSubmits);
                             }
                         }
-                        if (!(doMonoSharpen ||
+                        if (!(didAerReconstruction || doMonoSharpen || didColorConvert ||
                               (eye == (CyberpunkVR_MainIsRightEye ? 0u : 1u) && vrcamEye))) {
-                            D3D12_RESOURCE_BARRIER toCopyDest{};
-                            toCopyDest.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                            toCopyDest.Transition.pResource = texture;
-                            toCopyDest.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-                            toCopyDest.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-                            toCopyDest.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-                            m_cmdList->ResourceBarrier(1, &toCopyDest);
-
-                            m_cmdList->CopyResource(texture,fgSelected ? fgSelection.frame.color[eye] : monoSource);
-
-                            D3D12_RESOURCE_BARRIER toCommon{};
-                            toCommon.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                            toCommon.Transition.pResource = texture;
-                            toCommon.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-                            toCommon.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-                            toCommon.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-                            m_cmdList->ResourceBarrier(1, &toCommon);
+                            if(!cvr::framegen::RecordColorCopy(m_cmdList,
+                                menuUiSelected?menuUi->color[eye]:(fgSelected ? fgSelection.frame.color[eye] : monoSource),texture,menuRectActive)){
+                                copyReady=false;break;
+                            }
                         }
 
                         }
@@ -2189,7 +3125,7 @@ DWORD OpenXRManager::FrameThreadMain() {
                         // canted headset, and on this path they never reach the submitted pose: the
                         // capture builds each eye's pose from its centre's ORIENTATION plus a positional
                         // offset only, so there is no cant here to collapse.
-                        if (CyberpunkVR_MonoCyclopeanPose && !CyberpunkVR_VrcamOwnLabel &&
+                        if (!aerSelected && CyberpunkVR_MonoCyclopeanPose && !CyberpunkVR_VrcamOwnLabel &&
                             eye < 2 && monoHasView[0] && monoHasView[1]) {
                             projectionViews[eye].pose.orientation = monoPoses[0].orientation;
                             projectionViews[eye].pose.position = {
@@ -2197,7 +3133,10 @@ DWORD OpenXRManager::FrameThreadMain() {
                                 (monoPoses[0].position.y + monoPoses[1].position.y) * 0.5f,
                                 (monoPoses[0].position.z + monoPoses[1].position.z) * 0.5f};
                         }
-                        if (menuRectActive) {
+                        if(menuUiSelected&&eye<2&&menuUi->projection[eye].valid){
+                            projectionViews[eye].pose=menuUi->projection[eye].pose;
+                            projectionViews[eye].fov=menuUi->projection[eye].fov;
+                        } else if (menuRectActive) {
                             // LAZY-FOLLOW menus (projection path). Head-locking to the
                             // live eye pose every frame made the panel drag 1:1 with the
                             // head (motion sickness). Instead LATCH the per-eye poses when
@@ -2285,7 +3224,9 @@ DWORD OpenXRManager::FrameThreadMain() {
                         // between the eyes is divergence, which is the one thing the eyes cannot
                         // follow -- "left and right view are too far apart", measured. Convergence
                         // is only meaningful when the two eyes really are looking at one image.
-                        const bool bothEyesShareOneImage = !vrcamEye;
+                        const bool bothEyesShareOneImage = !menuUiSelected && !aerSelected && (fgSelected
+                            ? (fgSelection.frame.color[0] && fgSelection.frame.color[0]==fgSelection.frame.color[1])
+                            : !vrcamEye);
                         if (bothEyesShareOneImage && CyberpunkVR_FlatDistanceM > 0.05f && eye < 2) {
                             const float ipd = GetRuntimeIpd();
                             if (ipd > 0.03f && ipd < 0.10f) {
@@ -2342,6 +3283,19 @@ DWORD OpenXRManager::FrameThreadMain() {
                                 break;
                             }
 
+                            const D3D12_RESOURCE_DESC depthSrcDesc = monoDepthSource->GetDesc();
+                            const D3D12_RESOURCE_DESC depthDstDesc = depthTexture->GetDesc();
+                            // Depth must describe the same pixels as the projection.
+                            // Never crop/scale it implicitly or record an out-of-bounds copy.
+                            if (depthSrcDesc.Dimension != depthDstDesc.Dimension ||
+                                depthSrcDesc.Width != depthDstDesc.Width || depthSrcDesc.Height != depthDstDesc.Height ||
+                                depthSrcDesc.DepthOrArraySize != depthDstDesc.DepthOrArraySize ||
+                                depthSrcDesc.MipLevels != depthDstDesc.MipLevels ||
+                                depthSrcDesc.SampleDesc.Count != depthDstDesc.SampleDesc.Count ||
+                                depthSrcDesc.SampleDesc.Quality != depthDstDesc.SampleDesc.Quality) {
+                                useDepthLayer = false;
+                                break;
+                            }
                             if (!cvr::gpu::KeepCommandResources(m_cmdList, {monoDepthSource, depthTexture})) {
                                 useDepthLayer = false;
                                 break;
@@ -2356,8 +3310,6 @@ DWORD OpenXRManager::FrameThreadMain() {
                             toCopyDest.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
                             m_cmdList->ResourceBarrier(1, &toCopyDest);
 
-                            const D3D12_RESOURCE_DESC depthSrcDesc = monoDepthSource->GetDesc();
-                            const D3D12_RESOURCE_DESC depthDstDesc = depthTexture->GetDesc();
                             if (depthSrcDesc.Format == depthDstDesc.Format) {
                                 m_cmdList->CopyResource(depthTexture, monoDepthSource);
                             } else {
@@ -2408,6 +3360,7 @@ DWORD OpenXRManager::FrameThreadMain() {
                     }
 
                     if (!copyReady) {
+                        if(fgSelection.ownWitness.attempt)fgSelection.ownWitness.output=cvr::framegen::OwnOutputReason::RecordFailed;
                         for (uint32_t eye = 0; eye < viewCountOutput; ++eye) {
                             if (!acquiredEyes[eye]) {
                                 continue;
@@ -2430,31 +3383,34 @@ DWORD OpenXRManager::FrameThreadMain() {
                         }
 
                         m_cmdList->Close();
-                        // NOTE: intentionally NO m_d3dQueue->Wait on the depth-writer fence
-                        // here. Blocking the present queue on that fence deadlocks during
-                        // menu/scene loads: the game's depth-writer queue can be parked
-                        // behind its own async-compute Wait, so the fence is not reached,
-                        // the present queue stalls, and the m_fence CPU wait next present
-                        // freezes the game. The depth resolve is a REPROJECTION HINT: a
-                        // rare frame-stale/torn read is invisible, a freeze is not. So we
-                        // let the copy race (benign) instead of gating on the writer queue.
+                        // No partial draw may execute after its XR images were
+                        // released above. Cancel recorded-only shader reservations.
                         (void)monoDepthFence;
-                        ID3D12CommandList* cmdLists[] = {m_cmdList};
-                        m_d3dQueue->ExecuteCommandLists(1, cmdLists);
-                        
-                        ++m_fenceValue;
-                        if (SUCCEEDED(m_d3dQueue->Signal(m_fence, m_fenceValue)))
-                            cvr::gpu::profile::Submitted(gpuProfile, m_d3dQueue, m_fence, m_fenceValue);
-                        capturedReadFence=m_fenceValue;
+                        if(m_aerReconstruction)for(auto& ticket:aerTickets)if(ticket) {
+                            m_aerReconstruction->CancelNeverExecuted(ticket);ticket={};
+                        }
                     } else {
-                        m_cmdList->Close();
-                        ID3D12CommandList* cmdLists[] = {m_cmdList};
-                        m_d3dQueue->ExecuteCommandLists(1, cmdLists);
-                        
-                        ++m_fenceValue;
-                        if (SUCCEEDED(m_d3dQueue->Signal(m_fence, m_fenceValue)))
-                            cvr::gpu::profile::Submitted(gpuProfile, m_d3dQueue, m_fence, m_fenceValue);
-                        capturedReadFence=m_fenceValue;
+                        const auto submitClose=m_cmdList->Close();
+                        if(fgSelection.ownWitness.attempt&&FAILED(submitClose))fgSelection.ownWitness.output=cvr::framegen::OwnOutputReason::CloseFailed;
+                        if(menuUiSelected&&FAILED(submitClose)){static unsigned rows{};if(rows++<8)Log("[MenuPreviewUiPair] submit-close-failed hr=%08X\n",unsigned(submitClose));}
+                        if(SUCCEEDED(submitClose)) {
+                            ID3D12CommandList* cmdLists[] = {m_cmdList};
+                            m_d3dQueue->ExecuteCommandLists(1, cmdLists);
+                            capturedCopySubmitted=true;
+                            ++m_fenceValue;
+                            capturedCopySignaled=SUCCEEDED(m_d3dQueue->Signal(m_fence, m_fenceValue));
+                            if(fgSelection.ownWitness.attempt&&!capturedCopySignaled)fgSelection.ownWitness.output=cvr::framegen::OwnOutputReason::SignalFailed;
+                            m_submitAllocatorFences[m_cmdAllocatorIndex]=capturedCopySignaled?m_fenceValue:UINT64_MAX;
+                            RecordSubmitExecuted(capturedCopySignaled);
+                            if (capturedCopySignaled)
+                                cvr::gpu::profile::Submitted(gpuProfile, m_d3dQueue, m_fence, m_fenceValue);
+                            capturedReadFence=m_fenceValue;
+                        }
+                        if(m_aerReconstruction)for(auto& ticket:aerTickets)if(ticket) {
+                            if(capturedCopySubmitted)m_aerReconstruction->SubmissionReported(ticket,true,capturedCopySignaled);
+                            else m_aerReconstruction->CancelNeverExecuted(ticket);
+                            ticket={};
+                        }
 
                         bool releaseOk = true;
                         for (uint32_t eye = 0; eye < viewCountOutput; ++eye) {
@@ -2465,6 +3421,7 @@ DWORD OpenXRManager::FrameThreadMain() {
                             const XrResult releaseRes = xrReleaseSwapchainImage(m_eyeSwapchains[eye].handle, &releaseInfo);
                             if (XR_FAILED(releaseRes)) {
                                 Log("OpenXRManager: xrReleaseSwapchainImage failed for eye %u (res=%d)\n", eye, releaseRes);
+                                if(fgSelection.ownWitness.attempt)fgSelection.ownWitness.output=cvr::framegen::OwnOutputReason::ReleaseFailed;
                                 releaseOk = false;
                             }
                         }
@@ -2486,12 +3443,12 @@ DWORD OpenXRManager::FrameThreadMain() {
                             }
                         }
 
-                        if (releaseOk) {
+                        if (releaseOk && capturedCopySubmitted && capturedCopySignaled) {
                             XrCompositionLayerProjection layerProj{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
                             XrCompositionLayerQuad layerQuad{XR_TYPE_COMPOSITION_LAYER_QUAD};
-                            const XrCompositionLayerBaseHeader* layers[1+2*cvr::hud::ChannelCount+3] = {};
+                            const XrCompositionLayerBaseHeader* layers[3+2*cvr::hud::ChannelCount+3] = {};
 
-                            if (menuRectActive) {
+                            if (menuRectActive && !menuUiSelected) {
                                 layerQuad.space = m_localSpace;
                                 layerQuad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
                                 layerQuad.subImage = projectionViews[0].subImage;
@@ -2535,11 +3492,13 @@ DWORD OpenXRManager::FrameThreadMain() {
                               if(m_basePoseSet) {const auto& q=m_basePose.orientation;
                                   hudBodyYaw=atan2f(2*(q.w*q.y+q.x*q.z),1-2*(q.x*q.x+q.y*q.y));} }
                             hudBodyYaw+=BodyYawFollowOffset();
-                            layers[1]=m_hudQuad.Prepare(m_session,m_localSpace,m_d3dDevice,m_d3dQueue,
+                            const uint32_t menuBaseLayers=1u;
+                            layers[menuBaseLayers]=m_hudQuad.Prepare(m_session,m_localSpace,m_d3dDevice,m_d3dQueue,
                                 !menuRectActive,hudTracked,hudHead.pose,GetTrackingOriginSerial(),
                                 frameState.predictedDisplayTime,hudEyes?eyeOffsets:nullptr,hudBodyYaw);
-                            if(layers[1]) layers[2]=m_hudQuad.SecondEye();
-                            endInfo.layerCount = layers[2] ? 3 : (layers[1] ? 2 : 1);
+                            if(layers[menuBaseLayers])layers[menuBaseLayers+1]=m_hudQuad.SecondEye();
+                            endInfo.layerCount=layers[menuBaseLayers+1]?menuBaseLayers+2:(layers[menuBaseLayers]?menuBaseLayers+1:menuBaseLayers);
+                            if(editorUiLayer)layers[endInfo.layerCount++]=editorUiLayer;
                             if(const auto* interactions=m_interactionQuad.Prepare(m_session,m_localSpace,m_d3dDevice,m_d3dQueue,
                                 !menuRectActive,hudTracked,hudHead.pose,GetTrackingOriginSerial(),
                                 frameState.predictedDisplayTime,hudEyes?eyeOffsets:nullptr,hudBodyYaw)){
@@ -2604,10 +3563,29 @@ DWORD OpenXRManager::FrameThreadMain() {
                                     CVR_DIAGNOSTIC(CyberpunkVR_DebugSubmitAgeBuckets[bucket].fetch_add(1, std::memory_order_relaxed));
                                 }
                             }
+                            const auto timedEnd=lightTiming.Stamp();
                             const XrResult endRes = xrEndFrame(m_session, &endInfo);
+                            if(XR_FAILED(endRes))freshnessTerminal(cvr::menu_preview::FreshnessEvent::EndError,presentSerial,editorUiRetained);
+                            if(fgSelection.ownWitness.attempt)fgSelection.ownWitness.output=XR_SUCCEEDED(endRes)?cvr::framegen::OwnOutputReason::AcceptedProjection:cvr::framegen::OwnOutputReason::XrEndFailed;
+                            lightTiming.end+=lightTiming.Since(timedEnd);
                             XrAccumulateCycle(waitEnterMs, waitMs,
                                               frameState.predictedDisplayPeriod);
                             if (XR_SUCCEEDED(endRes)) {
+                                if(menuUiSelected&&menuUi->editorUiRequired&&editorUiLayer){
+                                    cvr::menu_preview::NoteSpatialEditorControlsPresented(menuUi->editorControlRevision);
+                                    m_editorUiDisplay=*menuUi;m_editorUiDisplayOrigin=GetTrackingOriginSerial();
+                                    m_editorUiDisplaySwapchain=reinterpret_cast<const XrCompositionLayerQuad*>(editorUiLayer)->subImage.swapchain;
+                                    if(menuUi->rawSceneSerial[0]&&menuUi->rawSceneSerial[1]){static uint64_t rawPairs{};
+                                        if(++rawPairs<=8||rawPairs%180==0)Log("[MenuPreviewRawScenePair] XR accepted epoch=%u setup=%u rawSerial=%llu/%llu cameraRevision=%llu/%llu controlRevision=%llu retained=%u; native app projections, independent UI quad\n",menuUi->scope.epoch,menuUi->scope.setup,menuUi->rawSceneSerial[0],menuUi->rawSceneSerial[1],menuUi->cameraRevision[0],menuUi->cameraRevision[1],menuUi->editorControlRevision,unsigned(editorUiRetained));}
+                                    static unsigned rows{};if(rows++<8)Log("[EditorUI-Quad] submitted epoch=%u owner=%llx source=%llu revision=%llu retained=%u origin=%llu; independent premultiplied UI, accepted eye poses retained\n",
+                                        menuUi->editorUi->scope.screenEpoch,menuUi->editorUi->scope.controllerIdentity,
+                                        menuUi->editorUi->sourceSequence,menuUi->editorUi->cameraRevision,unsigned(editorUiRetained),m_editorUiDisplayOrigin);
+                                }
+                                if((pairedSelected||menuRectActive)&&!m_worldFrameReplay.Capture(replayWorldKey,presentSerial,endInfo)){
+                                    static unsigned rejectedReplaySnapshots{};
+                                    if(++rejectedReplaySnapshots<=4)Log("[XR-WORLD-REPLAY] unsupported accepted layer snapshot, layers=%u\n",endInfo.layerCount);
+                                }
+                                if(menuUiSelected)cvr::menu_preview::NoteUiPairSubmitted(menuUi->scope.epoch,menuUi->cameraRevision[0],menuUi->cameraRevision[1]);
                                 for(int eye=0;eye<2;++eye)
                                     CVR_DIAGNOSTIC(CyberpunkVR_PoseIdLastSubmit[eye].store(monoPoseIds[eye],std::memory_order_relaxed));
                                 XrMark('E');
@@ -2709,13 +3687,64 @@ DWORD OpenXRManager::FrameThreadMain() {
                                 // on the line -- they are the same x with a later y, which drags
                                 // the slope toward zero. RealVR samples per produced frame for
                                 // the same reason.
-                                if (presentSerial != m_lastSubmittedSerial) {
+                                const bool nativeRealSource=!fgSelection.native ||
+                                    (!fgSelection.native->selected.frame->eyes[0]->generated &&
+                                     !fgSelection.native->selected.frame->eyes[1]->generated &&
+                                     fgSelection.native->selected.frame->eyes[0]->source_id==fgSelection.native->selected.frame->eyes[1]->source_id);
+                                if (!aerSelected && nativeRealSource && presentSerial != m_lastSubmittedSerial) {
                                     FitAddDisplayTime(presentSerial, frameState.predictedDisplayTime);
                                 }
-                                if(fgSelected)m_framegen.Submitted(fgSelection,m_fence,capturedReadFence,true);
+                                bool aerScopeCurrent=false;
+                                if(aerSelected) {
+                                    const auto current=cvr::framegen::ReadAerModeSnapshot();
+                                    uint64_t currentResourceEpoch{};
+                                    {std::lock_guard lock(m_presentMutex);currentResourceEpoch=m_captureResourceEpoch;}
+                                    aerScopeCurrent=current.ready && current.cameraActive && current.generation==aerSelection.generation &&
+                                        current.epochs==aerSelection.epochs && currentResourceEpoch==aerSelection.resourceEpoch &&
+                                        current.epochs.hmdWorld==GetTrackingOriginSerial() && !ExternalPoseResetPending() &&
+                                        cvr::camera::ValidateMainEyeSourceReceipt(aerSelection.referenceReceipt);
+                                }
+                                if(aerScopeCurrent && aerNativePair)
+                                    cvr::framegen::ObserveAerNativeAccepted(aerSelection.generation,aerSelection.epochs,
+                                        {true,frameState.predictedDisplayTime,aerNativePair->sourcePositions,2});
+                                else if(aerScopeCurrent) {
+                                    cvr::framegen::ObserveAerAccepted(aerSelection.generation,aerSelection.epochs,
+                                        {true,frameState.predictedDisplayTime,aerSelection.sourceIds,2});
+                                    RecordAerConsumer([&](auto& d){++d.realEndFrames;d.submittedSources=aerSelection.sourceIds;});
+                                }
+                                if(aerScopeCurrent && !aerNativePair && ppdObservation) {
+                                    cvr::ppd::ObservePpdAccepted({ppdObservation->scope,ppdObservation->nativeRevision,
+                                        aerSelection.sourceIds,{ppdObservation->eyes[0].sourceSerial,ppdObservation->eyes[1].sourceSerial},3,true,
+                                        {ppdObservation->eyes[0].outputEye,ppdObservation->eyes[1].outputEye}});
+                                }
+                                if(pairedSelected && ppdObservation && ppdObservation->paired && capturedCopySubmitted && capturedCopySignaled){
+                                    const auto now=cvr::framegen::ReadSourceFrameSystemStatus().scene;
+                                    const auto mode=cvr::framegen::ReadAerModeSnapshot();
+                                    if(now.valid&&!now.paused&&now.worldEpoch==pairedScene.worldEpoch&&!mode.requested&&
+                                       mode.generation==aerMode.generation&&mode.epochs==aerMode.epochs&&
+                                       GetTrackingOriginSerial()==ppdObservation->scope.hmdWorldEpoch&&!ExternalPoseResetPending())
+                                        cvr::ppd::ObservePpdAccepted({ppdObservation->scope,ppdObservation->nativeRevision,
+                                            {ppdObservation->eyes[0].sourceId,ppdObservation->eyes[1].sourceId},
+                                            {ppdObservation->eyes[0].sourceSerial,ppdObservation->eyes[1].sourceSerial},3,true,
+                                            {ppdObservation->eyes[0].outputEye,ppdObservation->eyes[1].outputEye}});
+                                }
+                                bool pairedScopeCurrent=false;
+                                if(pairedSelected){const auto now=cvr::framegen::ReadSourceFrameSystemStatus().scene;
+                                    uint64_t resourceEpoch{};{std::lock_guard lock(m_presentMutex);resourceEpoch=m_captureResourceEpoch;}
+                                    pairedScopeCurrent=now.valid&&!now.paused&&now.worldEpoch==pairedScene.worldEpoch&&!cvr::framegen::GetSettings().aerV2&&
+                                        fgSelection.frame.identity.origin==GetTrackingOriginSerial()&&fgSelection.frame.nativeStamp.resourceEpoch==resourceEpoch&&!ExternalPoseResetPending();}
+                                cvr::framegen::OnCameraSubmitted(aerScopeCurrent ? cvr::framegen::PresentedCamera::Alternating :
+                                    pairedScopeCurrent ? cvr::framegen::PresentedCamera::Paired : cvr::framegen::PresentedCamera::Unknown,
+                                    cvr::framegen::NowMs());
+                                if(m_ownGenerationBridge&&fgSelection.ownWitness.attempt){auto& w=fgSelection.ownWitness;if(!fgGameSelected&&!fgSelected){w.submissionKnown=true;w.accepted=true;w.copySubmitted=capturedCopySubmitted;w.signalReported=capturedCopySignaled;w.displayTime=frameState.predictedDisplayTime;}m_ownGenerationBridge->RecordOwnWitness(w);}
+                                if(fgGameSelected)m_gameFgPresenter.Submitted(fgSelection,m_fence,capturedReadFence,aerScopeCurrent||pairedScopeCurrent,capturedCopySubmitted,capturedCopySignaled,frameState.predictedDisplayTime);
+                                else if(fgSelected)m_framegen.Submitted(fgSelection,m_fence,capturedReadFence,true,
+                                    capturedCopySubmitted,capturedCopySignaled,frameState.predictedDisplayTime);
                                 else if(cvr::framegen::MetricsEnabled())cvr::framegen::OnSubmitted(presentSerial,false,presentSerial==m_lastSubmittedSerial,cvr::framegen::NowMs());
+                                freshnessTerminal(menuUiSelected?(presentSerial==m_lastSubmittedSerial?cvr::menu_preview::FreshnessEvent::Repeat:cvr::menu_preview::FreshnessEvent::Fresh):cvr::menu_preview::FreshnessEvent::AcceptedOther,presentSerial,editorUiRetained);
                                 m_lastSubmittedSerial = presentSerial;
-                                ReleaseCapturedRead(monoSource,capturedReadFence);
+                                if(menuUiSelected)menuUi->lease->fence=std::max(menuUi->lease->fence,capturedReadFence);
+                                else ReleaseCapturedRead(monoSource,capturedReadFence);
                                 if (vrcamEye)ReleaseCapturedRead(vrcamEye,capturedReadFence);
                                 if (monoDepthSource) monoDepthSource->Release();
                                 if (m_frameSyncEvent) {
@@ -2734,8 +3763,16 @@ DWORD OpenXRManager::FrameThreadMain() {
                     }
                 }
 
-                if(fgSelected)m_framegen.Submitted(fgSelection,m_fence,capturedReadFence,false);
-                if (monoSource) {
+                if(m_aerReconstruction)for(auto& ticket:aerTickets)if(ticket) {
+                    // A pre-record/allocator failure never reached Execute.
+                    m_aerReconstruction->CancelNeverExecuted(ticket);ticket={};
+                }
+                if(m_ownGenerationBridge&&fgSelection.ownWitness.attempt){auto& w=fgSelection.ownWitness;if(!fgGameSelected&&!fgSelected){if(replayWorldWhenBusy)ownReplayWitness=w;else{w.submissionKnown=true;w.copySubmitted=capturedCopySubmitted;w.signalReported=capturedCopySignaled;w.displayTime=frameState.predictedDisplayTime;}}m_ownGenerationBridge->RecordOwnWitness(w);}
+                if(fgGameSelected)m_gameFgPresenter.Submitted(fgSelection,m_fence,capturedReadFence,false,capturedCopySubmitted,capturedCopySignaled,frameState.predictedDisplayTime);
+                else if(fgSelected)m_framegen.Submitted(fgSelection,m_fence,capturedReadFence,false,
+                    capturedCopySubmitted,capturedCopySignaled,frameState.predictedDisplayTime);
+                if(menuUiSelected)menuUi->lease->fence=std::max(menuUi->lease->fence,capturedReadFence);
+                if (monoSource&&!menuUiSelected) {
                     ReleaseCapturedRead(monoSource,capturedReadFence);
                 }
                 if (vrcamEye) {
@@ -2753,19 +3790,62 @@ DWORD OpenXRManager::FrameThreadMain() {
                 frameState.shouldRender ? 1 : 0);
         }
 
+        if(replayWorldWhenBusy){
+            // The allocator wait can overlap a game pause/detach, resize or
+            // tracking reset. Read the live scope here, never the pre-wait key.
+            const auto scene=cvr::framegen::ReadSourceFrameSystemStatus().scene;
+            const bool liveMenu=GetMenuMode()!=0||GetMenuRectMode()!=0;
+            cvr::xr::WorldFrameKey liveKey{};
+            if((liveMenu||(scene.valid&&!scene.paused&&CyberpunkVR_StereoSubmit!=0&&!cvr::framegen::GetSettings().aerV2))&&
+               m_sessionRunning.load(std::memory_order_acquire)&&!ExternalPoseResetPending()&&m_eyeSwapchains.size()==2){
+                liveKey={m_session,m_localSpace,scene.worldEpoch,GetTrackingOriginSerial(),0,
+                    {m_eyeSwapchains[0].handle,m_eyeSwapchains[1].handle},m_worldReplaySessionRun.load(std::memory_order_acquire),liveMenu};
+                if(liveMenu&&m_editorUiDisplay&&m_editorUiDisplay->editorUi&&
+                   cvr::xr::EditorUiRetainedAllowed(m_editorUiDisplay->editorUi->scope,m_editorUiDisplayOrigin,
+                       GetTrackingOriginSerial(),cvr::menu_preview::IsPreviewEpochOpen(m_editorUiDisplay->editorUi->scope.screenEpoch),
+                       editorUiCurrentKnown?&editorUiCurrent.metadata:nullptr)){
+                    // Same accepted handle/pose; no image acquire/update during replay.
+                    liveKey.editorUi=m_editorUiDisplaySwapchain;
+                }
+                {std::lock_guard lock(m_presentMutex);liveKey.resources=m_captureResourceEpoch;}
+            }else m_worldFrameReplay.Invalidate();
+            if(const auto* replay=m_worldFrameReplay.Prepare(liveKey,frameState.predictedDisplayTime)){
+                const auto timedReplayEnd=lightTiming.Stamp();
+                const auto replayResult=xrEndFrame(m_session,replay);
+                freshnessTerminal(XR_SUCCEEDED(replayResult)?cvr::menu_preview::FreshnessEvent::Replay:cvr::menu_preview::FreshnessEvent::EndError,m_worldFrameReplay.Serial(),true);
+                lightTiming.end+=lightTiming.Since(timedReplayEnd);
+                if(XR_SUCCEEDED(replayResult)){
+                    if(m_ownGenerationBridge&&ownReplayWitness.attempt){ownReplayWitness.output=cvr::framegen::OwnOutputReason::Replay;ownReplayWitness.replay=true;ownReplayWitness.submissionKnown=true;ownReplayWitness.displayTime=frameState.predictedDisplayTime;m_ownGenerationBridge->RecordOwnWitness(ownReplayWitness);ownReplayWitness.attempt=0;}
+                    CVR_DIAGNOSTIC(CyberpunkVR_DebugXrEnds.fetch_add(1,std::memory_order_relaxed));
+                    CVR_DIAGNOSTIC(CyberpunkVR_DebugXrEndsWithLayer.fetch_add(1,std::memory_order_relaxed));
+                    if(cvr::framegen::MetricsEnabled())cvr::framegen::OnSubmitted(m_worldFrameReplay.Serial(),false,true,cvr::framegen::NowMs());
+                    static uint64_t replayCount{};
+                    if(++replayCount<=4||replayCount%180==0)Log("[%s] GPU allocator busy, retained image serial=%llu count=%llu layers=%u\n",liveMenu?"XR-MENU-REPLAY":"XR-WORLD-REPLAY",m_worldFrameReplay.Serial(),replayCount,replay->layerCount);
+                    XrAccumulateCycle(waitEnterMs,waitMs,frameState.predictedDisplayPeriod);
+                    if(m_frameSyncEvent)SetEvent(m_frameSyncEvent);
+                    continue;
+                }
+                m_worldFrameReplay.Invalidate();
+                Log("[XR-WORLD-REPLAY] xrEndFrame failed res=%d\n",replayResult);
+                if(m_ownGenerationBridge&&ownReplayWitness.attempt){ownReplayWitness.output=cvr::framegen::OwnOutputReason::XrEndFailed;ownReplayWitness.submissionKnown=true;m_ownGenerationBridge->RecordOwnWitness(ownReplayWitness);ownReplayWitness.attempt=0;}
+            }
+        }
         XrFrameEndInfo endInfo{XR_TYPE_FRAME_END_INFO};
         endInfo.displayTime = frameState.predictedDisplayTime;
         endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
         endInfo.layerCount = 0;
+        if(m_ownGenerationBridge&&ownReplayWitness.attempt){ownReplayWitness.submissionKnown=true;m_ownGenerationBridge->RecordOwnWitness(ownReplayWitness);}
         endInfo.layers = nullptr;
-        // AN END WITH NO LAYER IS A DISPLAY FRAME WITH NOTHING IN IT. The runtime holds whatever
-        // it composed last, which is precisely what "the headset runs at half the rate" looks
-        // like from the inside. Counted apart from the real submit so the two never average
-        // together into a number that says nothing.
+        // OpenXR requires an empty layer list to CLEAR the display. It does not
+        // retain the prior stereo image. Known allocator back-pressure reuses an
+        // accepted layer snapshot above; all other invalid states still fail closed.
         CVR_DIAGNOSTIC(CyberpunkVR_DebugXrEnds.fetch_add(1, std::memory_order_relaxed));
         CVR_DIAGNOSTIC(CyberpunkVR_DebugXrEndsEmpty.fetch_add(1, std::memory_order_relaxed));
         XrMark('e');
-        xrEndFrame(m_session, &endInfo);
+        const auto timedEmptyEnd=lightTiming.Stamp();
+        const auto freshnessEmptyResult=xrEndFrame(m_session, &endInfo);
+        freshnessTerminal(XR_SUCCEEDED(freshnessEmptyResult)?cvr::menu_preview::FreshnessEvent::Empty:cvr::menu_preview::FreshnessEvent::EndError);
+        lightTiming.end+=lightTiming.Since(timedEmptyEnd);
         XrAccumulateCycle(waitEnterMs, waitMs, frameState.predictedDisplayPeriod);
 
         if (m_frameSyncEvent) {

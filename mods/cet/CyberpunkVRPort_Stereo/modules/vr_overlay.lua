@@ -3,10 +3,10 @@
 local M = { error=nil, active=false, phase="idle", waiting=0 }
 local actions, pending, requestedClose = {}, nil, false
 local function englishLabel(a)
-    local names={OnClosePauseMenu="CONTINUE",OnSwitchToLoadGame="LOAD GAME",OnSwitchToSettings="SETTINGS",OnCreditsPicker="CREDITS",OnBuyGame="BUY GAME"}
+    local names={OnClosePauseMenu="ПРОДОЛЖИТЬ",OnSwitchToLoadGame="ЗАГРУЗИТЬ ИГРУ",OnSwitchToSettings="НАСТРОЙКИ",OnCreditsPicker="АВТОРЫ",OnBuyGame="КУПИТЬ ИГРУ"}
     if names[a.event] then return names[a.event] end
     local kind=a.kind or (a.action and a.action:match(":%s*([%w_]+)"))
-    return ({Save="SAVE GAME",QuickSave="QUICKSAVE",ExitToMainMenu="MAIN MENU",ExitGame="QUIT GAME"})[kind] or "GAME ACTION"
+    return ({Save="СОХРАНИТЬ ИГРУ",QuickSave="БЫСТРОЕ СОХРАНЕНИЕ",ExitToMainMenu="ГЛАВНОЕ МЕНЮ",ExitGame="ВЫЙТИ ИЗ ИГРЫ"})[kind] or "ИГРОВОЕ ДЕЙСТВИЕ"
 end
 local function controllers()
     local layer=Game.GetInkSystem():GetLayer(CName.new("inkMenuLayer"))

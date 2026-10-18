@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.24)
+project(NativeObjectIdentityTests LANGUAGES CXX)
+enable_testing()
+add_executable(native_object_identity_tests main.cpp)
+target_include_directories(native_object_identity_tests PRIVATE ../../include)
+target_compile_features(native_object_identity_tests PRIVATE cxx_std_20)
+target_compile_definitions(native_object_identity_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+add_test(NAME native_object_identity COMMAND native_object_identity_tests)

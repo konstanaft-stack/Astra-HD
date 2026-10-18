@@ -1,4 +1,5 @@
 #include "Utils/DebugGate.hpp"
+#include "Framegen/Framegen.hpp"
 #include "Render/SinglePassTrace.hpp"
 #include "Render/NativeGeometryPackets.hpp"
 #include "Render/StereoGpuProbe.hpp"
@@ -1591,6 +1592,7 @@ constexpr int kCascSlots = 4;
 
 float   g_cascs_slot[kCascSlots][kCascMatFloats] = {};
 uint8_t g_cascs_slot_all[kCascSlots][kCascSampleBytes] = {};
+uint64_t g_cascs_mode[kCascSlots] = {};
 int     g_cascs_have_n = 0;                     // slots the second view filled in its current turn
 int     g_cascs_idx = 0;                        // next ordinal within the current turn
 int     g_cascs_side = -2;                      // the side whose turn it is, as last seen HERE
@@ -1716,6 +1718,7 @@ void cascs_report(bool first) {
 }
 
 bool cascs_block_here(uint32_t size, const void* src) {
+    if (cvr::framegen::CascadeLendingEpoch()&1u) return false;
     if (!CyberpunkVR_CascSampleLend || size != kCascSampleBytes || !src || !g_exe_base) return false;
     const uintptr_t base = reinterpret_cast<uintptr_t>(g_exe_base);
     if (t_current_node_work <= base ||
@@ -1736,6 +1739,8 @@ int cascs_ordinal(int side) {
 
 void cascs_capture(const void* src, int slot) {
     if (slot < 0 || slot >= kCascSlots) return;
+    const auto mode=cvr::framegen::CascadeLendingEpoch();
+    if(mode&1u)return;
     float mat[kCascMatFloats];
     if (!cascs_read_mat(src, mat)) return;
     uint8_t all[kCascSampleBytes];
@@ -1743,6 +1748,7 @@ void cascs_capture(const void* src, int slot) {
     __except (EXCEPTION_EXECUTE_HANDLER) { return; }
     memcpy(g_cascs_slot[slot], mat, sizeof(mat));
     memcpy(g_cascs_slot_all[slot], all, kCascSampleBytes);
+    g_cascs_mode[slot]=mode;
     if (slot + 1 > g_cascs_have_n) g_cascs_have_n = slot + 1;
     // How far this view's own slots sit from each other -- the number that says whether pairing mattered.
     if (slot > 0) {
@@ -1754,6 +1760,8 @@ void cascs_capture(const void* src, int slot) {
 }
 
 bool cascs_apply(const void* src, void* dst, int slot) {
+    const auto mode=cvr::framegen::CascadeLendingEpoch();
+    if(mode&1u)return false;
     if (g_cascs_have_n <= 0) return false;
     // COVERAGE BEATS PAIRING, and it is measured rather than argued: the report says the second view's own
     // slots hold the same matrix to 0.0 mm, so which of them MAIN receives cannot matter -- while MISSING a
@@ -1766,6 +1774,7 @@ bool cascs_apply(const void* src, void* dst, int slot) {
         ++g_cascs_miss;
         slot = g_cascs_have_n - 1;
     }
+    if(g_cascs_mode[slot]!=mode)return false;
     float mine[kCascMatFloats];
     if (!cascs_read_mat(src, mine)) return false;
     float worst = 0.0f;
@@ -1831,11 +1840,13 @@ constexpr int kCascRenderSlots = 8;
 
 uint8_t  g_cascr[kCascRenderSlots][kCamBlockBytes] = {};
 bool     g_cascr_have[kCascRenderSlots] = {};
+uint64_t g_cascr_mode[kCascRenderSlots] = {};
 float    g_cascr_dmax[kCascRenderSlots] = {};
 uint64_t g_cascr_pairs = 0;
 std::atomic<int> g_cascr_said{0};
 
 bool cascr_block_here(uint32_t size, const void* src) {
+    if (cvr::framegen::CascadeLendingEpoch()&1u) return false;
     if (!CyberpunkVR_CascRenderLend || size != kCamBlockBytes || !src || !g_exe_base) return false;
     if (t_cascade_idx < 0 || t_cascade_idx >= kCascRenderSlots) return false;
     const uintptr_t base = reinterpret_cast<uintptr_t>(g_exe_base);
@@ -1844,17 +1855,21 @@ bool cascr_block_here(uint32_t size, const void* src) {
 }
 
 void cascr_capture(const void* src, int idx) {
+    const auto mode=cvr::framegen::CascadeLendingEpoch();
+    if(mode&1u)return;
     uint8_t all[kCamBlockBytes];
     __try { memcpy(all, src, kCamBlockBytes); }
     __except (EXCEPTION_EXECUTE_HANDLER) { return; }
     memcpy(g_cascr[idx], all, kCamBlockBytes);
+    g_cascr_mode[idx]=mode;
     g_cascr_have[idx] = true;
 }
 
 void cascr_report(bool first);
 
 bool cascr_apply(const void* src, void* dst, int idx) {
-    if (!g_cascr_have[idx]) return false;
+    const auto mode=cvr::framegen::CascadeLendingEpoch();
+    if ((mode&1u) || !g_cascr_have[idx] || g_cascr_mode[idx]!=mode) return false;
     float mine[kCamBlockBytes / 4];
     __try { memcpy(mine, src, kCamBlockBytes); }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }

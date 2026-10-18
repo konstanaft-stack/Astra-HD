@@ -30,7 +30,9 @@
 #include "Stereo/SyncStereo.hpp"
 #include "Framegen/Framegen.hpp"
 #include "Framegen/Inputs.hpp"
+#include "Framegen/ProducerTrace.hpp"
 #include "Camera/PoseIdentity.hpp"
+#include "MenuPreview/ImageLineage.hpp"
 #include "Stereo/AutoGrassReadiness.hpp"
 #include "Utils/MemorySafe.hpp"
 #include "Utils/StereoLog.hpp"
@@ -1001,6 +1003,7 @@ uint8_t __fastcall Detour_NodeDispatch(
     // Present and StartRender nodes carry. So MAIN is the dispatch whose view object IS that one, the second
     // eye is the VRCAM key, and everything else is neither.
     const int32_t previous_view_side = t_view_side;
+    uintptr_t previewObservedViewObject{}; // reuse existing getter result, no extra native call
     if (view_key_known && view_key == g_vrcam_ctx_key) {
         t_view_side = 1;
     } else {
@@ -1008,6 +1011,7 @@ uint8_t __fastcall Detour_NodeDispatch(
         uintptr_t obj = 0;
         __try { obj = work_context ? sl_view_obj(work_context) : 0; }
         __except (EXCEPTION_EXECUTE_HANDLER) { obj = 0; }
+        previewObservedViewObject=obj;
         t_view_side = (main_obj && obj == main_obj) ? 0 : -1;
     }
     // Publish the exact view for the camera hooks that run inside this dispatch. Saved and
@@ -1017,12 +1021,21 @@ uint8_t __fastcall Detour_NodeDispatch(
     const uint64_t previous_view_key   = t_active_view_key;
     t_active_view_known = view_key_known;
     t_active_view_key   = view_key;
+    const auto previousProducerNodeScope=cvr::framegen::EnterProducerNodeScope(
+        view_key_known,view_key,t_view_side,poseContext,uint32_t(work_rva));
     cvr::camera::PoseIdentity nodePose{};
     if(view_key_known && (view_key==0 || view_key==g_vrcam_ctx_key.load(std::memory_order_relaxed)))
         cvr::camera::ReadCameraPoseIdentity(poseContext+0x70,view_key==0 ? 1u : 2u,&nodePose);
-    if(cvr::framegen::Enabled() && nodePose)
+    // Frame identity belongs to each captured camera image, including FG-off
+    // paired stereo. Depth/MV copies remain controlled by CaptureInputsEnabled.
+    if(nodePose)
         nodePose.hasRenderFrameId=cvr::framegen::ReadRenderFrameIndex(&nodePose.renderFrameId);
     const auto previousNodePose=cvr::camera::SetNodePoseIdentity(nodePose);
+    uint32_t previewNativeFrame{};
+    const bool previewClockKnown=cvr::menu_preview::PreviewRtvTrackingActive() &&
+        cvr::framegen::ReadRenderFrameIndex(&previewNativeFrame);
+    const auto previousPreviewBinding=cvr::menu_preview::EnterPreviewNodeBinding(
+        poseContext,view_key_known?view_key:0,previewClockKnown,previewNativeFrame,uint32_t(work_rva),previewObservedViewObject);
     const bool fogNode=work_rva==VOLUMETRIC_FOG_NODE_RVA;
     const auto previousFogContext=fogNode ? cvr::stereo::SetFogWorkContext(reinterpret_cast<uintptr_t>(work_context)):0;
 
@@ -1062,6 +1075,7 @@ uint8_t __fastcall Detour_NodeDispatch(
     view_params_report();
     complend_report();
     const uint8_t result = g_node_dispatch_orig(node, work_context, args);
+    cvr::menu_preview::NotePreviewNodeEpilogue(uint32_t(work_rva));
     if (comp_lent_vd) comp_lend_restore(comp_lent_vd, comp_saved);
     // Give the slot back before anything else can run on this view.
     if (hud_block_slot) {
@@ -1104,6 +1118,8 @@ uint8_t __fastcall Detour_NodeDispatch(
     t_active_view_known = previous_view_known;
     t_active_view_key   = previous_view_key;
     cvr::camera::SetNodePoseIdentity(previousNodePose);
+    cvr::menu_preview::RestorePreviewNodeBinding(previousPreviewBinding);
+    cvr::framegen::RestoreProducerNodeScope(previousProducerNodeScope);
     if(fogNode)cvr::stereo::SetFogWorkContext(previousFogContext);
     t_current_node_work = previous_node_work;
     // THE FINISHED FRAME, at the epilogue of the second-view node that produced it. Same window as

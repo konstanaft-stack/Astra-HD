@@ -46,6 +46,7 @@ extern volatile int g_menuModeValue;
 unsigned int GetForcedRenderWidthValue();
 unsigned int GetForcedRenderHeightValue();
 void ApplySettingsResolutionOverride(uintptr_t settings);
+bool SettingsResolutionOverrideSuspended();
 
 // The last settings / DLSS objects the engine handed us. Shared: the hooks write them, the hub's
 // resolution logic reads them.
@@ -55,6 +56,12 @@ extern volatile uintptr_t g_dlssResPtr;
 // Player state the movement hooks branch on, refreshed from RTTI once per frame by the hub.
 extern bool g_isAiming;
 extern bool g_hasWeaponEquipped;
+
+// Laser-dot presentation is stricter than the generic weapon state: only a currently confirmed
+// ranged weapon qualifies. CET refreshes this heartbeat from AttachmentSlots.WeaponRight every
+// update; the render side fails closed if the heartbeat goes stale during loads or paused script.
+extern std::atomic<int> g_laserRangedWeaponActive;
+extern std::atomic<unsigned long long> g_laserRangedWeaponUpdatedMs;
 
 // The render size the launcher was told to use. The FOV hooks derive the vertical from the
 // horizontal through this aspect, so the two must be the SAME numbers the swapchain gets.

@@ -49,6 +49,9 @@
 #include <RED4ext/Scripting/Natives/entAnimationControllerComponent.hpp>
 #include <RED4ext/Scripting/Natives/Generated/ent/GarmentSkinnedMeshComponent.hpp>
 #include <RED4ext/Scripting/Natives/Generated/ent/MeshComponent.hpp>
+#include <RED4ext/Scripting/Natives/Generated/game/HitRepresentationComponent.hpp>
+#include <RED4ext/Scripting/Natives/Generated/game/HitShapeUserData.hpp>
+#include <RED4ext/Scripting/Natives/Generated/game/QueryResult.hpp>
 #include <windows.h>
 #include <algorithm>
 #include <cctype>
@@ -58,9 +61,12 @@
 #include <fstream>
 #include <utility>
 #include <iomanip>
+#include <limits>
 #include <string>
 #include "Anim/VrikHook.hpp"
 #include "Anim/WeaponAim.hpp"
+#include "Anim/AdsSightAim.hpp"
+#include "Core/VrCoreShared.hpp"
 #include "Natives/NativeState.hpp"
 #include "Natives/NativeHelpers.hpp"
 #include <MinHook.h>
@@ -351,6 +357,63 @@ static bool ProvIsPlayersAttack(int aClass, uintptr_t aProvider) {
     return mine;
 }
 
+// Visible Bullets uses the native projectile position provider. Its real slot 33 has a different
+// source offset from the orientation provider: +0x88 leads to the attack at source +0x10.
+// Only the local player's attack may use the live weapon muzzle as its launch origin.
+static void* g_posProvOrig = nullptr;
+
+static bool PosProvIsPlayersAttack(uintptr_t aProvider) {
+    const uintptr_t player = g_playerEntityPtr;
+    if (!player || !ProvPlausiblePtr(aProvider)) return false;
+
+    bool mine = false;
+    __try {
+        const uintptr_t source = *reinterpret_cast<uintptr_t*>(aProvider + 0x88);
+        if (!ProvPlausiblePtr(source)) return false;
+        const uintptr_t attack = *reinterpret_cast<uintptr_t*>(source + 0x10);
+        if (!ProvPlausiblePtr(attack)) return false;
+        const uintptr_t* words = reinterpret_cast<const uintptr_t*>(attack);
+        for (int h = 0; h < 4; ++h) {
+            if (words[kProvAttackHandleOffsets[h] / 8] == player) {
+                mine = true;
+                break;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    return mine;
+}
+
+static uintptr_t __fastcall PosProvStub33(uintptr_t rcx, uintptr_t rdx, uintptr_t r8, uintptr_t r9) {
+    using Fn = uintptr_t(__fastcall*)(uintptr_t,uintptr_t,uintptr_t,uintptr_t);
+    Fn original = reinterpret_cast<Fn>(g_posProvOrig);
+    const uintptr_t result = original ? original(rcx, rdx, r8, r9) : 0;
+
+    if (!g_pSharedHands || !g_provMuzzlePosSeq ||
+        g_pSharedHands[vrshared::kWeaponFlag] <= 0.5f || g_pSharedHands[27] <= 0.5f ||
+        !PosProvIsPlayersAttack(rcx)) return result;
+
+    float x = g_provMuzzlePos[0], y = g_provMuzzlePos[1], z = g_provMuzzlePos[2];
+    const float lengthSq = x*x + y*y + z*z;
+    if (!std::isfinite(lengthSq) || lengthSq <= 1.0f) return result;
+
+    if (VrAdsSightAimActive()) {
+        float sight[3] = {};
+        if (VrReadSightOrigin(sight)) {
+            x = sight[0]; y = sight[1]; z = sight[2];
+        }
+    }
+
+    const uintptr_t output = rdx ? rdx : result;
+    if (!ProvPlausiblePtr(output)) return result;
+    __try {
+        float* position = reinterpret_cast<float*>(output);
+        position[0] = x;
+        position[1] = y;
+        position[2] = z;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return result;
+}
+
 // Each stub knows its (class C, slot S): bump counter; sample/override the out-quat; call original.
 template <int C, int S>
 static uintptr_t __fastcall ProvStub(uintptr_t rcx, uintptr_t rdx, uintptr_t r8, uintptr_t r9) {
@@ -621,6 +684,25 @@ static int InstallProvClass(int c) {
     VirtualProtect(reinterpret_cast<void*>(vt + kProvSlotLo*8), kProvNSlots*8, oldp, &oldp);
     return 1;
 }
+static int InstallPositionProvClass() {
+    auto* rtti = RED4ext::CRTTISystem::Get();
+    auto* cls = rtti ? rtti->GetClass("entFuncPositionProvider") : nullptr;
+    if (!cls) return -1;
+    void* instance = cls->CreateInstance(true);
+    if (!instance) return -2;
+    uintptr_t vtable = 0;
+    __try { vtable = *reinterpret_cast<uintptr_t*>(instance); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    if (!vtable) return -3;
+
+    constexpr int kPositionSlot = 33;
+    uintptr_t* slot = reinterpret_cast<uintptr_t*>(vtable + kPositionSlot * 8);
+    DWORD oldProtection = 0;
+    if (!VirtualProtect(slot, sizeof(uintptr_t), PAGE_EXECUTE_READWRITE, &oldProtection)) return -4;
+    g_posProvOrig = reinterpret_cast<void*>(*slot);
+    *slot = reinterpret_cast<uintptr_t>(&PosProvStub33);
+    VirtualProtect(slot, sizeof(uintptr_t), oldProtection, &oldProtection);
+    return 1;
+}
 void InstallVRProvInstrument(RED4ext::IScriptable*, RED4ext::CStackFrame* aFrame, int32_t* aOut, int64_t) {
     aFrame->code++;
     if (g_provInstalled) { if (aOut) *aOut = 2; return; }
@@ -629,8 +711,9 @@ void InstallVRProvInstrument(RED4ext::IScriptable*, RED4ext::CStackFrame* aFrame
     FillRow<2>(std::make_integer_sequence<int, kProvNSlots>{});
     int ok = 0;
     for (int c = 0; c < kProvNCls; ++c) if (InstallProvClass(c) == 1) ++ok;
+    if (InstallPositionProvClass() == 1) ++ok;
     g_provInstalled = ok > 0 ? 1 : 0;
-    if (aOut) *aOut = ok;   // number of provider classes instrumented (expect 3)
+    if (aOut) *aOut = ok;   // number of provider classes instrumented (expect 4)
 }
 // arg = cls*1000 + REAL vtable slot (e.g. 0*1000+33 for entEntity slot 33); -1 = off.
 // Stored override slot is the STUB INDEX (realSlot - kProvSlotLo) to match ProvStub<C,S>.
@@ -673,6 +756,149 @@ void SetVRMuzzleQuat(RED4ext::IScriptable*, RED4ext::CStackFrame* aFrame, void*,
         g_pSharedHands[27] = 1.0f;  // valid
     }
 }
+// Publish CET's muzzle raycast result without performing a game-world query from Present. The
+// sequence brackets hit XYZ/valid and both visibility bits so the render thread consumes one update.
+void SetVRBarrelRayHit(RED4ext::IScriptable*, RED4ext::CStackFrame* aFrame, void*, int64_t) {
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    int32_t valid = 0, mainVisible = 1, secondVisible = 1;
+    RED4ext::GetParameter(aFrame, &x);
+    RED4ext::GetParameter(aFrame, &y);
+    RED4ext::GetParameter(aFrame, &z);
+    RED4ext::GetParameter(aFrame, &valid);
+    RED4ext::GetParameter(aFrame, &mainVisible);
+    RED4ext::GetParameter(aFrame, &secondVisible);
+    aFrame->code++;
+    EnsureSharedMemory();
+    if (!g_pSharedHands) return;
+
+    static uint32_t s_evenSeq = 0;
+    uint32_t nextEven = s_evenSeq + 2u;
+    if (nextEven >= 1000000u) nextEven = 2u;
+    g_pSharedHands[vrshared::kBarrelRaySeq] = static_cast<float>(nextEven - 1u);
+    std::atomic_thread_fence(std::memory_order_release);
+    g_pSharedHands[vrshared::kBarrelRayHitX + 0] = x;
+    g_pSharedHands[vrshared::kBarrelRayHitX + 1] = y;
+    g_pSharedHands[vrshared::kBarrelRayHitX + 2] = z;
+    g_pSharedHands[vrshared::kBarrelRayHitValid] = valid != 0 ? 1.0f : 0.0f;
+    g_pSharedHands[vrshared::kBarrelMainVisible] = mainVisible != 0 ? 1.0f : 0.0f;
+    g_pSharedHands[vrshared::kBarrelSecondVisible] = secondVisible != 0 ? 1.0f : 0.0f;
+    std::atomic_thread_fence(std::memory_order_release);
+    g_pSharedHands[vrshared::kBarrelRaySeq] = static_cast<float>(nextEven);
+    s_evenSeq = nextEven;
+}
+
+struct HitRepQueryState {
+    alignas(16) RED4ext::game::QueryResult result{};
+    int32_t status = 0;
+    bool initialized = false;
+};
+
+static bool HitRepMatchesBytes(const uint8_t* address, const uint8_t* expected, size_t count) {
+    __try {
+        if (!address || !expected) return false;
+        for (size_t i = 0; i < count; ++i) if (address[i] != expected[i]) return false;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static void QueryHitRepSurfaceNative(RED4ext::game::HitRepresentationComponent* component,
+                                     const RED4ext::Vector4* from,
+                                     const RED4ext::Vector4* to,
+                                     HitRepQueryState* state) {
+    if (!component || !from || !to || !state) return;
+    __try {
+        const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(L"Cyberpunk2077.exe"));
+        if (!base) { state->status = -1; return; }
+        // CP2077 2.3x signatures used by the TE6 implementation. Refuse the call if a game update
+        // moved either routine; a disabled NPC surface query is safer than calling a guessed RVA.
+        static constexpr uint8_t kQueryBytes[] = {0x48, 0x8B, 0xC4, 0x53};
+        static constexpr uint8_t kResultCtorBytes[] = {0x83, 0x61, 0x08, 0x00};
+        if (!HitRepMatchesBytes(reinterpret_cast<const uint8_t*>(base + 0x8BB428),
+                               kQueryBytes, sizeof(kQueryBytes)) ||
+            !HitRepMatchesBytes(reinterpret_cast<const uint8_t*>(base + 0x8BA038),
+                               kResultCtorBytes, sizeof(kResultCtorBytes))) {
+            state->status = -3;
+            return;
+        }
+        const auto initResult = reinterpret_cast<void (*)(RED4ext::game::QueryResult*)>(base + 0x8BA038);
+        const auto query = reinterpret_cast<bool (*)(RED4ext::game::HitRepresentationComponent*,
+            const float*, const float*, RED4ext::game::QueryResult*, void*)>(base + 0x8BB428);
+        initResult(&state->result);
+        state->initialized = true;
+        state->status = query(component, &from->X, &to->X, &state->result, nullptr) ? 1 : 2;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        state->status = -2;
+    }
+}
+
+static void DestroyHitRepQuery(HitRepQueryState* state) {
+    if (!state || !state->initialized) return;
+    __try {
+        const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(L"Cyberpunk2077.exe"));
+        if (!base) return;
+        const auto destroyResult = reinterpret_cast<void (*)(RED4ext::game::QueryResult*)>(base + 0x8B9F40);
+        destroyResult(&state->result);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+// Return the closest animated HitRepresentation surface on one candidate NPC. W<=0 is a miss;
+// candidate collection/deduplication stays in redscript so this native only intersects live shapes.
+void QueryVRNpcHitSurface(RED4ext::IScriptable*, RED4ext::CStackFrame* aFrame,
+                          RED4ext::Vector4* aOut, int64_t) {
+    RED4ext::Handle<RED4ext::IScriptable> entityHandle;
+    RED4ext::Vector4 from{}, to{};
+    RED4ext::GetParameter(aFrame, &entityHandle);
+    RED4ext::GetParameter(aFrame, &from);
+    RED4ext::GetParameter(aFrame, &to);
+    aFrame->code++;
+    if (!aOut) return;
+    aOut->X = aOut->Y = aOut->Z = aOut->W = 0.0f;
+
+    auto* entity = reinterpret_cast<RED4ext::ent::Entity*>(entityHandle.instance);
+    if (!entity) return;
+
+    float bestDistanceSq = std::numeric_limits<float>::infinity();
+    for (auto& componentHandle : entity->components) {
+        auto* component = componentHandle.instance;
+        if (!component) continue;
+        auto* type = component->GetType();
+        if (!type || type->name != "gameHitRepresentationComponent") continue;
+
+        auto* hitRep = reinterpret_cast<RED4ext::game::HitRepresentationComponent*>(component);
+        HitRepQueryState queryState{};
+        QueryHitRepSurfaceNative(hitRep, &from, &to, &queryState);
+        if (queryState.status == 1) {
+            for (const auto& hit : queryState.result.hitShapes) {
+                const float distanceSq = hit.result.enterDistanceFromOriginSq;
+                const auto& position = hit.result.hitPositionEnter;
+                if (!std::isfinite(distanceSq) || distanceSq < 0.0f ||
+                    !std::isfinite(position.X) || !std::isfinite(position.Y) ||
+                    !std::isfinite(position.Z) || distanceSq >= bestDistanceSq) continue;
+                bestDistanceSq = distanceSq;
+                aOut->X = position.X;
+                aOut->Y = position.Y;
+                aOut->Z = position.Z;
+                aOut->W = 1.0f;
+            }
+        }
+        DestroyHitRepQuery(&queryState);
+    }
+}
+
+// Laser eligibility is deliberately separate from generic weapon state. A melee weapon is still a
+// weapon for animation/input ownership but must never qualify a firearm aiming aid. Timestamping
+// makes the state fail closed when CET stops ticking during loads.
+void SetVRLaserRangedWeaponState(RED4ext::IScriptable*, RED4ext::CStackFrame* aFrame, void*, int64_t) {
+    int32_t value = 0;
+    RED4ext::GetParameter(aFrame, &value);
+    aFrame->code++;
+    g_laserRangedWeaponActive.store(value != 0 ? 1 : 0, std::memory_order_relaxed);
+    g_laserRangedWeaponUpdatedMs.store(GetTickCount64(), std::memory_order_relaxed);
+}
+
 // Publish the current ADS/scope zoom factor to shared[28] so the dxgi overlay can scale the
 // barrel laser-dot's screen offset by it (the scope magnifies the image but the bullet still
 // leaves the barrel). CET pushes PlayerStateMachine.ZoomLevel each frame; 1.0 = no zoom.
@@ -695,6 +921,38 @@ void SetVRMuzzlePos(RED4ext::IScriptable*, RED4ext::CStackFrame* aFrame, void*, 
         g_pSharedHands[200] = x; g_pSharedHands[201] = y; g_pSharedHands[202] = z;
         g_pSharedHands[203] = 1.0f;   // valid
     }
+}
+
+// The sight packet has independent validity and sequence from the muzzle and surface ray packets.
+// CET invalidates it on weapon loss or failed sight lookup so a weapon swap cannot reuse old data.
+void SetVRSightOrigin(RED4ext::IScriptable*, RED4ext::CStackFrame* aFrame, void*, int64_t) {
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    int32_t valid = 0;
+    RED4ext::GetParameter(aFrame, &x);
+    RED4ext::GetParameter(aFrame, &y);
+    RED4ext::GetParameter(aFrame, &z);
+    RED4ext::GetParameter(aFrame, &valid);
+    aFrame->code++;
+    EnsureSharedMemory();
+    if (!g_pSharedHands) return;
+
+    static uint32_t s_evenSeq = 0;
+    uint32_t nextEven = s_evenSeq + 2u;
+    if (nextEven >= 1000000u) nextEven = 2u;
+    g_pSharedHands[vrshared::kSightOriginSeq] = static_cast<float>(nextEven - 1u);
+    std::atomic_thread_fence(std::memory_order_release);
+
+    const float lengthSq = x*x + y*y + z*z;
+    const bool accepted = valid != 0 && std::isfinite(lengthSq) && lengthSq > 1.0f;
+    if (accepted) {
+        g_pSharedHands[vrshared::kSightOriginX] = x;
+        g_pSharedHands[vrshared::kSightOriginX + 1] = y;
+        g_pSharedHands[vrshared::kSightOriginX + 2] = z;
+    }
+    g_pSharedHands[vrshared::kSightOriginValid] = accepted ? 1.0f : 0.0f;
+    std::atomic_thread_fence(std::memory_order_release);
+    g_pSharedHands[vrshared::kSightOriginSeq] = static_cast<float>(nextEven);
+    s_evenSeq = nextEven;
 }
 
 // THE CARRY FLAG. Raised on the frame the weapon moves into the left slot; it starts the wrist's
@@ -950,6 +1208,18 @@ void GetVRMeleeTrigger(RED4ext::IScriptable*, RED4ext::CStackFrame* aFrame, int3
 void GetVRSharedSlot(RED4ext::IScriptable*, RED4ext::CStackFrame* aFrame, float* aOut, int64_t) {
     int32_t idx = 0; RED4ext::GetParameter(aFrame, &idx); aFrame->code++;
     if (aOut) *aOut = (g_pSharedHands && idx >= 0 && idx < 256) ? g_pSharedHands[idx] : 0.0f;
+}
+
+// Publish the route selected by the CET holster-zone classifier.
+// 0 = unavailable, 1 = XInput RB, 2 = a spatial action owns/suppresses the grip.
+void SetVRRightGripRoute(RED4ext::IScriptable*, RED4ext::CStackFrame* aFrame, int32_t* aOut, int64_t) {
+    int32_t route = 0;
+    RED4ext::GetParameter(aFrame, &route);
+    aFrame->code++;
+    if (route < 0 || route > 2) route = 0;
+    EnsureSharedMemory();
+    if (g_pSharedHands) g_pSharedHands[vrshared::kRightGripRoute] = static_cast<float>(route);
+    if (aOut) *aOut = route;
 }
 void GetVRProvDump(RED4ext::IScriptable*, RED4ext::CStackFrame* aFrame, float* aOut, int64_t) {
     int32_t idx = 0; RED4ext::GetParameter(aFrame, &idx); aFrame->code++;

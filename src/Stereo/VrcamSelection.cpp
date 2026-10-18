@@ -13,6 +13,7 @@
 #include "Stereo/SyncStereo.hpp"
 #include "Utils/StereoLog.hpp"
 #include "Stereo/VrcamConfig.hpp"   // vrcam.json access + CName hashing, shared with the launcher
+extern "C" uint32_t CyberpunkVR_VrcamEnabled;
 #include "Render/ColorBlit.hpp"   // HUD debug overlay on the mirror image
 #include <windows.h>
 #include <d3d12.h>
@@ -219,7 +220,7 @@ void vrcam_active_watcher() {
                         vrcam_apply_selection(wanted, camera);
                         g_vrcam_pick_authoritative = true;
                         vrcam_config_write_component(wanted);
-                        vrcam_bridge_write("vrcam_enable.txt", "1");
+                        vrcam_bridge_write("vrcam_enable.txt", CyberpunkVR_VrcamEnabled ? "1" : "0");
                         last.clear();
                         disagreeSince = 0;
                         continue;
@@ -272,7 +273,7 @@ void vrcam_active_watcher() {
                     cvr::log("[vrcam] live camera is %s but the launcher picked %s -> NOT "
                             "adopting; re-requesting %s", buf, g_vrcam_camera, g_vrcam_component);
                     vrcam_config_write_component(g_vrcam_component);
-                    vrcam_bridge_write("vrcam_enable.txt", "1");
+                    vrcam_bridge_write("vrcam_enable.txt", CyberpunkVR_VrcamEnabled ? "1" : "0");
                 }
                 last.clear();               // re-evaluate on the next poll
                 continue;

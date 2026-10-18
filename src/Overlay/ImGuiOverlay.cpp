@@ -6,8 +6,12 @@
 #include "Overlay/VrDraw.hpp"
 #include "Overlay/VrImGuiInput.hpp"
 #include "Runtimes/OpenXRManager.hpp"
+#include "Render/DesktopMirror.hpp"
+#include "Stereo/CetOverlayLayer.hpp"
+#include "MenuPreview/SpatialEditor.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
@@ -25,6 +29,10 @@ extern volatile int g_verboseLog; // per-frame log spam toggle (default off)
 
 
 extern void Log(const char* fmt, ...);
+extern void SetCetVirtualCursorVisible(bool visible);
+extern bool GetCetVirtualCursorClientPosition(float* x, float* y);
+extern void SyncCetVirtualCursorFromPhysicalClient(LPARAM lParam);
+extern void UpdateCetVirtualCursorFromRawInput(LPARAM lParam);
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
@@ -134,6 +142,9 @@ DXGI_FORMAT g_rtvFormat = DXGI_FORMAT_UNKNOWN;
 DXGI_FORMAT g_imguiPsoFormat = DXGI_FORMAT_UNKNOWN;
 // The list the world-projected markers draw into, captured while the frame is still open.
 ImDrawList* g_bgDrawList = nullptr;
+// Geometry projected through the second eye's own world frustum. It is inserted only while recording
+// the VRCAM overlay replay; MAIN's background list remains excluded from that pass.
+ImDrawList* g_secondEyeWorldDrawList = nullptr;
 // A small ring of RTVs for targets that are not the swapchain (the second eye). Round-robin
 // rather than one, so a descriptor is never rewritten while a frame that referenced it is still
 // in flight -- the same reason ColorBlit keeps a ring.
@@ -150,6 +161,7 @@ bool g_drawDataSubmitted = false;
 cvr::vrui::ImGuiPointerRouter g_pointerInput;
 std::atomic<float> g_desktopWidth{0},g_desktopHeight{0};
 std::mutex g_desktopPointerMutex;
+std::atomic<bool> g_cetOverlayVisible{false};
 bool g_drawHandLocator = false;
 bool g_drawHandProxy3D = false;
 bool g_drawHandDebugAxes = false;
@@ -194,6 +206,7 @@ void ReleaseRenderTargets() {
             Log("Overlay teardown drain timed out; continuing (the device may be gone).\n");
         }
     }
+    CetOverlayInvalidateSwapchainResources();
     for (FrameContext& frame : g_frames) {
         SafeRelease(frame.renderTarget);
         SafeRelease(frame.allocator);
@@ -209,9 +222,21 @@ void ReleaseRenderTargets() {
     g_rtvFormat = DXGI_FORMAT_UNKNOWN;
 }
 
+bool OverlayIsSwapchainBackbuffer(ID3D12Resource* resource) {
+    if (!resource) return false;
+    for (const FrameContext& frame : g_frames) {
+        if (frame.renderTarget == resource) return true;
+    }
+    return false;
+}
+
 void ShutdownOverlay() {
     {std::lock_guard pointerLock(g_desktopPointerMutex);g_pointerInput={};}
     ReleaseRenderTargets();
+    if (g_secondEyeWorldDrawList) {
+        IM_DELETE(g_secondEyeWorldDrawList);
+        g_secondEyeWorldDrawList = nullptr;
+    }
     if (g_imguiInitialized) {
         ImGui_ImplDX12_Shutdown();
         ImGui_ImplWin32_Shutdown();
@@ -475,10 +500,27 @@ bool IsBlockedInputMessage(UINT msg) {
 }
 
 LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if(!g_menuVisible&&cvr::menu_preview::HandleSpatialEditorMouse(msg,uint64_t(wParam)))return 0;
     const float clientMouseX=float((short)LOWORD(lParam)),clientMouseY=float((short)HIWORD(lParam));
     static int totalMsgCount = 0;
     if (g_verboseLog && totalMsgCount++ % 5000 == 0) {
         Log("OverlayWndProc: msg=%u, hwnd=%p, count=%d\n", msg, hwnd, totalMsgCount);
+    }
+
+    const bool cetCursorActive = g_cetOverlayVisible.load(std::memory_order_relaxed) && !cvr::vrui::Visible();
+    if (cetCursorActive) {
+        if (msg == WM_INPUT) {
+            UpdateCetVirtualCursorFromRawInput(lParam);
+        } else if (msg == WM_MOUSEMOVE || msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP ||
+                   msg == WM_LBUTTONDBLCLK || msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP ||
+                   msg == WM_RBUTTONDBLCLK || msg == WM_MBUTTONDOWN || msg == WM_MBUTTONUP ||
+                   msg == WM_MBUTTONDBLCLK || msg == WM_XBUTTONDOWN || msg == WM_XBUTTONUP) {
+            SyncCetVirtualCursorFromPhysicalClient(lParam);
+        } else if (msg == WM_KILLFOCUS) {
+            SetCetVirtualCursorVisible(false);
+        } else if (msg == WM_SETFOCUS) {
+            SetCetVirtualCursorVisible(true);
+        }
     }
 
     // 1. Scale mouse coordinates FIRST so ImGui and game receive the scaled input
@@ -496,9 +538,12 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 int oldX = x;
                 int oldY = y;
                 
-                if (winWidth > 0 && winHeight > 0 && (winWidth != static_cast<int>(virtualWidth) || winHeight != static_cast<int>(virtualHeight))) {
-                    x = (x * static_cast<int>(virtualWidth)) / winWidth;
-                    y = (y * static_cast<int>(virtualHeight)) / winHeight;
+                DesktopCoverTransform cover{};
+                if (winWidth > 0 && winHeight > 0 && ComputeDesktopCoverTransform(
+                        virtualWidth, virtualHeight, static_cast<UINT>(winWidth),
+                        static_cast<UINT>(winHeight), cover)) {
+                    x = static_cast<int>(std::lround(cover.sourceX + x * cover.sourceWidth / winWidth));
+                    y = static_cast<int>(std::lround(cover.sourceY + y * cover.sourceHeight / winHeight));
                     
                     lParam = MAKELPARAM(static_cast<WORD>(x), static_cast<WORD>(y));
                 }
@@ -516,6 +561,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     if ((msg == WM_KEYUP || msg == WM_SYSKEYUP) && (wParam == VK_F10 || wParam == VK_INSERT)) {
         cvr::vrui::Toggle();
         g_menuVisible = cvr::vrui::Visible();
+        SetCetVirtualCursorVisible(g_cetOverlayVisible.load(std::memory_order_relaxed) && !g_menuVisible);
         if (g_menuVisible) {
             ReleaseGameMouseCapture();
         }
@@ -529,11 +575,23 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         if(msg==WM_MOUSEMOVE || msg==WM_LBUTTONDOWN || msg==WM_LBUTTONDBLCLK || msg==WM_LBUTTONUP || msg==WM_MOUSEWHEEL || msg==WM_MOUSEHWHEEL){
             const float width=g_desktopWidth.load(),height=g_desktopHeight.load();
             const auto rect=cvr::vrui::DesktopPlacement(width,height);
-            RECT client{};GetClientRect(hwnd,&client);
+            RECT client{};POINT clientOrigin{};
+            if(!GetDesktopPhysicalClientRect(hwnd,client,clientOrigin))GetClientRect(hwnd,&client);
             POINT position{LONG(clientMouseX),LONG(clientMouseY)};
             if(msg==WM_MOUSEWHEEL || msg==WM_MOUSEHWHEEL)ScreenToClient(hwnd,&position);
-            const float x=(position.x*width/std::max(1L,client.right-client.left)-rect.x)/rect.scale;
-            const float y=(position.y*height/std::max(1L,client.bottom-client.top)-rect.y)/rect.scale;
+            DesktopCoverTransform cover{};
+            const LONG clientW=std::max(1L,client.right-client.left);
+            const LONG clientH=std::max(1L,client.bottom-client.top);
+            const bool cropped=ComputeDesktopCoverTransform(
+                static_cast<UINT>(width),static_cast<UINT>(height),
+                static_cast<UINT>(clientW),static_cast<UINT>(clientH),cover);
+            const auto placement=cropped
+                ? cvr::vrui::DesktopPlacement(float(cover.sourceWidth),float(cover.sourceHeight))
+                : rect;
+            const float x=(position.x*float(cropped ? cover.sourceWidth : width)/clientW-
+                placement.x)/placement.scale;
+            const float y=(position.y*float(cropped ? cover.sourceHeight : height)/clientH-
+                placement.y)/placement.scale;
             const auto now=GetTickCount64();
             std::lock_guard pointerLock(g_desktopPointerMutex);
             if(msg==WM_LBUTTONDOWN || msg==WM_LBUTTONDBLCLK || msg==WM_LBUTTONUP)
@@ -558,10 +616,26 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
     }
 
+    if (g_cetOverlayVisible.load(std::memory_order_relaxed) && !cvr::vrui::Visible() &&
+        (msg == WM_MOUSEMOVE || msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP ||
+         msg == WM_LBUTTONDBLCLK || msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP ||
+         msg == WM_RBUTTONDBLCLK || msg == WM_MBUTTONDOWN || msg == WM_MBUTTONUP ||
+         msg == WM_MBUTTONDBLCLK || msg == WM_XBUTTONDOWN || msg == WM_XBUTTONUP)) {
+        float x = 0.0f;
+        float y = 0.0f;
+        if (GetCetVirtualCursorClientPosition(&x, &y)) {
+            lParam = MAKELPARAM(static_cast<WORD>(std::lround(x)), static_cast<WORD>(std::lround(y)));
+        }
+    }
     return g_originalWndProc ? CallWindowProcA(g_originalWndProc, hwnd, msg, wParam, lParam) : DefWindowProcA(hwnd, msg, wParam, lParam);
 }
 }  // namespace overlay
 using namespace overlay;
+
+void SetCetOverlayVisible(bool visible) {
+    g_cetOverlayVisible.store(visible, std::memory_order_relaxed);
+    SetCetVirtualCursorVisible(visible && !cvr::vrui::Visible());
+}
 
 void OverlaySetDeviceAndQueue(ID3D12Device* device, ID3D12CommandQueue* queue) {
     if (device == g_device && queue == g_queue) return;
@@ -604,6 +678,11 @@ void OverlayRender(IDXGISwapChain* swapChain) {
     FrameContext& frame = g_frames[frameIndex];
     if (!frame.renderTarget || !frame.allocator || !g_cmdList) return;
     g_menuVisible=cvr::vrui::Visible();
+    static bool previousMenuVisible = false;
+    if (previousMenuVisible != g_menuVisible) {
+        previousMenuVisible = g_menuVisible;
+        SetCetVirtualCursorVisible(g_cetOverlayVisible.load(std::memory_order_relaxed) && !g_menuVisible);
+    }
     std::shared_ptr<cvr::vrui::Canvas> vrCanvas;
     if(g_menuVisible){vrCanvas=cvr::vrui::AcquireCanvas(g_device,g_imguiPsoFormat);if(!vrCanvas)return;}
 
@@ -639,7 +718,36 @@ void OverlayRender(IDXGISwapChain* swapChain) {
 
     ImGui::NewFrame();
 
+    if (!g_secondEyeWorldDrawList) {
+        g_secondEyeWorldDrawList = IM_NEW(ImDrawList)(ImGui::GetDrawListSharedData());
+        g_secondEyeWorldDrawList->_OwnerName = "##SecondEyeWorld";
+    }
+    g_secondEyeWorldDrawList->_ResetForNewFrame();
+    g_secondEyeWorldDrawList->PushTextureID(ImGui::GetIO().Fonts->TexID);
+    g_secondEyeWorldDrawList->PushClipRect(ImVec2(0.0f, 0.0f), ImGui::GetIO().DisplaySize, false);
+
     if(!g_menuVisible){DrawHandLocatorOverlay();DrawBarrelCrosshair();DrawCompactAdsCameraTelemetry();}
+
+    if (g_cetOverlayVisible.load(std::memory_order_relaxed) && !g_menuVisible) {
+        float cursorX = 0.0f;
+        float cursorY = 0.0f;
+        if (GetCetVirtualCursorClientPosition(&cursorX, &cursorY)) {
+            ImDrawList* draw = ImGui::GetForegroundDrawList();
+            const ImVec2 p(cursorX, cursorY);
+            const ImVec2 p1(cursorX + 6.0f, cursorY + 18.0f);
+            const ImVec2 p2(cursorX + 10.0f, cursorY + 11.0f);
+            const ImVec2 p3(cursorX + 17.0f, cursorY + 10.0f);
+            draw->AddTriangleFilled(p, p1, p2, IM_COL32(0, 0, 0, 255));
+            draw->AddTriangleFilled(ImVec2(cursorX + 1.0f, cursorY + 1.0f),
+                                    ImVec2(cursorX + 6.0f, cursorY + 16.0f),
+                                    ImVec2(cursorX + 9.0f, cursorY + 10.0f),
+                                    IM_COL32(255, 255, 255, 255));
+            draw->AddLine(p2, p3, IM_COL32(0, 0, 0, 255), 3.0f);
+            draw->AddLine(ImVec2(cursorX + 9.0f, cursorY + 10.0f),
+                          ImVec2(cursorX + 15.0f, cursorY + 10.0f),
+                          IM_COL32(255, 255, 255, 255), 1.0f);
+        }
+    }
 
     const bool placementSave = cvr::vrui::ConsumePlacementSave();
     if (g_menuVisible || placementSave) {
@@ -657,7 +765,13 @@ void OverlayRender(IDXGISwapChain* swapChain) {
     ImGui::Render();
 
     const bool drain = ShouldDrainThisFrame();
-    if (CyberpunkVR_OverlaySkipEmpty && !vrCanvas && !HasDrawWork(ImGui::GetDrawData())) {
+    const bool haveSecondEyeWorld = g_secondEyeWorldDrawList &&
+                                    g_secondEyeWorldDrawList->VtxBuffer.Size > 0 &&
+                                    g_secondEyeWorldDrawList->IdxBuffer.Size > 0;
+    if (CyberpunkVR_OverlaySkipEmpty && !vrCanvas &&
+        !(g_cetOverlayVisible.load(std::memory_order_relaxed) && CyberpunkVR_CetStereoOverlay) &&
+        !HasDrawWork(ImGui::GetDrawData()) &&
+        !haveSecondEyeWorld) {
         CVR_DIAGNOSTIC(++CyberpunkVR_DebugOverlayEmptyFrames);
         // An empty CPU frame must still clear stale ImGui draw data and update
         // the barrel-dot publication. It needs no allocator, upload or barriers.
@@ -681,6 +795,28 @@ void OverlayRender(IDXGISwapChain* swapChain) {
     toRt.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
     toRt.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     g_cmdList->ResourceBarrier(1, &toRt);
+
+    if (g_cetOverlayVisible.load(std::memory_order_relaxed) && CyberpunkVR_CetStereoOverlay) {
+        // With the F10 XR canvas active, the game backbuffer remains in PRESENT.
+        // Transition it separately so CET can still composite its independent layer.
+        D3D12_RESOURCE_BARRIER cetBackbuffer{};
+        if (vrCanvas) {
+            cetBackbuffer.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            cetBackbuffer.Transition.pResource = frame.renderTarget;
+            cetBackbuffer.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+            cetBackbuffer.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            cetBackbuffer.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            g_cmdList->ResourceBarrier(1, &cetBackbuffer);
+        }
+        if (CetOverlayRecordIntoTarget(g_cmdList, frame.renderTarget, 0.0f)) {
+            if (++CyberpunkVR_DebugCetMainComposites == 1)
+                Log("[cet-layer] MAIN composite active.\n");
+        }
+        if (vrCanvas) {
+            std::swap(cetBackbuffer.Transition.StateBefore, cetBackbuffer.Transition.StateAfter);
+            g_cmdList->ResourceBarrier(1, &cetBackbuffer);
+        }
+    }
 
     const auto drawRtv=vrCanvas?vrCanvas->rtv->GetCPUDescriptorHandleForHeapStart():frame.rtv;
     if(vrCanvas){const float clear[4]={0,0,0,0};g_cmdList->ClearRenderTargetView(drawRtv,clear,0,nullptr);}
@@ -735,7 +871,16 @@ void OverlayRenderDesktop(IDXGISwapChain* swapChain) {
     barrier.Transition={frame.renderTarget,D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,D3D12_RESOURCE_STATE_PRESENT,D3D12_RESOURCE_STATE_RENDER_TARGET};
     g_cmdList->ResourceBarrier(1,&barrier);g_cmdList->OMSetRenderTargets(1,&frame.rtv,FALSE,nullptr);
     ID3D12DescriptorHeap* heaps[]={g_srvHeap};g_cmdList->SetDescriptorHeaps(1,heaps);
-    {cvr::vrui::DesktopDraw desktop(*draw,w,h);ImGui_ImplDX12_RenderDrawData(draw,g_cmdList);}
+    cvr::vrui::DesktopRect placement=cvr::vrui::DesktopPlacement(w,h);
+    RECT client{};POINT origin{};DesktopCoverTransform cover{};
+    if(GetDesktopPhysicalClientRect(g_hwnd,client,origin) &&
+        ComputeDesktopCoverTransform(static_cast<UINT>(w),static_cast<UINT>(h),
+            static_cast<UINT>(std::max(0L,client.right-client.left)),
+            static_cast<UINT>(std::max(0L,client.bottom-client.top)),cover)){
+        placement=cvr::vrui::DesktopPlacement(float(cover.sourceWidth),float(cover.sourceHeight));
+        placement.x+=float(cover.sourceX);placement.y+=float(cover.sourceY);
+    }
+    {cvr::vrui::DesktopDraw desktop(*draw,w,h,placement);ImGui_ImplDX12_RenderDrawData(draw,g_cmdList);}
     std::swap(barrier.Transition.StateBefore,barrier.Transition.StateAfter);g_cmdList->ResourceBarrier(1,&barrier);
     if(FAILED(g_cmdList->Close()))return;
     ID3D12CommandList* lists[]={g_cmdList};g_queue->ExecuteCommandLists(1,lists);
@@ -791,8 +936,8 @@ bool OverlayIsVisible() {
 // What is NOT recorded is the background draw list: the hand locator, the aim ray and the barrel
 // cross are projected with one frustum, so their pixels are only true for the eye they were
 // projected for. Reusing them here would put a second, flat copy at optical infinity beside the
-// correct one -- and the barrel dot already has its own properly projected second-eye draw
-// (ColorBlit::RecordDot with CyberpunkVR_BarrelDotNdcX2). The foreground list is kept, because after
+// correct one. The barrel dot instead writes its properly projected second-eye geometry into the
+// dedicated g_secondEyeWorldDrawList inserted below. The foreground list is kept, because after
 // that move it holds exactly what IS screen-space: ImGui's software mouse cursor, which has to be in
 // both eyes to be usable.
 // ================================================================================================
@@ -840,7 +985,11 @@ bool OverlayRecordIntoTarget(ID3D12GraphicsCommandList* cmdList, ID3D12Resource*
     if (g_imguiPsoFormat == DXGI_FORMAT_UNKNOWN) return false;
 
     ImDrawData* drawData = ImGui::GetDrawData();
-    if (!drawData || !drawData->Valid || drawData->CmdListsCount <= 0) return false;
+    if (!drawData || !drawData->Valid) return false;
+    const bool haveSecondEyeWorld = g_secondEyeWorldDrawList &&
+                                    g_secondEyeWorldDrawList->VtxBuffer.Size > 0 &&
+                                    g_secondEyeWorldDrawList->IdxBuffer.Size > 0;
+    if (drawData->CmdListsCount <= 0 && !haveSecondEyeWorld) return false;
 
     const D3D12_RESOURCE_DESC desc = target->GetDesc();
     const uint32_t wantW = static_cast<uint32_t>(drawData->DisplaySize.x);
@@ -892,6 +1041,8 @@ bool OverlayRecordIntoTarget(ID3D12GraphicsCommandList* cmdList, ID3D12Resource*
     // whole overlay LEFT -- which is where a panel nearer than infinity sits in the right eye. Clip
     // rectangles are taken relative to DisplayPos by the backend, so they follow it exactly.
     const ImVec2 savedPos = drawData->DisplayPos;
+    const int savedTotalIdxCount = drawData->TotalIdxCount;
+    const int savedTotalVtxCount = drawData->TotalVtxCount;
     drawData->DisplayPos.x += shiftPx;
 
     // And the background list is dropped for this pass. Erasing from the vector keeps its capacity,
@@ -904,7 +1055,21 @@ bool OverlayRecordIntoTarget(ID3D12GraphicsCommandList* cmdList, ID3D12Resource*
         }
     }
     if (bgIndex >= 0) {
+        drawData->TotalIdxCount -= g_bgDrawList->IdxBuffer.Size;
+        drawData->TotalVtxCount -= g_bgDrawList->VtxBuffer.Size;
         drawData->CmdLists.erase(drawData->CmdLists.Data + bgIndex);
+        drawData->CmdListsCount = drawData->CmdLists.Size;
+    }
+
+    // This list is already projected for the second eye. Insert it beneath screen-space windows and
+    // cancel the draw-data DisplayPos shift for its vertices only.
+    if (haveSecondEyeWorld) {
+        if (shiftPx != 0.0f) {
+            for (ImDrawVert& vertex : g_secondEyeWorldDrawList->VtxBuffer) vertex.pos.x += shiftPx;
+        }
+        drawData->CmdLists.insert(drawData->CmdLists.Data, g_secondEyeWorldDrawList);
+        drawData->TotalIdxCount += g_secondEyeWorldDrawList->IdxBuffer.Size;
+        drawData->TotalVtxCount += g_secondEyeWorldDrawList->VtxBuffer.Size;
         drawData->CmdListsCount = drawData->CmdLists.Size;
     }
 
@@ -916,10 +1081,18 @@ bool OverlayRecordIntoTarget(ID3D12GraphicsCommandList* cmdList, ID3D12Resource*
         ImGui_ImplDX12_RenderDrawData(drawData, cmdList);
     }
 
+    if (haveSecondEyeWorld) {
+        drawData->CmdLists.erase(drawData->CmdLists.Data);
+        if (shiftPx != 0.0f) {
+            for (ImDrawVert& vertex : g_secondEyeWorldDrawList->VtxBuffer) vertex.pos.x -= shiftPx;
+        }
+    }
     if (bgIndex >= 0) {
         drawData->CmdLists.insert(drawData->CmdLists.Data + bgIndex, g_bgDrawList);
-        drawData->CmdListsCount = drawData->CmdLists.Size;
     }
+    drawData->CmdListsCount = drawData->CmdLists.Size;
+    drawData->TotalIdxCount = savedTotalIdxCount;
+    drawData->TotalVtxCount = savedTotalVtxCount;
     drawData->DisplayPos = savedPos;
 
     if (anything) CVR_DIAGNOSTIC(++CyberpunkVR_DebugOverlaySecondEyeDraws);

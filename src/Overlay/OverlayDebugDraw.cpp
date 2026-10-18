@@ -11,6 +11,9 @@
 #include "Overlay/ImGuiOverlay.hpp"
 #include "Overlay/LiveControlsUi.hpp"
 #include "Runtimes/OpenXRManager.hpp"
+#include "Core/LiveControls.hpp"
+#include "Core/VrCoreShared.hpp"
+#include "Utils/SharedSlots.hpp"
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
@@ -206,11 +209,11 @@ void DrawHandLocatorOverlay() {
             drawList->AddText(ImVec2(center.x + 8.0f, center.y - 20.0f), bodyColor, name);
         }
 
-        drawEndpointLabel(handPose, 0.070f * s, 0.0f, 0.0f, textColor, "R", ImVec2(4.0f, -6.0f));
-        drawEndpointLabel(handPose, -0.070f * s, 0.0f, 0.0f, textColor, "L", ImVec2(-10.0f, -6.0f));
-        drawEndpointLabel(handPose, 0.0f, 0.070f * s, 0.0f, textColor, "U", ImVec2(-4.0f, -14.0f));
-        drawEndpointLabel(handPose, 0.0f, -0.070f * s, 0.0f, textColor, "D", ImVec2(-4.0f, 2.0f));
-        drawEndpointLabel(handPose, 0.0f, 0.0f, -(fwdLen + 0.020f * s), textColor, "F", ImVec2(4.0f, -6.0f));
+        drawEndpointLabel(handPose, 0.070f * s, 0.0f, 0.0f, textColor, "П", ImVec2(4.0f, -6.0f));
+        drawEndpointLabel(handPose, -0.070f * s, 0.0f, 0.0f, textColor, "Л", ImVec2(-10.0f, -6.0f));
+        drawEndpointLabel(handPose, 0.0f, 0.070f * s, 0.0f, textColor, "В", ImVec2(-4.0f, -14.0f));
+        drawEndpointLabel(handPose, 0.0f, -0.070f * s, 0.0f, textColor, "Н", ImVec2(-4.0f, 2.0f));
+        drawEndpointLabel(handPose, 0.0f, 0.0f, -(fwdLen + 0.020f * s), textColor, "ВП", ImVec2(4.0f, -6.0f));
     };
 
     if (hasLeft) {
@@ -218,7 +221,7 @@ void DrawHandLocatorOverlay() {
             EmitHandProxyIm3d(left, true, g_handLocatorScale, g_drawHandDebugAxes);
         }
         if (g_drawHandDebugAxes || !g_drawHandProxy3D) {
-            drawHandWire(left, IM_COL32(0, 220, 255, 255), "LEFT", true);
+            drawHandWire(left, IM_COL32(0, 220, 255, 255), "ЛЕВАЯ", true);
         }
     }
     if (hasRight) {
@@ -226,7 +229,7 @@ void DrawHandLocatorOverlay() {
             EmitHandProxyIm3d(right, false, g_handLocatorScale, g_drawHandDebugAxes);
         }
         if (g_drawHandDebugAxes || !g_drawHandProxy3D) {
-            drawHandWire(right, IM_COL32(255, 180, 0, 255), "RIGHT", false);
+            drawHandWire(right, IM_COL32(255, 180, 0, 255), "ПРАВАЯ", false);
         }
     }
 
@@ -310,6 +313,7 @@ extern "C" __declspec(dllexport) int      CyberpunkVR_BarrelDotWorld = 1;
 extern "C" int CyberpunkVR_MainIsRightEye;
 extern "C" __declspec(dllexport) uint64_t CyberpunkVR_BarrelDotTick = 0;
 extern "C" __declspec(dllexport) int32_t  CyberpunkVR_BarrelDotSecondEye = 1;
+extern "C" __declspec(dllexport) int32_t  CyberpunkVR_BarrelDotSecondVisible = 1;
 extern "C" __declspec(dllexport) uint64_t CyberpunkVR_DebugBarrelDotDraws = 0;
 extern "C" int CyberpunkVR_WeaponClass;
 
@@ -317,6 +321,73 @@ extern "C" int CyberpunkVR_WeaponClass;
 // rotate it into the located game camera's local frame (inv(camQuat) * fwd) and project that
 // direction with the SAME view/FOV the eye renders through -> the dot lands exactly where the bullet
 // goes (both derive from the same muzzle + camera). No controller-space guessing.
+void DrawRadialLaserSpot(ImDrawList* drawList, const ImVec2& center, float coreRadiusPx) {
+    if (!drawList || !(coreRadiusPx > 0.0f)) return;
+
+    constexpr float kOuterCoreRatio = 2.5f;
+    constexpr float kLn2 = 0.69314718f;
+    constexpr float kRingCoreDistances[] = {
+        0.25f, 0.50f, 0.75f, 1.00f, 1.30f, 1.65f, 2.00f, 2.25f, 2.50f
+    };
+    constexpr int kRingCount = static_cast<int>(IM_ARRAYSIZE(kRingCoreDistances));
+    const float outerRadiusPx = coreRadiusPx * kOuterCoreRatio;
+    const float segmentEstimate = 3.1415926535f /
+        acosf(std::clamp(1.0f - 0.30f / std::max(outerRadiusPx, 0.31f), -1.0f, 1.0f));
+    const int segments = std::clamp(static_cast<int>(ceilf(segmentEstimate)), 12, 128);
+    const int vertexCount = 1 + kRingCount * segments;
+    const int indexCount = segments * 3 + (kRingCount - 1) * segments * 6;
+    const ImVec2 uv = ImGui::GetFontTexUvWhitePixel();
+
+    auto colorAt = [&](float coreDistance) -> ImU32 {
+        const float intensity = expf(-kLn2 * coreDistance * coreDistance);
+        const float fadeT = std::clamp((coreDistance - 2.25f) / 0.25f, 0.0f, 1.0f);
+        const float smoothFade = fadeT * fadeT * (3.0f - 2.0f * fadeT);
+        const float alpha = intensity * (1.0f - smoothFade);
+        const float hotCore = expf(-4.0f * coreDistance * coreDistance);
+        const float green = 0.045f + (0.82f - 0.045f) * hotCore;
+        const float blue = 0.045f + (0.68f - 0.045f) * hotCore;
+        return ImGui::ColorConvertFloat4ToU32(ImVec4(1.0f, green, blue, alpha));
+    };
+
+    drawList->PrimReserve(indexCount, vertexCount);
+    const ImDrawIdx base = static_cast<ImDrawIdx>(drawList->_VtxCurrentIdx);
+    drawList->PrimWriteVtx(center, uv, colorAt(0.0f));
+    for (int ring = 0; ring < kRingCount; ++ring) {
+        const float coreDistance = kRingCoreDistances[ring];
+        const float ringRadiusPx = coreRadiusPx * coreDistance;
+        const ImU32 color = colorAt(coreDistance);
+        for (int segment = 0; segment < segments; ++segment) {
+            const float angle = (2.0f * 3.1415926535f * static_cast<float>(segment)) /
+                                static_cast<float>(segments);
+            drawList->PrimWriteVtx(
+                ImVec2(center.x + cosf(angle) * ringRadiusPx,
+                       center.y + sinf(angle) * ringRadiusPx),
+                uv, color);
+        }
+    }
+
+    const ImDrawIdx firstRing = static_cast<ImDrawIdx>(base + 1);
+    for (int segment = 0; segment < segments; ++segment) {
+        const ImDrawIdx next = static_cast<ImDrawIdx>((segment + 1) % segments);
+        drawList->PrimWriteIdx(base);
+        drawList->PrimWriteIdx(static_cast<ImDrawIdx>(firstRing + segment));
+        drawList->PrimWriteIdx(static_cast<ImDrawIdx>(firstRing + next));
+    }
+    for (int ring = 1; ring < kRingCount; ++ring) {
+        const ImDrawIdx inner = static_cast<ImDrawIdx>(base + 1 + (ring - 1) * segments);
+        const ImDrawIdx outer = static_cast<ImDrawIdx>(base + 1 + ring * segments);
+        for (int segment = 0; segment < segments; ++segment) {
+            const ImDrawIdx next = static_cast<ImDrawIdx>((segment + 1) % segments);
+            drawList->PrimWriteIdx(static_cast<ImDrawIdx>(inner + segment));
+            drawList->PrimWriteIdx(static_cast<ImDrawIdx>(outer + segment));
+            drawList->PrimWriteIdx(static_cast<ImDrawIdx>(outer + next));
+            drawList->PrimWriteIdx(static_cast<ImDrawIdx>(inner + segment));
+            drawList->PrimWriteIdx(static_cast<ImDrawIdx>(outer + next));
+            drawList->PrimWriteIdx(static_cast<ImDrawIdx>(inner + next));
+        }
+    }
+}
+
 // The compact ADS-camera panel, drawn with the game running so the numbers can be read while
 // aiming rather than reconstructed from a log afterwards. A window, not the background list, so it
 // reaches both eyes through the second-eye overlay pass. Off by default (dabinn, TofuExpress
@@ -336,9 +407,9 @@ void DrawCompactAdsCameraTelemetry() {
         ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
         ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav |
         ImGuiWindowFlags_NoInputs;
-    if (ImGui::Begin("ADS camera telemetry##compact", nullptr, flags)) {
+    if (ImGui::Begin("Телеметрия камеры прицеливания##compact", nullptr, flags)) {
         if (!t.available) {
-            ImGui::TextUnformatted("ADS CAM  waiting for gameplay camera...");
+            ImGui::TextUnformatted("ПРИЦЕЛ  ожидание игровой камеры...");
         } else {
             const ImVec4 stateColor = t.aiming
                 ? ImVec4(1.0f, 0.78f, 0.24f, 1.0f)
@@ -347,18 +418,18 @@ void DrawCompactAdsCameraTelemetry() {
             const float sharedZoomRaw = OpenXRManager::Get().GetSharedSlot(28);
             const float finalZoom = (std::isfinite(mainAdsZoom) && mainAdsZoom > 0.0f)
                 ? mainAdsZoom : 1.0f;
-            ImGui::TextColored(stateColor, "ADS CAM  %s", t.aiming ? "ON" : "HIP");
-            ImGui::Text("zoom MAIN %.3fx   final %.3fx", mainAdsZoom, finalZoom);
-            ImGui::TextDisabled("shared[28] %.3fx   diagnostic only", sharedZoomRaw);
+            ImGui::TextColored(stateColor, "ПРИЦЕЛ  %s", t.aiming ? "ПРИЦЕЛ" : "ОТ БЕДРА");
+            ImGui::Text("зум MAIN %.3fx   итоговый %.3fx", mainAdsZoom, finalZoom);
+            ImGui::TextDisabled("shared[28] %.3fx   только диагностика", sharedZoomRaw);
             if (!t.baselineValid) {
-                ImGui::TextUnformatted("Hold hip-fire briefly to capture baseline");
+                ImGui::TextUnformatted("Ненадолго опустите прицел для замера исходного положения");
             } else {
-                ImGui::Text("delta cm  R %+6.2f  F %+6.2f  U %+6.2f",
+                ImGui::Text("сдвиг см  П %+6.2f  ВП %+6.2f  В %+6.2f",
                             t.deltaRight * 100.0f, t.deltaForward * 100.0f, t.deltaUp * 100.0f);
-                ImGui::Text("peak  cm  R %6.2f  F %6.2f  U %6.2f   n=%u",
+                ImGui::Text("пик   см  П %6.2f  ВП %6.2f  В %6.2f   n=%u",
                             t.peakRight * 100.0f, t.peakForward * 100.0f,
                             t.peakUp * 100.0f, t.samples);
-                ImGui::TextDisabled("raw   cm  R %+6.2f  F %+6.2f  U %+6.2f",
+                ImGui::TextDisabled("исх.  см  П %+6.2f  ВП %+6.2f  В %+6.2f",
                                     t.residualRight * 100.0f, t.residualForward * 100.0f,
                                     t.residualUp * 100.0f);
             }
@@ -368,182 +439,313 @@ void DrawCompactAdsCameraTelemetry() {
 }
 
 void DrawBarrelCrosshair() {
-    // Invalidate the second-eye/mirror publication before any early return.
-    // Equipping melee must not leave the previous gun's dot alive for 250ms.
-    CyberpunkVR_BarrelDotTick = 0;
-    const float equipped = OpenXRManager::Get().GetSharedSlot(144);
-    if (!g_drawBarrelCross || !(equipped >= 0.9f) || CyberpunkVR_WeaponClass == 5) return;
-    const float rad = 3.0f;
+    int laserDotMode = g_liveControls.xrLaserDotMode;
+    if (laserDotMode < 0 || laserDotMode > 2) laserDotMode = 1;
+    CyberpunkVR_BarrelDotWorld = laserDotMode;
 
-    // ONE INSTANT, BOTH QUANTITIES (dabinn, TofuExpress 821e8a4e). The camera quaternion and the
-    // muzzle direction come out of a single seqlocked packet published at MAIN's final-camera
-    // callback. What stood here read the latest LOCATED quaternion at Present and sampled the muzzle
-    // slots independently, so a fast head turn combined two different moments and the dot smeared
-    // into a velocity-dependent trail; and the located quaternion is not even the right camera,
-    // since it goes through the mixer and is scaled by the camera weight on the way to the screen.
-    //
-    // The latch for the identity-default muzzle moved to the publisher, where the direction is
-    // captured, so it cannot disagree with the quaternion it ships with.
+    const bool surfaceMode = laserDotMode == 2;
+    constexpr unsigned long long kLaserWeaponFreshMs = 250;
+    const unsigned long long nowMs = GetTickCount64();
+    const unsigned long long weaponUpdatedMs =
+        g_laserRangedWeaponUpdatedMs.load(std::memory_order_relaxed);
+    const bool rangedWeaponActive =
+        g_laserRangedWeaponActive.load(std::memory_order_relaxed) != 0 &&
+        weaponUpdatedMs != 0 && nowMs - weaponUpdatedMs <= kLaserWeaponFreshMs;
+    const bool worldMapOpen = OpenXRManager::Get().GetSharedSlot(81) != 0.0f;
+    const bool deviceScreenOpen =
+        OpenXRManager::Get().GetSharedSlot(vrshared::kDeviceScreenOpen) > 0.5f;
+    const bool gameUiActive =
+        g_menuModeValue != 0 || worldMapOpen ||
+        g_uiPopupOpen.load(std::memory_order_relaxed) != 0 || deviceScreenOpen;
+    const bool hideForAds = g_drawBarrelCross && g_liveControls.xrHideLaserDotAds != 0 && g_isAiming;
+    const bool drawLaser = g_drawBarrelCross && rangedWeaponActive && !gameUiActive && !hideForAds;
+    const bool raycastActive = drawLaser && surfaceMode;
+
+    // CET owns every physics query. Publish the common mode/UI gate before any early return so
+    // disabling the dot also stops the game-thread ray and LOS work.
+    OpenXRManager::Get().SetSharedSlot(vrshared::kBarrelRayActive, raycastActive ? 1.0f : 0.0f);
+
+    // Legacy publication feeds only the desktop second-eye mirror now. The HMD second eye gets a
+    // dedicated ImGui list which is reset every frame.
+    CyberpunkVR_BarrelDotTick = 0;
+    CyberpunkVR_BarrelDotSecondVisible = 0;
+    if (!drawLaser) return;
+
     cvr::camera::BarrelFrame bf{};
     if (!cvr::camera::BarrelFrameRead(&bf)) return;
     const float mfx = bf.muzzleFwd[0], mfy = bf.muzzleFwd[1], mfz = bf.muzzleFwd[2];
     if (mfx*mfx + mfy*mfy + mfz*mfz < 0.25f) return;
-
     const float cqx = bf.camQuat[0], cqy = bf.camQuat[1], cqz = bf.camQuat[2], cqw = bf.camQuat[3];
 
-    // A DIRECTION CANNOT MARK AN IMPACT POINT except for an eye that lies on the bullet's line.
-    //
-    // The old code rotated the muzzle forward into camera axes and projected that vector, i.e. it
-    // drew a mark at infinity along the barrel. The bullet, though, leaves the MUZZLE, so an
-    // impact at range t appears from eye E offset by (muzzle - E)perp / t. The weapon is held in
-    // front of the left eye, so that offset is ~0 there and the mark looked exact; the right eye
-    // is an IPD or more off the barrel and the same mark misses, by a constant distance in metres
-    // -- which is why it never changed with the sight's zero distance and never showed up in any
-    // of the per-eye rendering measurements. Nothing about the picture was ever wrong.
-    //
-    // So build a real point on the bullet's line and project it from each eye's own position.
-    // Both eyes then mark the same place in the world, and both are right.
-    // LATCHED ON THIS SIDE. The slot reads back as (0,0,0) on a good share of frames -- the
-    // publisher filters local-space samples, so something else is clearing it, and chasing who
-    // is not worth another round-trip. A muzzle position does not stop existing between frames,
-    // so the last real one is kept and a zero read simply changes nothing. Immune to whoever
-    // writes there and to the order they do it in.
+    // Muzzle position is published from the game side and can momentarily read as zero during an
+    // otherwise valid frame. Keep the last real world-space sample; a muzzle does not teleport to
+    // the origin just because one shared-memory sample was empty.
     static float s_mp[3] = {0.0f, 0.0f, 0.0f};
     {
         const float rx = OpenXRManager::Get().GetSharedSlot(200);
         const float ry = OpenXRManager::Get().GetSharedSlot(201);
         const float rz = OpenXRManager::Get().GetSharedSlot(202);
-        if (rx*rx + ry*ry + rz*rz > 1.0f) { s_mp[0] = rx; s_mp[1] = ry; s_mp[2] = rz; }
+        if (rx*rx + ry*ry + rz*rz > 1.0f) {
+            s_mp[0] = rx; s_mp[1] = ry; s_mp[2] = rz;
+        }
     }
     const float mpx = s_mp[0], mpy = s_mp[1], mpz = s_mp[2];
-    // Straight from the camera hook in this same DLL. Routing these two through shared memory
-    // added two more ways to end up with nothing and no message -- which is exactly what happened.
+
+    // v0.1.7 publishes this as the rendered HEAD CENTRE. Eye offsets therefore come from the same
+    // XrFrameSlot the submit path will use for the image, instead of adding/subtracting camera-right.
     const float hcx = static_cast<float>(g_lastLocatePosFP[0]) / 131072.0f;
     const float hcy = static_cast<float>(g_lastLocatePosFP[1]) / 131072.0f;
     const float hcz = static_cast<float>(g_lastLocatePosFP[2]) / 131072.0f;
     const bool haveWorld = (mpx * mpx + mpy * mpy + mpz * mpz) > 1.0f &&
                            (hcx * hcx + hcy * hcy + hcz * hcz) > 1.0f;
 
+    // CET owns the surface query and publishes one seqlocked hit+visibility packet. Freshness is
+    // driven by SEQUENCE ADVANCE, not by the packet merely remaining valid, so a stopped CET tick
+    // cannot leave the old hit glued to a wall.
+    static uint32_t s_lastRaySeq = 0;
+    static uint64_t s_lastRayTick = 0;
+    float hitx = 0.0f, hity = 0.0f, hitz = 0.0f, hitValid = 0.0f;
+    float mainVisible = 1.0f, secondVisible = 1.0f;
+    uint32_t raySeq = 0;
+    bool rayPacket = false;
+    for (int attempt = 0; surfaceMode && attempt < 3 && !rayPacket; ++attempt) {
+        const uint32_t s0 = static_cast<uint32_t>(
+            OpenXRManager::Get().GetSharedSlot(vrshared::kBarrelRaySeq));
+        if (s0 == 0u || (s0 & 1u)) continue;
+        std::atomic_thread_fence(std::memory_order_acquire);
+        const float x = OpenXRManager::Get().GetSharedSlot(vrshared::kBarrelRayHitX + 0);
+        const float y = OpenXRManager::Get().GetSharedSlot(vrshared::kBarrelRayHitX + 1);
+        const float z = OpenXRManager::Get().GetSharedSlot(vrshared::kBarrelRayHitX + 2);
+        const float v = OpenXRManager::Get().GetSharedSlot(vrshared::kBarrelRayHitValid);
+        const float vm = OpenXRManager::Get().GetSharedSlot(vrshared::kBarrelMainVisible);
+        const float vs = OpenXRManager::Get().GetSharedSlot(vrshared::kBarrelSecondVisible);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        const uint32_t s1 = static_cast<uint32_t>(
+            OpenXRManager::Get().GetSharedSlot(vrshared::kBarrelRaySeq));
+        if (s0 == s1 && !(s1 & 1u)) {
+            hitx = x; hity = y; hitz = z; hitValid = v;
+            mainVisible = vm; secondVisible = vs;
+            raySeq = s1; rayPacket = true;
+        }
+    }
+    if (rayPacket && raySeq != s_lastRaySeq) {
+        s_lastRaySeq = raySeq;
+        s_lastRayTick = GetTickCount64();
+    }
+    const uint64_t nowTick = GetTickCount64();
+    const bool rayFresh = rayPacket && s_lastRayTick != 0 && (nowTick - s_lastRayTick) <= 20u;
+    const bool haveRayHit = surfaceMode && rayFresh && hitValid > 0.5f &&
+                            (hitx * hitx + hity * hity + hitz * hitz) > 1.0f;
+
     const ImVec2 displaySize = ImGui::GetIO().DisplaySize;
     if (displaySize.x <= 1.0f || displaySize.y <= 1.0f) return;
 
-    // The camera's right axis, from the same quaternion the view is built with. Column 0 of the
-    // rotation -- the engine's camera frame is X right, Y forward, Z up (verified live by
-    // right x forward = up on the render camera's own basis).
-    const float rgt[3] = {
-        1.0f - 2.0f * (cqy * cqy + cqz * cqz),
-        2.0f * (cqx * cqy + cqz * cqw),
-        2.0f * (cqx * cqz - cqy * cqw)
-    };
-    float halfIpd = CyberpunkVRPort_HalfIpd();
-    if (!(halfIpd > 0.0001f)) halfIpd = OpenXRManager::Get().GetSharedSlot(95);
-    if (!(halfIpd > 0.0001f)) halfIpd = 0.0325f;
-
-    // Screen position of the impact point as seen from one eye. sign: -1 = MAIN/left, +1 = VRCAM.
-    static float s_dbgLy[2] = {0.0f, 0.0f};
-    static float s_dbgWhy = 0.0f;
-    auto dotForEye = [&](float sign, ImVec2* out) -> bool {
-        if (!haveWorld) { s_dbgWhy = 1.0f; return false; }
-        const float D = CyberpunkVR_BarrelDotDistM;
-        if (!(D > 0.5f)) { s_dbgWhy = 2.0f; return false; }
-        const float ex = hcx + rgt[0] * halfIpd * sign;
-        const float ey = hcy + rgt[1] * halfIpd * sign;
-        const float ez = hcz + rgt[2] * halfIpd * sign;
-        // The point the bullet reaches at D, and the ray from THIS eye to it.
-        const float dx = (mpx + mfx * D) - ex;
-        const float dy = (mpy + mfy * D) - ey;
-        const float dz = (mpz + mfz * D) - ez;
-        float lx = 0.0f, ly = 0.0f, lz = 0.0f;
-        RotateVectorByQuaternion(dx, dy, dz, -cqx, -cqy, -cqz, cqw, &lx, &ly, &lz);
-        s_dbgLy[(sign > 0.0f) ? 1 : 0] = ly;
-        const bool okp = ProjectHeadSpacePointToScreen(lx, lz, -ly, displaySize, out);
-        if (!okp) s_dbgWhy = 3.0f;
-        return okp;
-    };
-
-    ImVec2 sc{};
-    // game-cam-local (Yfwd/Xright/Zup) -> OpenXR view convention (forward -Z, right +X, up +Y): (x, z, -y)
-    // The control number: the muzzle forward in camera axes. The old path projects exactly this
-    // and works, so its forward component tells whether the axis mapping below is the same one.
-    float vx = 0.0f, vy = 0.0f, vz = 0.0f;
-    RotateVectorByQuaternion(mfx, mfy, mfz, -cqx, -cqy, -cqz, cqw, &vx, &vy, &vz);
-    ImVec2 scRight{};
-    // Sign fixed by observation: a fixed world point must slide LEFT on screen when the eye
-    // moves RIGHT, and it was doing the opposite -- the second eye sat right of the first. So
-    // MAIN is the +right eye here, not the -right one. Live switch rather than a silent constant.
-    const float sMain = (CyberpunkVR_BarrelDotEyeSign >= 0) ? +1.0f : -1.0f;
-    // Do NOT require both, and do NOT fall back. Requiring both meant one failed projection
-    // dropped the pair onto the direction path, which is wrong for the second eye BY
-    // CONSTRUCTION -- a mark at infinity cannot show a finite impact from an eye off the line.
-    // That is what made the right eye's dot sit right of the shot on half the frames.
-    const bool mainOk = dotForEye(sMain, &sc);
-    if (!dotForEye(-sMain, &scRight)) scRight = sc;
-    // OFF by default. The world point is the exact answer, but it depends on a muzzle transform
-    // that goes to identity between frames (fists, and recoil right after a shot) -- latched, it
-    // then lags and the two dots visibly part company. The simple form below has none of that:
-    // one projection, plus a constant parallax for the second eye.
-    const bool worldOk = mainOk && (CyberpunkVR_BarrelDotWorld != 0);
-    {
-        static int s_said = -1;
-        const int now = worldOk ? 1 : 0;
-        if (now != s_said) {
-            s_said = now;
-            Log("BarrelDot: worldPath=%d why=%.0f ly=(%.3f %.3f) v=(%.3f %.3f %.3f) fwd=(%.3f %.3f %.3f) D=%.1f "
-                "ndc=(%.5f %.5f) muzzle=(%.3f %.3f %.3f) head=(%.3f %.3f %.3f) halfIpd=%.4f\n",
-                now, s_dbgWhy, s_dbgLy[0], s_dbgLy[1], vx, vy, vz, mfx, mfy, mfz,
-                CyberpunkVR_BarrelDotDistM,
-                CyberpunkVR_BarrelDotNdcX, CyberpunkVR_BarrelDotNdcX2,
-                mpx, mpy, mpz, hcx, hcy, hcz, halfIpd);
+    // User radius is a world-space beam core. Modes 0/1 use a stable 10 m reference size. In
+    // surface mode optional distance scaling grows the physical footprint with beam travel while
+    // perspective turns it back into an angular screen radius.
+    constexpr float kLaserDotReferenceDepthM = 10.0f;
+    constexpr float kLaserDotHalfDivergenceRad = 0.00075f;
+    constexpr float kLaserDotMissAngularRadiusRad = 0.0005f;
+    constexpr float kLaserDotSafetyMaxAngularRadius = 1.0f;
+    const float radiusMm = std::clamp(
+        static_cast<float>(g_liveControls.xrLaserDotRadiusMm), 1.0f, 50.0f);
+    const float baseRadiusM = radiusMm * 0.001f;
+    const bool scaleWithDistance = surfaceMode && g_liveControls.xrLaserDotScaleWithDistance != 0;
+    float angularRadius = baseRadiusM / kLaserDotReferenceDepthM;
+    if (scaleWithDistance) {
+        if (!haveRayHit) {
+            angularRadius = tanf(kLaserDotMissAngularRadiusRad);
+        } else {
+            float lx = 0.0f, ly = 0.0f, lz = 0.0f;
+            RotateVectorByQuaternion(hitx - hcx, hity - hcy, hitz - hcz,
+                                     -cqx, -cqy, -cqz, cqw, &lx, &ly, &lz);
+            if (ly > 0.01f) {
+                float beamTravelM = ly;
+                if (haveWorld) {
+                    const float bdx = hitx - mpx;
+                    const float bdy = hity - mpy;
+                    const float bdz = hitz - mpz;
+                    beamTravelM = sqrtf(bdx * bdx + bdy * bdy + bdz * bdz);
+                }
+                const float beamSpreadM = beamTravelM * tanf(kLaserDotHalfDivergenceRad);
+                const float surfaceRadiusM =
+                    sqrtf(baseRadiusM * baseRadiusM + beamSpreadM * beamSpreadM);
+                angularRadius = surfaceRadiusM / ly;
+            } else {
+                angularRadius = kLaserDotSafetyMaxAngularRadius;
+            }
         }
     }
-    // With world data present the direction path is not a fallback, it is a wrong answer.
-    if (CyberpunkVR_BarrelDotWorld && haveWorld && !worldOk) return;
-    if (worldOk || ProjectHeadSpacePointToScreen(vx, vz, -vy, displaySize, &sc)) {
-        // NO ZOOM COMPENSATION HERE ANY MORE (dabinn, TofuExpress 2cb7b031). ADS magnification is
-        // already in the projection this point was built with -- GetOverlayProjTans divides the
-        // tangents by MAIN's own live factor -- so scaling the screen offset by shared[28] on top
-        // applied the zoom TWICE. shared[28] is a CET GetZoom sample taken on its own schedule: not
-        // only redundant, it can also be a frame out of step with the projection.
-        // PUBLISH IT FOR THE SECOND EYE. The overlay draws into the backbuffer, which is eye 0
-        // only -- eye 1 is the VRCAM view and no ImGui list ever reaches it. Rather than repeat
-        // this projection there (and risk the two disagreeing for a reason of my own making),
-        // hand the finished screen position over in NDC and let the eye pass stamp the same
-        // point. Both eyes are projected through the same effective ADS frustum, so there is
-        // nothing left to compensate for here either.
-        CyberpunkVR_BarrelDotNdcX = (sc.x / displaySize.x) * 2.0f - 1.0f;
-        CyberpunkVR_BarrelDotNdcY = 1.0f - (sc.y / displaySize.y) * 2.0f;
-        {
-            // Parallax of the zero distance, in NDC. Small-angle: the second eye sees the
-            // zero point IPD/D radians to the side, and a magnified (scoped) image scales
-            // that angle along with everything else.
-            float thx = 0.0f, thy = 0.0f;
-            float dx = 0.0f;
-            const float zeroM = CyberpunkVR_SightZeroMeters;
-            if (zeroM > 0.1f && GetOverlayProjTans(displaySize, &thx, &thy)) {
-                const float ipd = OpenXRManager::Get().GetRuntimeIpd();
-                if (ipd > 0.001f) {
-                    // The offset eye is on the other side once MAIN moves eyes.
-                    // thx already comes back magnified by the live ADS factor, so the
-                    // parallax expressed in NDC scales with it automatically. Multiplying by
-                    // shared[28] here was the same double application a third time.
-                    dx = -(ipd / zeroM) / thx;
-                    if (CyberpunkVR_MainIsRightEye) dx = -dx;
-                }
-            }
-            CyberpunkVR_BarrelDotNdcX2 = (worldOk
-                ? ((scRight.x / displaySize.x) * 2.0f - 1.0f)   // its own eye, its own ray
-                : (CyberpunkVR_BarrelDotNdcX + dx))
-                + CyberpunkVR_BarrelDotOffX2;
-        }
-        CyberpunkVR_BarrelDotRadiusPx = rad;
-        CyberpunkVR_BarrelDotTick = GetTickCount64();
+    float rad = 3.0f;
+    float tanHalfX = 0.0f, tanHalfY = 0.0f;
+    if (GetOverlayProjTans(displaySize, &tanHalfX, &tanHalfY) && tanHalfX > 0.0001f) {
+        angularRadius = std::clamp(angularRadius, 0.0f, kLaserDotSafetyMaxAngularRadius);
+        rad = angularRadius * (displaySize.x * 0.5f) / tanHalfX;
+    }
 
-        // Background list: world-projected, see DrawHandLocatorOverlay.
-        ImDrawList* dl = ImGui::GetBackgroundDrawList();
-        if (dl) {
-            dl->AddCircleFilled(sc, rad, IM_COL32(255, 60, 60, 255));
-            //dl->AddCircle(sc, 11.0f, IM_COL32(255, 255, 255, 235), 0, 2.0f);
+    // Resolve the two physical eye origins from the coherent XR frame slot for THIS image. At this
+    // point HookedPresent has not called OnPresent yet, so presentCount+1 is exactly the serial the
+    // submit path will consume moments later. The relative offsets are converted from LOCAL-space
+    // XR coordinates into head-local axes, scaled to the port's desired IPD, then rotated by the
+    // rendered game camera quaternion and anchored at the rendered head centre.
+    float eyeWorld[2][3]{}; // [OpenXR view index: 0=left, 1=right]
+    bool haveCoherentEyes = false;
+    {
+        auto& xr = OpenXRManager::Get();
+        OpenXRManager::XrFrameSlot slot{};
+        const uint64_t imageSerial = xr.GetPresentCount() + 1u;
+        if (xr.GetFrameSlot(imageSerial, &slot)) {
+            float eyeHead[2][3]{};
+            for (int eye = 0; eye < 2; ++eye) {
+                const float dx = slot.viewPose[eye].position.x - slot.headPoseLocal.position.x;
+                const float dy = slot.viewPose[eye].position.y - slot.headPoseLocal.position.y;
+                const float dz = slot.viewPose[eye].position.z - slot.headPoseLocal.position.z;
+                float hx = 0.0f, hy = 0.0f, hz = 0.0f;
+                const XrQuaternionf& hq = slot.headPoseLocal.orientation;
+                RotateVectorByQuaternion(dx, dy, dz, -hq.x, -hq.y, -hq.z, hq.w,
+                                         &hx, &hy, &hz);
+                // XR head axes: +X right, +Y up, -Z forward.
+                // Game camera axes: +X right, +Y forward, +Z up.
+                eyeHead[eye][0] = hx;
+                eyeHead[eye][1] = -hz;
+                eyeHead[eye][2] = hy;
+            }
+
+            const float sx = eyeHead[1][0] - eyeHead[0][0];
+            const float sy = eyeHead[1][1] - eyeHead[0][1];
+            const float sz = eyeHead[1][2] - eyeHead[0][2];
+            const float rawIpd = sqrtf(sx*sx + sy*sy + sz*sz);
+            float desiredHalfIpd = CyberpunkVRPort_HalfIpd();
+            if (!(desiredHalfIpd > 0.0001f)) desiredHalfIpd = xr.GetSharedSlot(95);
+            if (!(desiredHalfIpd > 0.0001f)) desiredHalfIpd = rawIpd * 0.5f;
+            if (rawIpd > 0.001f && desiredHalfIpd > 0.0001f) {
+                const float scale = (2.0f * desiredHalfIpd) / rawIpd;
+                for (int eye = 0; eye < 2; ++eye) {
+                    float ox = 0.0f, oy = 0.0f, oz = 0.0f;
+                    RotateVectorByQuaternion(
+                        eyeHead[eye][0] * scale,
+                        eyeHead[eye][1] * scale,
+                        eyeHead[eye][2] * scale,
+                        cqx, cqy, cqz, cqw, &ox, &oy, &oz);
+                    eyeWorld[eye][0] = hcx + ox;
+                    eyeWorld[eye][1] = hcy + oy;
+                    eyeWorld[eye][2] = hcz + oz;
+                }
+                haveCoherentEyes = true;
+            }
         }
+    }
+
+    const int mainView = CyberpunkVR_MainIsRightEye ? 1 : 0;
+    const int secondView = 1 - mainView;
+    const float* mainEye = haveCoherentEyes ? eyeWorld[mainView] : nullptr;
+    const float* secondEye = haveCoherentEyes ? eyeWorld[secondView] : nullptr;
+
+    // Publish the same image-coherent origins to CET for its per-eye LOS queries. If no coherent
+    // frame slot is available, leave the sequence untouched; CET deliberately treats stale eyes as
+    // visibility fail-open while continuing to provide the surface hit.
+    if (mainEye && secondEye) {
+        static uint32_t s_eyeSeq = 0;
+        uint32_t nextEven = s_eyeSeq + 2u;
+        if (nextEven >= 1000000u) nextEven = 2u;
+        auto& xr = OpenXRManager::Get();
+        xr.SetSharedSlot(vrshared::kBarrelEyeSeq, static_cast<float>(nextEven - 1u));
+        std::atomic_thread_fence(std::memory_order_release);
+        for (int i = 0; i < 3; ++i) {
+            xr.SetSharedSlot(vrshared::kBarrelMainEyeX + i, mainEye[i]);
+            xr.SetSharedSlot(vrshared::kBarrelSecondEyeX + i, secondEye[i]);
+        }
+        std::atomic_thread_fence(std::memory_order_release);
+        xr.SetSharedSlot(vrshared::kBarrelEyeSeq, static_cast<float>(nextEven));
+        s_eyeSeq = nextEven;
+    }
+
+    auto projectWorldPointFromEye = [&](const float* eye, float px, float py, float pz,
+                                        ImVec2* out) -> bool {
+        if (!eye) return false;
+        float lx = 0.0f, ly = 0.0f, lz = 0.0f;
+        RotateVectorByQuaternion(px - eye[0], py - eye[1], pz - eye[2],
+                                 -cqx, -cqy, -cqz, cqw, &lx, &ly, &lz);
+        return ProjectHeadSpacePointToScreen(lx, lz, -ly, displaySize, out);
+    };
+
+    auto finiteDotForEye = [&](const float* eye, ImVec2* out) -> bool {
+        if (!haveWorld || !eye) return false;
+        const float D = CyberpunkVR_BarrelDotDistM;
+        if (!(D > 0.5f)) return false;
+        return projectWorldPointFromEye(
+            eye, mpx + mfx * D, mpy + mfy * D, mpz + mfz * D, out);
+    };
+
+    auto surfaceDotForEye = [&](const float* eye, ImVec2* out) -> bool {
+        return haveRayHit && projectWorldPointFromEye(eye, hitx, hity, hitz, out);
+    };
+
+    // Mode 0 stays a steady bore-direction cue. Mode 1 projects a finite point on the muzzle ray.
+    // Mode 2 uses the CET surface hit while fresh and falls back to the direction cue on a miss.
+    float vx = 0.0f, vy = 0.0f, vz = 0.0f;
+    RotateVectorByQuaternion(mfx, mfy, mfz, -cqx, -cqy, -cqz, cqw, &vx, &vy, &vz);
+    ImVec2 sc{};
+    ImVec2 scSecond{};
+    bool worldOk = false;
+    if (laserDotMode == 1) {
+        if (!mainEye || !secondEye) return;
+        const bool mainOk = finiteDotForEye(mainEye, &sc);
+        const bool secondOk = finiteDotForEye(secondEye, &scSecond);
+        if (haveWorld && (!mainOk || !secondOk)) return;
+        worldOk = mainOk && secondOk;
+    } else if (surfaceMode && haveRayHit) {
+        if (!mainEye || !secondEye) return;
+        const bool mainOk = surfaceDotForEye(mainEye, &sc);
+        const bool secondOk = surfaceDotForEye(secondEye, &scSecond);
+        if (!mainOk || !secondOk) return;
+        worldOk = true;
+    }
+
+    if (!worldOk) {
+        if (!ProjectHeadSpacePointToScreen(vx, vz, -vy, displaySize, &sc)) return;
+        scSecond = sc;
+    }
+
+    CyberpunkVR_BarrelDotNdcX = (sc.x / displaySize.x) * 2.0f - 1.0f;
+    CyberpunkVR_BarrelDotNdcY = 1.0f - (sc.y / displaySize.y) * 2.0f;
+
+    // Steady mode keeps the established finite-zero parallax without depending on a muzzle
+    // position sample. Finite/surface modes already projected the actual world point per eye.
+    if (laserDotMode == 0) {
+        float thx = 0.0f, thy = 0.0f;
+        float dx = 0.0f;
+        const float zeroM = CyberpunkVR_SightZeroMeters;
+        if (zeroM > 0.1f && GetOverlayProjTans(displaySize, &thx, &thy)) {
+            const float ipd = OpenXRManager::Get().GetRuntimeIpd();
+            if (ipd > 0.001f) {
+                dx = -(ipd / zeroM) / thx;
+                if (CyberpunkVR_MainIsRightEye) dx = -dx;
+            }
+        }
+        CyberpunkVR_BarrelDotNdcX2 = CyberpunkVR_BarrelDotNdcX + dx + CyberpunkVR_BarrelDotOffX2;
+    } else {
+        CyberpunkVR_BarrelDotNdcX2 =
+            ((scSecond.x / displaySize.x) * 2.0f - 1.0f) + CyberpunkVR_BarrelDotOffX2;
+    }
+
+    const ImVec2 secondEyeSc{
+        (CyberpunkVR_BarrelDotNdcX2 + 1.0f) * displaySize.x * 0.5f,
+        (1.0f - CyberpunkVR_BarrelDotNdcY) * displaySize.y * 0.5f};
+
+    // RecordDot is retained for the desktop mirror and receives the full halo extent. Both HMD
+    // eyes draw the same radial ImGui mesh from the core radius.
+    CyberpunkVR_BarrelDotRadiusPx = rad * 2.5f;
+    CyberpunkVR_BarrelDotTick = GetTickCount64();
+    const bool mainDotVisible = !surfaceMode || !rayFresh || mainVisible > 0.5f;
+    CyberpunkVR_BarrelDotSecondVisible =
+        (!surfaceMode || !rayFresh || secondVisible > 0.5f) ? 1 : 0;
+
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    if (dl && mainDotVisible) DrawRadialLaserSpot(dl, sc, rad);
+    if (g_secondEyeWorldDrawList && CyberpunkVR_BarrelDotSecondEye &&
+        CyberpunkVR_BarrelDotSecondVisible) {
+        DrawRadialLaserSpot(g_secondEyeWorldDrawList, secondEyeSc, rad);
     }
 }
 

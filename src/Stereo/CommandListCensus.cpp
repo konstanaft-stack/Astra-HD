@@ -1,3 +1,7 @@
+#include "MenuPreview/UiConsumer.hpp"
+#include "MenuPreview/EditorUiSurface.hpp"
+#include "MenuPreview/PipelineEvidence.hpp"
+#include "MenuPreview/PixelReadback.hpp"
 #include "Utils/DebugGate.hpp"
 #include "Render/SinglePassTrace.hpp"
 #include "Render/NativeStereoProbe.hpp"
@@ -46,8 +50,10 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <charconv>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -1008,9 +1014,159 @@ extern "C" __declspec(dllexport) uint64_t CyberpunkVR_DebugSightVsUsed = 0;
     } __except (EXCEPTION_EXECUTE_HANDLER) { tags[u] = 0; }
     log("[pso] sight shader dumped %zu bytes -> %s   chunks: %s", len, path, tags);
 }
-struct PsoIds { uint64_t ps, vs; uint32_t ps_len, vs_len; };
+struct PsoIds { uint64_t ps, vs; uint32_t ps_len, vs_len; cvr::menu_preview::PipelineShaderEvidence bindings; };
 static std::unordered_map<void*, PsoIds> g_pso_ids;
+static std::unordered_map<uintptr_t,cvr::menu_preview::ComputeShaderEvidence> g_compute_ids;
 static std::mutex g_pso_ids_mtx;
+// Microsoft DXC DxilPipelineStateValidation.h: PSV0 consists of runtime-info
+// size/data, resource count, bind-info stride, then ResourceBindInfo0/1 rows.
+// Parse only the bounded compiler declarations while the caller owns bytecode.
+static void menu_ps_bindings(const D3D12_SHADER_BYTECODE& ps,cvr::menu_preview::PipelineShaderEvidence& out)noexcept {
+    out.srvBindingsKnown=false;out.srvBindingCount=0;
+    const auto* b=static_cast<const uint8_t*>(ps.pShaderBytecode);const size_t n=ps.BytecodeLength;
+    if(!b||n<32||n>16u*1024u*1024u||memcmp(b,"DXBC",4))return;
+    const auto word=[&](size_t p){uint32_t v{};memcpy(&v,b+p,4);return v;};
+    const auto total=word(24),chunks=word(28);if(total!=n||!chunks||chunks>128||chunks>(n-32)/4)return;
+    size_t begin{},length{};bool dxil=false;
+    for(uint32_t i=0;i<chunks;++i){const size_t o=word(32+size_t(i)*4);if(o>n-8)return;const auto size=word(o+4);if(size>n-o-8)return;
+        if(!memcmp(b+o,"DXIL",4))dxil=true;
+        if(!memcmp(b+o,"PSV0",4)){if(begin)return;begin=o+8;length=size;}
+    }
+    if(!dxil||!begin||length<8)return;const size_t runtimeBytes=word(begin);if(runtimeBytes<24||runtimeBytes>length-8)return;
+    size_t at=begin+4+runtimeBytes;const size_t end=begin+length;const auto count=word(at);at+=4;
+    if(!count){out.srvBindingsKnown=true;return;}if(count>256||end-at<4)return;
+    const auto stride=word(at);at+=4;if(stride<16||stride>64||count>(end-at)/stride)return;
+    std::array<cvr::menu_preview::ShaderSrvBinding,16> bindings{};uint32_t used{};
+    for(uint32_t i=0;i<count;++i,at+=stride){const auto type=word(at);if(type>=6&&type<=9)return; // UAV-writing PS is not a UI transfer.
+        if(type<3||type>5)continue;if(used==bindings.size())return;
+        const auto first=word(at+8),last=word(at+12);if(last<first)return;
+        bindings[used++]={word(at+4),first,last,stride>=24?word(at+16):0};
+    }
+    out.srvBindings=bindings;out.srvBindingCount=used;out.srvBindingsKnown=true;
+}
+static void menu_cs_bindings(const D3D12_SHADER_BYTECODE& cs,cvr::menu_preview::ComputeShaderEvidence& out)noexcept {
+    const auto* b=static_cast<const uint8_t*>(cs.pShaderBytecode);const size_t n=cs.BytecodeLength;
+    if(!b||n<32||n>16u*1024u*1024u||memcmp(b,"DXBC",4))return;
+    const auto word=[&](size_t p){uint32_t v{};memcpy(&v,b+p,4);return v;};
+    const auto total=word(24),chunks=word(28);if(total!=n||!chunks||chunks>128||chunks>(n-32)/4)return;
+    size_t begin{},length{};bool dxil=false;
+    for(uint32_t i=0;i<chunks;++i){const size_t o=word(32+size_t(i)*4);if(o>n-8)return;const auto size=word(o+4);if(size>n-o-8)return;
+        if(!memcmp(b+o,"DXIL",4))dxil=true;
+        if(!memcmp(b+o,"PSV0",4)){if(begin)return;begin=o+8;length=size;}
+    }
+    if(!dxil||!begin||length<8)return;const size_t runtimeBytes=word(begin);if(runtimeBytes<24||runtimeBytes>length-8)return;
+    size_t at=begin+4+runtimeBytes;const size_t end=begin+length;const auto count=word(at);at+=4;
+    if(!count){out.bindingsKnown=true;return;}if(count>256||end-at<4)return;
+    const auto stride=word(at);at+=4;if(stride<16||stride>64||count>(end-at)/stride)return;
+    auto parsed=out;
+    for(uint32_t i=0;i<count;++i,at+=stride){const auto type=word(at);const bool srv=type>=3&&type<=5,uav=type>=6&&type<=9;
+        if(!srv&&!uav)continue;const auto first=word(at+8),last=word(at+12);if(last<first)return;
+        const cvr::menu_preview::ShaderSrvBinding binding{word(at+4),first,last,stride>=24?word(at+16):0};
+        if(srv){if(parsed.srvBindingCount==parsed.srvBindings.size())return;parsed.srvBindings[parsed.srvBindingCount++]=binding;}
+        else{if(parsed.uavBindingCount==parsed.uavBindings.size())return;parsed.uavBindings[parsed.uavBindingCount++]=binding;}
+    }
+    parsed.bindingsKnown=true;out=parsed;
+}
+// DXC DxilContainer.h: OSG1 has an 8-byte signature header and 32-byte rows.
+// The second mask byte is NeverWrites, not an AlwaysWrites mask.
+static void menu_ps_outputs(const D3D12_SHADER_BYTECODE& ps,cvr::menu_preview::PipelineShaderEvidence& out)noexcept {
+    const auto* b=static_cast<const uint8_t*>(ps.pShaderBytecode);const size_t n=ps.BytecodeLength;
+    if(!b||n<32||n>16u*1024u*1024u||memcmp(b,"DXBC",4))return;
+    const auto word=[&](size_t p){uint32_t v{};memcpy(&v,b+p,4);return v;};
+    const auto chunks=word(28);if(word(24)!=n||!chunks||chunks>128||chunks>(n-32)/4)return;
+    size_t begin{},length{};
+    for(uint32_t i=0;i<chunks;++i){const size_t o=word(32+size_t(i)*4);if(o>n-8)return;const auto size=word(o+4);if(size>n-o-8)return;
+        if(!memcmp(b+o,"OSGN",4))return; // Unverified legacy layout stays unknown.
+        if(!memcmp(b+o,"OSG1",4)){if(begin)return;begin=o+8;length=size;}
+    }
+    if(!begin||length<8)return;const auto count=word(begin),offset=word(begin+4);
+    if(count>256||offset<8||offset>length||count>(length-offset)/32)return;
+    uint32_t mask{};
+    for(uint32_t i=0;i<count;++i){const size_t row=begin+offset+size_t(i)*32;
+        if(word(row+12)!=64)continue; // SV_Target; depth/coverage are not RTVs.
+        const auto reg=word(row+20);if(word(row)!=0||reg>=8)return;
+        if((b[row+24]&uint8_t(~b[row+25])&0xF)!=0)mask|=uint32_t(1)<<reg;
+    }
+    out.colorOutputMask=mask;out.colorOutputsKnown=true;
+}
+// Independent from the sight selectors: capture one exact original UI PS at
+// creation, while the caller still owns the bytecode. Never retain its pointer.
+static void menu_ps_dump(uint64_t hash,const D3D12_SHADER_BYTECODE& ps)noexcept {
+    struct Request {uint64_t hash{};std::array<wchar_t,32768> path{};};
+    static const Request request=[]()noexcept {
+        Request r;
+        try {
+            char value[32]{};const auto n=GetEnvironmentVariableA("CPVR_MENU_UI_PS_HASH",value,sizeof(value));
+            if(!n||n>=sizeof(value))return r;
+            const char* first=value;if(n>2&&value[0]=='0'&&(value[1]=='x'||value[1]=='X'))first+=2;
+            uint64_t parsed{};const auto result=std::from_chars(first,value+n,parsed,16);
+            if(result.ec!=std::errc{}||result.ptr!=value+n||!parsed)return r;
+            const auto pathLength=GetEnvironmentVariableW(L"CPVR_MENU_UI_PS_DUMP_PATH",r.path.data(),DWORD(r.path.size()));
+            if(pathLength&&pathLength<r.path.size()&&std::filesystem::path(r.path.data()).is_absolute())r.hash=parsed;
+        }catch(...){}
+        return r;
+    }();
+    if(!request.hash||hash!=request.hash)return;
+    static std::atomic<bool> attempted{};bool expected=false;
+    if(!attempted.compare_exchange_strong(expected,true))return;
+    try {
+        constexpr size_t maxBytes=16u*1024u*1024u;
+        if(!ps.pShaderBytecode||ps.BytecodeLength<32||ps.BytecodeLength>maxBytes){
+            log("[MenuPreviewPipeline] ps-dump FAIL hash=%016llX bytes=%zu reason=bytecode-bounds",static_cast<unsigned long long>(hash),ps.BytecodeLength);return;
+        }
+        HANDLE file=CreateFileW(request.path.data(),GENERIC_WRITE,FILE_SHARE_READ,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
+        if(file==INVALID_HANDLE_VALUE){log("[MenuPreviewPipeline] ps-dump FAIL hash=%016llX bytes=%zu error=%lu reason=create-new path=%ls",static_cast<unsigned long long>(hash),ps.BytecodeLength,GetLastError(),request.path.data());return;}
+        DWORD written{};const bool wrote=WriteFile(file,ps.pShaderBytecode,DWORD(ps.BytecodeLength),&written,nullptr)!=FALSE;
+        DWORD error=wrote?ERROR_SUCCESS:GetLastError();
+        const bool complete=wrote&&written==ps.BytecodeLength;
+        const bool flushed=complete&&FlushFileBuffers(file)!=FALSE;
+        if(complete&&!flushed)error=GetLastError();
+        const bool closed=CloseHandle(file)!=FALSE;if(!closed)error=GetLastError();
+        log("[MenuPreviewPipeline] ps-dump %s hash=%016llX bytes=%zu written=%lu error=%lu path=%ls; exact original PS hash, no shader replacement",complete&&flushed&&closed?"PASS":"FAIL",static_cast<unsigned long long>(hash),ps.BytecodeLength,written,error,request.path.data());
+    }catch(...){try{log("[MenuPreviewPipeline] ps-dump FAIL reason=exception");}catch(...){}}
+}
+// Capture the exact VS paired with both requested identities in one creation
+// call. Its caller-owned bytes are written now; no shader pointer is retained.
+static void menu_vs_dump(uint64_t psHash,uint64_t vsHash,const D3D12_SHADER_BYTECODE& vs)noexcept {
+    struct Request {uint64_t psHash{},vsHash{};std::array<wchar_t,32768> path{};};
+    static const Request request=[]()noexcept {
+        Request r;
+        try {
+            const auto readHash=[](const char* name,uint64_t& hash)noexcept {
+                char value[32]{};const auto n=GetEnvironmentVariableA(name,value,sizeof(value));
+                if(!n||n>=sizeof(value))return false;
+                const char* first=value;if(n>2&&value[0]=='0'&&(value[1]=='x'||value[1]=='X'))first+=2;
+                if(value+n-first!=16)return false;
+                uint64_t parsed{};const auto result=std::from_chars(first,value+n,parsed,16);
+                if(result.ec!=std::errc{}||result.ptr!=value+n||!parsed)return false;
+                hash=parsed;return true;
+            };
+            uint64_t ps{},vertex{};
+            if(!readHash("CPVR_MENU_UI_VS_PS_HASH",ps)||!readHash("CPVR_MENU_UI_VS_HASH",vertex))return r;
+            const auto pathLength=GetEnvironmentVariableW(L"CPVR_MENU_UI_VS_DUMP_PATH",r.path.data(),DWORD(r.path.size()));
+            if(pathLength&&pathLength<r.path.size()&&std::filesystem::path(r.path.data()).is_absolute()){r.psHash=ps;r.vsHash=vertex;}
+        }catch(...){}
+        return r;
+    }();
+    if(!request.psHash||!request.vsHash||psHash!=request.psHash||vsHash!=request.vsHash)return;
+    static std::atomic<bool> attempted{};bool expected=false;
+    if(!attempted.compare_exchange_strong(expected,true))return;
+    try {
+        constexpr size_t maxBytes=16u*1024u*1024u;
+        if(!vs.pShaderBytecode||vs.BytecodeLength<32||vs.BytecodeLength>maxBytes){
+            log("[MenuPreviewPipeline] vs-dump FAIL psHash=%016llX vsHash=%016llX bytes=%zu reason=bytecode-bounds",static_cast<unsigned long long>(psHash),static_cast<unsigned long long>(vsHash),vs.BytecodeLength);return;
+        }
+        HANDLE file=CreateFileW(request.path.data(),GENERIC_WRITE,FILE_SHARE_READ,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
+        if(file==INVALID_HANDLE_VALUE){log("[MenuPreviewPipeline] vs-dump FAIL psHash=%016llX vsHash=%016llX bytes=%zu error=%lu reason=create-new path=%ls",static_cast<unsigned long long>(psHash),static_cast<unsigned long long>(vsHash),vs.BytecodeLength,GetLastError(),request.path.data());return;}
+        DWORD written{};const bool wrote=WriteFile(file,vs.pShaderBytecode,DWORD(vs.BytecodeLength),&written,nullptr)!=FALSE;
+        DWORD error=wrote?ERROR_SUCCESS:GetLastError();
+        const bool complete=wrote&&written==vs.BytecodeLength;
+        const bool flushed=complete&&FlushFileBuffers(file)!=FALSE;
+        if(complete&&!flushed)error=GetLastError();
+        const bool closed=CloseHandle(file)!=FALSE;if(!closed)error=GetLastError();
+        log("[MenuPreviewPipeline] vs-dump %s psHash=%016llX vsHash=%016llX bytes=%zu written=%lu error=%lu path=%ls; exact original pair, no shader replacement",complete&&flushed&&closed?"PASS":"FAIL",static_cast<unsigned long long>(psHash),static_cast<unsigned long long>(vsHash),vs.BytecodeLength,written,error,request.path.data());
+    }catch(...){try{log("[MenuPreviewPipeline] vs-dump FAIL reason=exception");}catch(...){}}
+}
 static thread_local ID3D12PipelineState* t_current_pso = nullptr;
 // Which dispatch inside the vision node is the outline generator, and where that count stands.
 // WHICH 384x384 DISPATCH IN THE NODE IS THE OUTLINE: the third, ordinal 2. Established on the
@@ -1047,12 +1203,15 @@ static thread_local int32_t   t_vis_swap_ord = 0;
     if (ps.pShaderBytecode && ps.BytecodeLength) {
         ids.ps = fnv1a(ps.pShaderBytecode, ps.BytecodeLength);
         ids.ps_len = static_cast<uint32_t>(ps.BytecodeLength);
+        if(cvr::menu_preview::UiConsumerEnabled()){menu_ps_bindings(ps,ids.bindings);menu_ps_outputs(ps,ids.bindings);}
     }
     if (vs.pShaderBytecode && vs.BytecodeLength) {
         ids.vs = fnv1a(vs.pShaderBytecode, vs.BytecodeLength);
         ids.vs_len = static_cast<uint32_t>(vs.BytecodeLength);
     }
     if (!ids.ps && !ids.vs) return;
+    menu_ps_dump(ids.ps,ps);
+    menu_vs_dump(ids.ps,ids.vs,vs);
     // More than one pipeline uses this pixel shader, and the first one created is NOT the one the
     // sight draws with: the first dump came back with a 3-input vertex shader (POSITION/TEXCOORD/
     // COLOR), which cannot even place a quad in the world. So every vertex shader paired with this
@@ -1235,6 +1394,7 @@ extern "C" __declspec(dllexport) int32_t CyberpunkVR_SightAxisProbe = 1;
         t_inst_stride = views[0].StrideInBytes;
     }
     e->iavb_original(self, start, num, views);
+    if(cvr::menu_preview::UiRasterDiagnosticsEnabled())cvr::menu_preview::UiVertexBuffers(self,start,num,views);
 }
 
 // Decode the sight's world orientation for this view and print it once. The three rows are the
@@ -1841,7 +2001,12 @@ void STDMETHODCALLTYPE hk_ClearDepthStencilView(ID3D12GraphicsCommandList* self,
     if (!e || !e->draw_original) return;
     maybe_marker(self);
     cascade_draw_seen();
+    const auto editorRoute=cvr::menu_preview::BeginEditorUiDraw(self,
+        cvr::menu_preview::InspectEditorUiDraw(self,vtx,inst));
     e->draw_original(self, vtx, inst, sv, si);
+    cvr::menu_preview::EndEditorUiDraw(self,editorRoute);
+    if(!cvr::stereo::probe::internalCommands)cvr::menu_preview::UiDrawReturned(self,vtx,inst,sv,false,0,0,si);
+    cvr::menu_preview::PreviewPixelDrawReturned(self,false,vtx,inst,sv,0,si);
     if (CyberpunkVR_DrawCensus) draw_census_note(t_vrcam_node_active);
 }
 
@@ -1882,7 +2047,12 @@ void STDMETHODCALLTYPE hk_ClearDepthStencilView(ID3D12GraphicsCommandList* self,
         const uint64_t ps = sight_note(t_vrcam_node_active);
         if (ps && ps == CyberpunkVR_SightSkipPs) return;
     }
+    const auto editorRoute=cvr::menu_preview::BeginEditorUiDraw(self,
+        cvr::menu_preview::InspectEditorUiDraw(self,idx,inst));
     e->drawidx_original(self, idx, inst, si, bv, sinst);
+    cvr::menu_preview::EndEditorUiDraw(self,editorRoute);
+    cvr::menu_preview::UiDrawReturned(self,idx,inst,~0u,true,si,bv,sinst);
+    cvr::menu_preview::PreviewPixelDrawReturned(self,true,idx,inst,si,bv,sinst);
     if (CyberpunkVR_DrawCensus) draw_census_note(t_vrcam_node_active);
     // The shadow cascade, counted per view. One compare on every other draw in the frame.
     if (CyberpunkVR_CascadeCensus && g_exe_base &&
@@ -2051,6 +2221,7 @@ static void volume_node_note(uint32_t rva, UINT n, bool vrcam) {
         }
     }
     e->dispatch_original(self, x, y, z);
+    if(!vis_swapped&&!cvr::stereo::probe::internalCommands)cvr::menu_preview::UiDispatchReturned(self,x,y,z);
     if (vis_swapped && vis_prev) self->SetPipelineState(vis_prev);
     t_last_disp[0] = x; t_last_disp[1] = y; t_last_disp[2] = z;
     if (CyberpunkVR_DispatchCensus && g_exe_base) {
@@ -2076,10 +2247,24 @@ static void volume_node_note(uint32_t rva, UINT n, bool vrcam) {
     if (CyberpunkVR_LightContent) light_content_report();
 }
 
+void STDMETHODCALLTYPE probe_CopyTextureRegion(ID3D12GraphicsCommandList* self,const D3D12_TEXTURE_COPY_LOCATION* destination,UINT x,UINT y,UINT z,const D3D12_TEXTURE_COPY_LOCATION* source,const D3D12_BOX* box) {
+    const auto* entry=command_list_hook_entry(self);if(!entry||!entry->copytex)return;
+    entry->copytex(self,destination,x,y,z,source,box);
+    if(cvr::stereo::probe::internalCommands||!destination||!destination->pResource||cvr::menu_preview::UiConsumerTimingScope()!=2)return;
+    bool whole=false;
+    if(source&&source->pResource&&destination->Type==D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX&&source->Type==D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX&&destination->SubresourceIndex==0&&source->SubresourceIndex==0&&!x&&!y&&!z){
+        const auto d=destination->pResource->GetDesc(),s=source->pResource->GetDesc();
+        whole=d.Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE2D&&s.Dimension==d.Dimension&&d.MipLevels==1&&s.MipLevels==1&&d.DepthOrArraySize==1&&s.DepthOrArraySize==1&&d.SampleDesc.Count==1&&s.SampleDesc.Count==1&&d.Width==s.Width&&d.Height==s.Height&&d.Format==s.Format&&
+            (!box||(!box->left&&!box->top&&!box->front&&box->right==s.Width&&box->bottom==s.Height&&box->back==1));
+    }
+    // An incomplete/unknown write only invalidates existing UI provenance.
+    cvr::menu_preview::UiCopyResourceReturned(self,destination->pResource,whole?source->pResource:nullptr);
+}
 void STDMETHODCALLTYPE probe_CopyResource(ID3D12GraphicsCommandList* self,ID3D12Resource* destination,ID3D12Resource* source) {
     const auto* entry=command_list_hook_entry(self);if(!entry || !entry->copyres)return;
     if(!cvr::stereo::probe::internalCommands)cvr::stereo::packets::upload_shadow::Invalidate(destination);
     entry->copyres(self,destination,source);
+    if(!cvr::stereo::probe::internalCommands)cvr::menu_preview::UiCopyResourceReturned(self,destination,source);
 }
  void STDMETHODCALLTYPE hk_CopyBufferRegion(ID3D12GraphicsCommandList* self,
         ID3D12Resource* dst, UINT64 dst_off, ID3D12Resource* src, UINT64 src_off,
@@ -2199,3 +2384,30 @@ void STDMETHODCALLTYPE probe_CopyResource(ID3D12GraphicsCommandList* self,ID3D12
 
 }  // namespace detail
 }  // namespace cvr
+
+namespace cvr::menu_preview {
+bool QueryPipelineShaders(uintptr_t pipeline,PipelineShaderEvidence& out)noexcept {
+    out={};
+    try {
+        std::lock_guard lock(detail::g_pso_ids_mtx);
+        const auto found=detail::g_pso_ids.find(reinterpret_cast<void*>(pipeline));
+        if(found==detail::g_pso_ids.end())return false;
+        const auto& ids=found->second;out=ids.bindings;out.psHash=ids.ps;out.vsHash=ids.vs;out.psBytes=ids.ps_len;out.vsBytes=ids.vs_len;return true;
+    }catch(...){return false;}
+}
+void RecordComputeShader(uintptr_t pipeline,const D3D12_SHADER_BYTECODE& cs)noexcept {
+    if(!pipeline||!UiConsumerEnabled()||!cs.pShaderBytecode||!cs.BytecodeLength||cs.BytecodeLength>16u*1024u*1024u)return;
+    try {
+        ComputeShaderEvidence evidence;evidence.csHash=detail::fnv1a(cs.pShaderBytecode,cs.BytecodeLength);evidence.csBytes=uint32_t(cs.BytecodeLength);
+        detail::menu_cs_bindings(cs,evidence);
+        std::lock_guard lock(detail::g_pso_ids_mtx);
+        if(detail::g_compute_ids.size()<65536||detail::g_compute_ids.contains(pipeline))detail::g_compute_ids[pipeline]=evidence;
+    }catch(...){}
+}
+bool QueryComputeShader(uintptr_t pipeline,ComputeShaderEvidence& out)noexcept {
+    out={};try {
+        std::lock_guard lock(detail::g_pso_ids_mtx);const auto found=detail::g_compute_ids.find(pipeline);
+        if(found==detail::g_compute_ids.end())return false;out=found->second;return true;
+    }catch(...){return false;}
+}
+}

@@ -1,0 +1,1 @@
+Экспериментальный Cyberpunk 2077 в VR: Astra HD и VR-центр для установки, запуска и отдельных профилей. Выпуск r29 native-base; optional NR/OptiScaler/MFG не включён, совместная NR+FG — следующий этап.

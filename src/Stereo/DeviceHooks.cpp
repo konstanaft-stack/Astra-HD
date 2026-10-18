@@ -1,9 +1,22 @@
+#include "MenuPreview/UiConsumer.hpp"
+#include "MenuPreview/PipelineEvidence.hpp"
+#include "MenuPreview/DescriptorProvenance.hpp"
+#include "MenuPreview/PixelReadback.hpp"
 #include "Utils/DebugGate.hpp"
+#include "Framegen/SrHistoryIntegration.hpp"
 #include "Hooks/AftermathDiagnostics.hpp"
+#include "Hooks/GpuObjectProvenance.hpp"
 #include "Render/CommandResources.hpp"
+#include "Render/NativeObjectIdentity.hpp"
+#include "Render/NativeColorSource.hpp"
+#include "MenuPreview/ImageLineage.hpp"
+#include "Framegen/NativeFgReadback.hpp"
+#include "Framegen/NativeFgOutput.hpp"
+#include "Render/ResourceAllocation.hpp"
 #include "Render/NativeStereoProbe.hpp"
 #include "Render/StereoGpuProbe.hpp"
 #include "Render/StereoSceneState.hpp"
+#include "Render/RenderProbeScope.hpp"
 #include <wrl/client.h>
 // DeviceHooks -- how everything else in this module gets to run at all.
 //
@@ -64,6 +77,7 @@
 #include "Utils/LogThrottle.hpp"
 #include "Stereo/StereoInternal.hpp"
 #include "Stereo/EngineRvas.hpp"
+#include "Stereo/CetOverlayLayer.hpp"
 #include "Stereo/DetourRegistry.hpp"
 #include "Stereo/StereoInternal.hpp"
 #include "Stereo/EngineRvas.hpp"
@@ -128,7 +142,15 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateDescriptorHeap(
             }
         }
     }
-    return g_orig_CreateDescriptorHeap(self, use, riid, out);
+    const auto result=g_orig_CreateDescriptorHeap(self, use, riid, out);
+    if(SUCCEEDED(result)&&out&&*out)cvr::menu_preview::PreviewDescriptorHeapCreated(self,static_cast<IUnknown*>(*out));
+    if(SUCCEEDED(result)&&out&&*out&&cvr::menu_preview::UiStereoRequested()){
+        Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap;
+        if(SUCCEEDED(static_cast<IUnknown*>(*out)->QueryInterface(IID_PPV_ARGS(&heap))))
+            cvr::menu_preview::UiDescriptorHeapCreated(self,heap.Get());
+    }
+    if(SUCCEEDED(result)&&out&&*out)NameGpuObjectProvenance(static_cast<IUnknown*>(*out),L"DescriptorHeap",reinterpret_cast<const void*>(ret_abs));
+    return result;
 }
 
 // --- ExecuteCommandLists probe: count actual GPU command-list executions per
@@ -343,17 +365,37 @@ static void STDMETHODCALLTYPE Hook_ExecuteCommandLists(
             }
         }
     }
+    auto srSubmission=cvr::framegen::SrBeforeSubmit(self,n,lists);
     {
         std::lock_guard submissionLock(cvr::camera::ImageSubmissionMutex());
         if(self==g_game_queue)cvr::framegen::BeforeGameCommands(self);
         auto resources = cvr::gpu::PrepareCommandResources(n, lists);
+        auto imageSubmission=cvr::camera::PrepareImagePoseLists(self,n,lists);
+        auto previewImageSubmission=cvr::menu_preview::PreparePreviewImageLists(self,n,lists);
+        auto previewPixels=cvr::menu_preview::PreparePreviewPixels(n,lists,self);
+        auto uiSubmission=cvr::menu_preview::PrepareUiSubmission(n,lists);
+        auto editorUiSubmission=cvr::menu_preview::PrepareEditorUiSubmission(self,n,lists);
+        auto nativeColorSubmission=cvr::render::PrepareNativeColor(self,n,lists);
+        auto inputSubmission=cvr::framegen::PrepareInputSubmission(n,lists);
         cvr::stereo::gpu_probe::BeforeSubmit(self,n,lists);
+        ColorPathAuditBeforeSubmit(self,n,lists);
+        cvr::framegen::NativeFgReadbackBeforeSubmit(self,n,lists);
+        cvr::framegen::NativeFgOutputBeforeSubmit(self,n,lists);
         g_orig_ExecuteCommandLists(self,n,lists);
+        const auto actualUiSubmission=cvr::menu_preview::UiSubmitted(self,std::move(uiSubmission));
+        cvr::menu_preview::EditorUiSubmitted(self,std::move(editorUiSubmission),g_orig_ExecuteCommandLists);
+        cvr::menu_preview::SubmittedPreviewPixels(self,std::move(previewPixels),g_orig_ExecuteCommandLists,actualUiSubmission);
+        cvr::framegen::NativeFgReadbackSubmitted(self);
+        cvr::framegen::NativeFgOutputSubmitted(self);
+        ColorPathAuditSubmitted(self);
+        cvr::camera::CommitImagePoseLists(self,std::move(imageSubmission));
+        cvr::menu_preview::CommitPreviewImageLists(self,std::move(previewImageSubmission));
+        cvr::render::CommitNativeColor(self,std::move(nativeColorSubmission));
         cvr::gpu::SubmitCommandResources(self, std::move(resources));
         cvr::stereo::gpu_probe::Submitted(self,n,lists);
-        cvr::camera::CommitImagePoseLists(self,n,lists);
-        cvr::framegen::Submitted(self,n,lists);
+        cvr::framegen::Submitted(inputSubmission,self);
     }
+    cvr::framegen::SrSubmitted(srSubmission,self,n,lists);
     // The game just submitted the list that wrote the vrcam final. That target rests
     // permanently in RENDER_TARGET (never read back -> no RT->read barrier exists),
     // so we copy it out ourselves with one tiny submit on the game queue right here,
@@ -387,6 +429,7 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateCommandQueue(
     HRESULT hr = g_orig_CreateCommandQueue(self, desc, riid, out);
     if (SUCCEEDED(hr) && out && *out) {
         auto* queue = reinterpret_cast<ID3D12CommandQueue*>(*out);
+        if(!cvr::gpu::RegisterNativeObject(queue))log("[exec] native queue identity registration failed queue=%p",queue);
         if (desc && desc->Type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
             std::lock_guard<std::mutex> lock(g_game_object_mtx);
             if (!g_game_queue) {
@@ -438,6 +481,7 @@ PFN_OMSetRenderTargets command_list_original_om(
 static void STDMETHODCALLTYPE ProbeHeaps(ID3D12GraphicsCommandList* list,UINT count,ID3D12DescriptorHeap* const* heaps) {
     const auto* e=command_list_hook_entry(list);if(!e || !e->heaps_original)return;
     e->heaps_original(list,count,heaps);cvr::stereo::scene_state::Heaps(list,count,heaps);
+    cvr::menu_preview::UiDescriptorHeaps(list,count,heaps);
 }
 static void STDMETHODCALLTYPE ProbeTopology(ID3D12GraphicsCommandList* list,D3D12_PRIMITIVE_TOPOLOGY topology) {
     const auto* e=command_list_hook_entry(list);if(!e || !e->topology_original)return;
@@ -450,14 +494,18 @@ static void STDMETHODCALLTYPE ProbeStencil(ID3D12GraphicsCommandList* list,UINT 
 static void STDMETHODCALLTYPE ProbeGraphicsRoot(ID3D12GraphicsCommandList* list,ID3D12RootSignature* root) {
     const auto* entry=command_list_hook_entry(list);if(!entry || !entry->groot_original)return;
     entry->groot_original(list,root);cvr::stereo::native_probe::RootSignature(list,root);
+    cvr::menu_preview::UiGraphicsRootSignature(list,root);
 }
 static void STDMETHODCALLTYPE ProbeGraphicsTable(ID3D12GraphicsCommandList* list,UINT index,D3D12_GPU_DESCRIPTOR_HANDLE table) {
     const auto* entry=command_list_hook_entry(list);if(!entry || !entry->grootdt_original)return;
+    const auto nativeCaller=reinterpret_cast<uintptr_t>(_ReturnAddress());
     entry->grootdt_original(list,index,table);cvr::stereo::native_probe::RootTable(list,index,table);
+    cvr::menu_preview::UiGraphicsRootTable(list,index,table,nativeCaller);
 }
 static void STDMETHODCALLTYPE ProbeGraphicsCbv(ID3D12GraphicsCommandList* list,UINT index,D3D12_GPU_VIRTUAL_ADDRESS address) {
     const auto* entry=command_list_hook_entry(list);if(!entry || !entry->grootcbv_original)return;
     entry->grootcbv_original(list,index,address);cvr::stereo::native_probe::RootCbv(list,index,address);
+    if(cvr::menu_preview::UiRasterDiagnosticsEnabled())cvr::menu_preview::UiGraphicsConstantBuffer(list,index,address);
 }
 static void STDMETHODCALLTYPE ProbeIndexBuffer(ID3D12GraphicsCommandList* list,const D3D12_INDEX_BUFFER_VIEW* view) {
     const auto* entry=command_list_hook_entry(list);if(!entry || !entry->iaib_original)return;
@@ -474,6 +522,20 @@ static void STDMETHODCALLTYPE ProbeShadingRate(ID3D12GraphicsCommandList5* list,
 static void STDMETHODCALLTYPE ProbeShadingImage(ID3D12GraphicsCommandList5* list,ID3D12Resource* image) {
     const auto* e=command_list_hook_entry(list);if(!e || !e->shading_image_original)return;
     e->shading_image_original(list,image);cvr::stereo::scene_state::ShadingRateImage(list,image);
+}
+static HRESULT STDMETHODCALLTYPE PreviewClose(ID3D12GraphicsCommandList* self){
+    const auto* e=command_list_hook_entry(self);if(!e||!e->close_original)return E_FAIL;
+    if(cvr::menu_preview::EditorUiPrivateCommands())return e->close_original(self);
+    const bool locked=cvr::menu_preview::LockPreviewPixelLifecycle();
+    const auto result=e->close_original(self);
+    cvr::menu_preview::ClosePreviewPixelList(self,SUCCEEDED(result));
+    cvr::menu_preview::UiCloseList(self,SUCCEEDED(result));
+    cvr::menu_preview::CloseEditorUiList(self,SUCCEEDED(result));
+    cvr::menu_preview::UnlockPreviewPixelLifecycle(locked);return result;
+}
+static void STDMETHODCALLTYPE ProbePipelineState(ID3D12GraphicsCommandList* list,ID3D12PipelineState* pipeline){
+    hk_SetPipelineState(list,pipeline);
+    if(!cvr::stereo::probe::internalCommands)cvr::menu_preview::UiPipelineState(list,pipeline);
 }
 static void patch_command_list_vtable(void* command_list) {
     if (!command_list) return;
@@ -519,9 +581,11 @@ static void patch_command_list_vtable(void* command_list) {
         reinterpret_cast<PFN_ProbeHeaps>(vtable[28]),reinterpret_cast<PFN_ProbeTopology>(vtable[20]),reinterpret_cast<PFN_ProbeStencil>(vtable[24]),
         sameList5?reinterpret_cast<PFN_ProbeShadingRate>(vtable[77]):nullptr,
         sameList5?reinterpret_cast<PFN_ProbeShadingImage>(vtable[78]):nullptr,
-        probeEnabled && (sameList5 || list5Result==E_NOINTERFACE)};
+        probeEnabled && (sameList5 || list5Result==E_NOINTERFACE),
+        reinterpret_cast<HRESULT (STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*)>(vtable[9])};
     struct Slot {size_t index;void* detour;};
     const Slot slots[]{
+        {9,reinterpret_cast<void*>(&PreviewClose)},
         {46,reinterpret_cast<void*>(&hk_OMSetRenderTargets)},
         {26,reinterpret_cast<void*>(&hk_ResourceBarrier)},
         {15,reinterpret_cast<void*>(&hk_CopyBufferRegion)},
@@ -535,14 +599,17 @@ static void patch_command_list_vtable(void* command_list) {
         {44,reinterpret_cast<void*>(&hk_IASetVertexBuffers)},
         {29,reinterpret_cast<void*>(&hk_SetComputeRootSignature)},
         {31,reinterpret_cast<void*>(&hk_SetComputeRootDescriptorTable)},
-        {25,reinterpret_cast<void*>(&hk_SetPipelineState)},
+        {25,reinterpret_cast<void*>(&ProbePipelineState)},
         {47,reinterpret_cast<void*>(&hk_ClearDepthStencilView)}};
     const Slot probeSlots[]{{30,reinterpret_cast<void*>(&ProbeGraphicsRoot)},
         {32,reinterpret_cast<void*>(&ProbeGraphicsTable)},{38,reinterpret_cast<void*>(&ProbeGraphicsCbv)},
         {43,reinterpret_cast<void*>(&ProbeIndexBuffer)},{17,reinterpret_cast<void*>(&probe_CopyResource)},
+        {16,reinterpret_cast<void*>(&probe_CopyTextureRegion)},
         {55,reinterpret_cast<void*>(&ProbePredication)},{28,reinterpret_cast<void*>(&ProbeHeaps)},
         {20,reinterpret_cast<void*>(&ProbeTopology)},{24,reinterpret_cast<void*>(&ProbeStencil)}};
-    constexpr size_t firstSlot=10;const size_t lastSlot=sameList5?78:59;
+    // Install lifetime/copy hooks before a menu exists. Per-frame observation
+    // remains gated by a fresh preview inside the callbacks themselves.
+    const size_t firstSlot=cvr::menu_preview::PreviewMetadataRequested()?9:10;const size_t lastSlot=sameList5?78:59;
     const size_t bytes=(lastSlot-firstSlot+1)*sizeof(void*);
     DWORD oldProtection{};
     if(!VirtualProtect(vtable+firstSlot,bytes,PAGE_READWRITE,&oldProtection)) {
@@ -550,9 +617,9 @@ static void patch_command_list_vtable(void* command_list) {
     }
     g_command_list_vtable_hooks[count]=entry;
     g_command_list_vtable_hook_count.store(count+1,std::memory_order_release);
-    for(const auto& slot:slots)
+    for(const auto& slot:slots)if(slot.index!=9||cvr::menu_preview::PreviewMetadataRequested())
         InterlockedExchangePointer(reinterpret_cast<void* volatile*>(vtable+slot.index),slot.detour);
-    if(probeEnabled)for(const auto& slot:probeSlots)
+    for(const auto& slot:probeSlots)if(probeEnabled || (cvr::menu_preview::UiStereoRequested()&&(slot.index==28||slot.index==30||slot.index==32)))
         InterlockedExchangePointer(reinterpret_cast<void* volatile*>(vtable+slot.index),slot.detour);
     if(sameList5){
         InterlockedExchangePointer(reinterpret_cast<void* volatile*>(vtable+77),reinterpret_cast<void*>(&ProbeShadingRate));
@@ -574,6 +641,40 @@ using PFN_CreatePlacedResource = HRESULT (STDMETHODCALLTYPE*)(
     D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*, REFIID, void**);
 static PFN_CreateCommittedResource g_orig_CreateCommitted = nullptr;
 static PFN_CreatePlacedResource    g_orig_CreatePlaced = nullptr;
+using PFN_CreateCommitted1=HRESULT(STDMETHODCALLTYPE*)(ID3D12Device4*,const D3D12_HEAP_PROPERTIES*,D3D12_HEAP_FLAGS,const D3D12_RESOURCE_DESC*,D3D12_RESOURCE_STATES,const D3D12_CLEAR_VALUE*,ID3D12ProtectedResourceSession*,REFIID,void**);
+using PFN_CreateCommitted2=HRESULT(STDMETHODCALLTYPE*)(ID3D12Device8*,const D3D12_HEAP_PROPERTIES*,D3D12_HEAP_FLAGS,const D3D12_RESOURCE_DESC1*,D3D12_RESOURCE_STATES,const D3D12_CLEAR_VALUE*,ID3D12ProtectedResourceSession*,REFIID,void**);
+using PFN_CreateCommitted3=HRESULT(STDMETHODCALLTYPE*)(ID3D12Device10*,const D3D12_HEAP_PROPERTIES*,D3D12_HEAP_FLAGS,const D3D12_RESOURCE_DESC1*,D3D12_BARRIER_LAYOUT,const D3D12_CLEAR_VALUE*,ID3D12ProtectedResourceSession*,UINT32,const DXGI_FORMAT*,REFIID,void**);
+static PFN_CreateCommitted1 g_orig_CreateCommitted1{};
+static PFN_CreateCommitted2 g_orig_CreateCommitted2{};
+static PFN_CreateCommitted3 g_orig_CreateCommitted3{};
+static void StampCommittedAllocation(HRESULT hr,void** out,unsigned api){
+    if(FAILED(hr)||!out||!*out)return;
+    auto* resource=static_cast<ID3D12Resource*>(*out);
+    const auto marked=cvr::gpu::MarkResourceAllocation(resource,true);
+    static std::atomic<uint32_t> rows{};
+    const auto desc=resource->GetDesc();
+    if(desc.Width==1920&&desc.Height==1920&&rows.fetch_add(1)<12)
+        log("[allocation] committed-api=%u resource=%p mark=%08X size=%llux%u",api,resource,unsigned(marked),desc.Width,desc.Height);
+}
+static HRESULT STDMETHODCALLTYPE Hook_CreateCommitted1(ID3D12Device4* self,const D3D12_HEAP_PROPERTIES* hp,D3D12_HEAP_FLAGS flags,const D3D12_RESOURCE_DESC* desc,D3D12_RESOURCE_STATES state,const D3D12_CLEAR_VALUE* clear,ID3D12ProtectedResourceSession* protectedSession,REFIID iid,void** out){
+    const auto hr=g_orig_CreateCommitted1(self,hp,flags,desc,state,clear,protectedSession,iid,out);StampCommittedAllocation(hr,out,1);return hr;
+}
+static HRESULT STDMETHODCALLTYPE Hook_CreateCommitted2(ID3D12Device8* self,const D3D12_HEAP_PROPERTIES* hp,D3D12_HEAP_FLAGS flags,const D3D12_RESOURCE_DESC1* desc,D3D12_RESOURCE_STATES state,const D3D12_CLEAR_VALUE* clear,ID3D12ProtectedResourceSession* protectedSession,REFIID iid,void** out){
+    const auto hr=g_orig_CreateCommitted2(self,hp,flags,desc,state,clear,protectedSession,iid,out);StampCommittedAllocation(hr,out,2);return hr;
+}
+static HRESULT STDMETHODCALLTYPE Hook_CreateCommitted3(ID3D12Device10* self,const D3D12_HEAP_PROPERTIES* hp,D3D12_HEAP_FLAGS flags,const D3D12_RESOURCE_DESC1* desc,D3D12_BARRIER_LAYOUT layout,const D3D12_CLEAR_VALUE* clear,ID3D12ProtectedResourceSession* protectedSession,UINT32 formatCount,const DXGI_FORMAT* formats,REFIID iid,void** out){
+    const auto hr=g_orig_CreateCommitted3(self,hp,flags,desc,layout,clear,protectedSession,formatCount,formats,iid,out);StampCommittedAllocation(hr,out,3);return hr;
+}
+template<class Device,class Fn> static void HookCommittedAllocationMethod(ID3D12Device* base,UINT slot,Fn& original,Fn hook){
+    Microsoft::WRL::ComPtr<Device> device;
+    if(FAILED(base->QueryInterface(IID_PPV_ARGS(&device)))||!device)return;
+    auto** table=*reinterpret_cast<void***>(device.Get());
+    DWORD protection{};if(!VirtualProtect(table+slot,sizeof(void*),PAGE_READWRITE,&protection)){log("[allocation] hook failed slot=%u",slot);return;}
+    original=reinterpret_cast<Fn>(table[slot]);
+    InterlockedExchangePointer(reinterpret_cast<void* volatile*>(table+slot),reinterpret_cast<void*>(hook));
+    DWORD ignored{};VirtualProtect(table+slot,sizeof(void*),protection,&ignored);
+    log("[allocation] versioned committed resource hook slot=%u device=%p",slot,device.Get());
+}
 // buf_note moved with the census; declared in Stereo/StereoInternal.hpp.
 
 static void buf_note_created(void* out, const D3D12_RESOURCE_DESC* d) {
@@ -592,6 +693,8 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateCommittedResource(
         const D3D12_CLEAR_VALUE* cv, REFIID riid, void** out) {
     HRESULT hr = g_orig_CreateCommitted(self, hp, hf, d, st, cv, riid, out);
     if (SUCCEEDED(hr) && out && *out) {
+        if(cvr::framegen::NativeFgStereoRequested()||cvr::menu_preview::UiConsumerEnabled())cvr::gpu::MarkResourceAllocation(static_cast<ID3D12Resource*>(*out),true);
+        NameGpuObjectProvenance(static_cast<IUnknown*>(*out),L"Committed",_ReturnAddress());
         buf_note_created(*out, d);
         if (d) cvr::diagnostics::ObserveResourceCreation(static_cast<ID3D12Resource*>(*out), *d);
     }
@@ -603,6 +706,8 @@ static HRESULT STDMETHODCALLTYPE Hook_CreatePlacedResource(
         D3D12_RESOURCE_STATES st, const D3D12_CLEAR_VALUE* cv, REFIID riid, void** out) {
     HRESULT hr = g_orig_CreatePlaced(self, heap, off, d, st, cv, riid, out);
     if (SUCCEEDED(hr) && out && *out) {
+        if(cvr::framegen::NativeFgStereoRequested()||cvr::menu_preview::UiConsumerEnabled())cvr::gpu::MarkPlacedResourceAllocation(self,static_cast<ID3D12Resource*>(*out),heap,off,d);
+        NameGpuObjectProvenance(static_cast<IUnknown*>(*out),L"Placed",_ReturnAddress());
         buf_note_created(*out, d);
         if (d) cvr::diagnostics::ObserveResourceCreation(static_cast<ID3D12Resource*>(*out), *d);
     }
@@ -938,6 +1043,7 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateComputePipelineState(
         d.CS.BytecodeLength  = g_vision_cs_blob.size();
         HRESULT hr2 = g_orig_CreateComputePso(self, &d, riid, out);
         if (SUCCEEDED(hr2)) {
+            if(out&&*out)cvr::menu_preview::RecordComputeShader(reinterpret_cast<uintptr_t>(*out),d.CS);
             CVR_DIAGNOSTIC(++CyberpunkVR_DebugVisionCsSwaps);
             log("[pso] outline CS substituted (compute desc) pso=%p", out ? *out : nullptr);
             return hr2;
@@ -947,7 +1053,9 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateComputePipelineState(
         log("[pso] outline CS substitution REFUSED hr=0x%08X -- original kept",
             static_cast<unsigned>(hr2));
     }
-    return g_orig_CreateComputePso(self, desc, riid, out);
+    const auto result=g_orig_CreateComputePso(self,desc,riid,out);
+    if(SUCCEEDED(result)&&desc&&out&&*out)cvr::menu_preview::RecordComputeShader(reinterpret_cast<uintptr_t>(*out),desc->CS);
+    return result;
 }
 
 static HRESULT STDMETHODCALLTYPE Hook_CreateGraphicsPipelineState(
@@ -999,9 +1107,10 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateGraphicsPipelineState(
 // entries or it desynchronises and reads garbage.
 // Offsets of the PS and VS payloads inside the tagged stream, SIZE_MAX when absent. Kept in its
 // own function on purpose: it needs SEH, and SEH cannot share a frame with objects that unwind.
-static void pso_stream_find(const uint8_t* p, size_t len, size_t* psoff, size_t* vsoff, size_t* cacheoff=nullptr) {
+static void pso_stream_find(const uint8_t* p, size_t len, size_t* psoff, size_t* vsoff, size_t* cacheoff=nullptr,size_t* csoff=nullptr) {
     *psoff = SIZE_MAX; *vsoff = SIZE_MAX;
     if(cacheoff) *cacheoff=SIZE_MAX;
+    if(csoff) *csoff=SIZE_MAX;
     if (!p || !len) return;
     const uint8_t* base = p;
     const uint8_t* end = p + len;
@@ -1025,6 +1134,8 @@ static void pso_stream_find(const uint8_t* p, size_t len, size_t* psoff, size_t*
                     *psoff = static_cast<size_t>(payload - base);
                 else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS)
                     *vsoff = static_cast<size_t>(payload - base);
+                else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS && csoff)
+                    *csoff = static_cast<size_t>(payload - base);
                 break;
             case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE:
                 plen = sizeof(void*); break;
@@ -1070,7 +1181,7 @@ static void pso_stream_find(const uint8_t* p, size_t len, size_t* psoff, size_t*
             if (p >= end) break;
             p += (sizeof(void*) + plen + sizeof(void*) - 1) & ~(sizeof(void*) - 1);
         }
-    } __except (EXCEPTION_EXECUTE_HANDLER) { *psoff = SIZE_MAX; *vsoff = SIZE_MAX; }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { *psoff = SIZE_MAX; *vsoff = SIZE_MAX;if(csoff)*csoff=SIZE_MAX; }
 }
 
 
@@ -1134,6 +1245,7 @@ static HRESULT STDMETHODCALLTYPE Hook_CreatePipelineState(
                 nd.pPipelineStateSubobjectStream = copy.data();
                 HRESULT hrc = g_orig_CreatePso(self, &nd, riid, out);
                 if (SUCCEEDED(hrc)) {
+                    if(out&&*out)cvr::menu_preview::RecordComputeShader(reinterpret_cast<uintptr_t>(*out),ncbc);
                     CVR_DIAGNOSTIC(++CyberpunkVR_DebugVisionCsSwaps);
                     log("[pso] outline CS substituted (stream desc) pso=%p", out ? *out : nullptr);
                     return hrc;
@@ -1189,14 +1301,15 @@ static HRESULT STDMETHODCALLTYPE Hook_CreatePipelineState(
     }
     HRESULT hr = g_orig_CreatePso(self, desc, riid, out);
     if (SUCCEEDED(hr) && out && *out && desc && desc->pPipelineStateSubobjectStream) {
-        size_t psoff = SIZE_MAX, vsoff = SIZE_MAX;
+        size_t psoff = SIZE_MAX, vsoff = SIZE_MAX,csoff=SIZE_MAX;
         pso_stream_find(static_cast<const uint8_t*>(desc->pPipelineStateSubobjectStream),
-                        desc->SizeInBytes, &psoff, &vsoff);
+                        desc->SizeInBytes, &psoff, &vsoff,nullptr,&csoff);
         D3D12_SHADER_BYTECODE ps{}, vs{};
         const uint8_t* base = static_cast<const uint8_t*>(desc->pPipelineStateSubobjectStream);
         if (psoff != SIZE_MAX) ps = *reinterpret_cast<const D3D12_SHADER_BYTECODE*>(base + psoff);
         if (vsoff != SIZE_MAX) vs = *reinterpret_cast<const D3D12_SHADER_BYTECODE*>(base + vsoff);
         if (ps.pShaderBytecode || vs.pShaderBytecode) pso_ids_record(*out, ps, vs);
+        if(csoff!=SIZE_MAX)cvr::menu_preview::RecordComputeShader(reinterpret_cast<uintptr_t>(*out),*reinterpret_cast<const D3D12_SHADER_BYTECODE*>(base+csoff));
         cvr::stereo::native_probe::StreamCreated(self,*desc,static_cast<ID3D12PipelineState*>(*out));
         CVR_DIAGNOSTIC(++CyberpunkVR_DebugPsoStream);
     }
@@ -1209,6 +1322,9 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateCommandList(
         REFIID riid, void** out) {
     HRESULT hr = g_orig_CreateCommandList(
         self, node_mask, type, allocator, initial_state, riid, out);
+    if(SUCCEEDED(hr)&&out&&*out&&!cvr::gpu::RegisterNativeObject(static_cast<ID3D12CommandList*>(*out)))
+        log("[exec] native list identity registration failed list=%p",*out);
+    const void* const caller = _ReturnAddress();
     // COMPUTE as well as DIRECT. Registering only DIRECT lists left the engine's async-compute
     // list (`AsyncComputeDuringShadowmaps` in a capture) invisible to every hook here -- the
     // dispatch census, the ExecuteIndirect census, the barrier probes, all of them. That blind
@@ -1219,12 +1335,78 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateCommandList(
     // compute list simply finds the compute vtable's entry and the original is always called.
     // (A compute list has its own vtable, which is exactly why it was never patched before.)
     if (SUCCEEDED(hr) && out && *out &&
-        (type == D3D12_COMMAND_LIST_TYPE_DIRECT || type == D3D12_COMMAND_LIST_TYPE_COMPUTE))
+        (type == D3D12_COMMAND_LIST_TYPE_DIRECT || type == D3D12_COMMAND_LIST_TYPE_COMPUTE)) {
         patch_command_list_vtable(*out);
+        if(!cvr::menu_preview::EditorUiPrivateCommands()){
+            if(cvr::menu_preview::UiConsumerEnabled()&&CyberpunkVR_NativeStereoProbeState.load(std::memory_order_relaxed)!=1)
+                cvr::stereo::scene_state::Reset(reinterpret_cast<ID3D12GraphicsCommandList*>(*out));
+            cvr::menu_preview::UiPipelineState(reinterpret_cast<ID3D12GraphicsCommandList*>(*out),initial_state);
+        }
+    }
+    if (SUCCEEDED(hr) && out && *out && type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
+        CetOverlayNoteCommandListCreated(reinterpret_cast<ID3D12GraphicsCommandList*>(*out), caller);
+    }
     return hr;
 }
 
+enum class UiBeginKind {Srv,Copy};
+struct UiBeginSample {std::atomic<uint64_t> calls{},ticks{},maximum{};};
+struct UiBeginTiming {LARGE_INTEGER frequency{};std::atomic<int64_t> lastReport{};std::atomic<uint32_t> reports{};UiBeginSample srv,copy;UiBeginTiming(){QueryPerformanceFrequency(&frequency);}};
+static UiBeginTiming& UiTiming(){static auto* state=new UiBeginTiming;return *state;}
+static bool UiTimingEnabled(){static const bool enabled=[] {char value[4]{};return GetEnvironmentVariableA("CPVR_MENU_UI_TIMING",value,sizeof(value))==1&&value[0]=='1';}();return enabled;}
+static void NoteUiBegin(UiBeginKind kind,uint64_t ticks,int64_t now){
+    auto& state=UiTiming();auto& sample=kind==UiBeginKind::Srv?state.srv:state.copy;
+    sample.calls.fetch_add(1,std::memory_order_relaxed);sample.ticks.fetch_add(ticks,std::memory_order_relaxed);
+    auto maximum=sample.maximum.load(std::memory_order_relaxed);while(maximum<ticks&&!sample.maximum.compare_exchange_weak(maximum,ticks,std::memory_order_relaxed)){}
+    if(!state.frequency.QuadPart||state.reports.load(std::memory_order_relaxed)>=180)return;
+    auto previous=state.lastReport.load(std::memory_order_relaxed);
+    if(!previous){state.lastReport.compare_exchange_strong(previous,now,std::memory_order_relaxed);return;}
+    if(now-previous<state.frequency.QuadPart*10||!state.lastReport.compare_exchange_strong(previous,now,std::memory_order_relaxed))return;
+    if(state.reports.fetch_add(1,std::memory_order_relaxed)>=180)return;
+    const auto srvCalls=state.srv.calls.exchange(0),srvTicks=state.srv.ticks.exchange(0),srvMax=state.srv.maximum.exchange(0);
+    const auto copyCalls=state.copy.calls.exchange(0),copyTicks=state.copy.ticks.exchange(0),copyMax=state.copy.maximum.exchange(0);
+    const auto scope=cvr::menu_preview::UiConsumerTimingScope();
+    Log("[MenuPreviewUI] ui-begin-timing intervalMs=%llu scope=%u activeAlias=%u worldOrNoPreview=%u srvCalls=%llu srvTotalTicks=%llu srvMaxTicks=%llu copyCalls=%llu copyTotalTicks=%llu copyMaxTicks=%llu qpcFrequency=%lld; Begin-only QPC, original D3D12 call excluded\n",uint64_t((now-previous)*1000/state.frequency.QuadPart),scope,unsigned(scope==2),unsigned(scope==0),srvCalls,srvTicks,srvMax,copyCalls,copyTicks,copyMax,state.frequency.QuadPart);
+}
+template<class F> static auto TimedUiBegin(UiBeginKind kind,F&& begin){
+    LARGE_INTEGER start{},end{};bool timed=false;
+    try{timed=UiTimingEnabled()&&QueryPerformanceCounter(&start);}catch(...){timed=false;}
+    auto token=begin(); // The original observer runs exactly once; its exception policy is unchanged.
+    if(timed)try{if(QueryPerformanceCounter(&end))NoteUiBegin(kind,uint64_t(end.QuadPart-start.QuadPart),end.QuadPart);}catch(...){/* Diagnostics cannot interrupt the native call chain. */}
+    return token;
+}
+using PreviewCopyDescriptorsFn=void (STDMETHODCALLTYPE*)(ID3D12Device*,UINT,const D3D12_CPU_DESCRIPTOR_HANDLE*,const UINT*,UINT,const D3D12_CPU_DESCRIPTOR_HANDLE*,const UINT*,D3D12_DESCRIPTOR_HEAP_TYPE);
+using PreviewCopySimpleFn=void (STDMETHODCALLTYPE*)(ID3D12Device*,UINT,D3D12_CPU_DESCRIPTOR_HANDLE,D3D12_CPU_DESCRIPTOR_HANDLE,D3D12_DESCRIPTOR_HEAP_TYPE);
+static PreviewCopyDescriptorsFn previewCopyOriginal{};
+static PreviewCopySimpleFn previewCopySimpleOriginal{};
+static void STDMETHODCALLTYPE PreviewCopyDescriptors(ID3D12Device* self,UINT destinations,const D3D12_CPU_DESCRIPTOR_HANDLE* destinationStarts,const UINT* destinationSizes,UINT sources,const D3D12_CPU_DESCRIPTOR_HANDLE* sourceStarts,const UINT* sourceSizes,D3D12_DESCRIPTOR_HEAP_TYPE type){
+    const auto token=cvr::menu_preview::BeginPreviewDescriptorCopies(self,destinations,destinationStarts,destinationSizes,type);
+    const auto uiToken=TimedUiBegin(UiBeginKind::Copy,[&]{return cvr::menu_preview::BeginUiDescriptorCopy(self,destinations,destinationStarts,destinationSizes,sources,sourceStarts,sourceSizes,type);});
+    previewCopyOriginal(self,destinations,destinationStarts,destinationSizes,sources,sourceStarts,sourceSizes,type);
+    cvr::menu_preview::FinishUiDescriptorCopy(uiToken);
+    cvr::menu_preview::FinishPreviewDescriptorCopies(token);
+}
+static void STDMETHODCALLTYPE PreviewCopyDescriptorsSimple(ID3D12Device* self,UINT count,D3D12_CPU_DESCRIPTOR_HANDLE destination,D3D12_CPU_DESCRIPTOR_HANDLE source,D3D12_DESCRIPTOR_HEAP_TYPE type){
+    const auto token=cvr::menu_preview::BeginPreviewDescriptorCopies(self,1,&destination,&count,type);
+    const auto uiToken=TimedUiBegin(UiBeginKind::Copy,[&]{return cvr::menu_preview::BeginUiDescriptorCopy(self,1,&destination,&count,1,&source,&count,type);});
+    previewCopySimpleOriginal(self,count,destination,source,type);
+    cvr::menu_preview::FinishUiDescriptorCopy(uiToken);
+    cvr::menu_preview::FinishPreviewDescriptorCopies(token);
+}
+using UiCreateSrvFn=void(STDMETHODCALLTYPE*)(ID3D12Device*,ID3D12Resource*,const D3D12_SHADER_RESOURCE_VIEW_DESC*,D3D12_CPU_DESCRIPTOR_HANDLE);
+using UiCreateUavFn=void(STDMETHODCALLTYPE*)(ID3D12Device*,ID3D12Resource*,ID3D12Resource*,const D3D12_UNORDERED_ACCESS_VIEW_DESC*,D3D12_CPU_DESCRIPTOR_HANDLE);
+static UiCreateSrvFn uiCreateSrvOriginal{};static UiCreateUavFn uiCreateUavOriginal{};
+static void STDMETHODCALLTYPE UiCreateSrv(ID3D12Device* device,ID3D12Resource* resource,const D3D12_SHADER_RESOURCE_VIEW_DESC* desc,D3D12_CPU_DESCRIPTOR_HANDLE handle){
+    const auto token=TimedUiBegin(UiBeginKind::Srv,[&]{return cvr::menu_preview::BeginUiSrvWrite(handle);});uiCreateSrvOriginal(device,resource,desc,handle);
+    cvr::menu_preview::FinishUiSrvWrite(token,resource,handle);
+}
+static void STDMETHODCALLTYPE UiCreateUav(ID3D12Device* device,ID3D12Resource* resource,ID3D12Resource* counter,const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc,D3D12_CPU_DESCRIPTOR_HANDLE handle){
+    const auto token=cvr::menu_preview::BeginUiSrvWrite(handle);uiCreateUavOriginal(device,resource,counter,desc,handle);
+    cvr::menu_preview::FinishUiSrvWrite(token,resource,handle,true);
+}
 void patch_device_descriptor_slot(void* device) {
+    if(device&&!cvr::gpu::RegisterNativeObject(static_cast<ID3D12Device*>(device)))
+        log("[exec] native device identity registration failed device=%p",device);
     if (!device) return;
     bool expected = false;
     if (!g_desc_vtable_patched.compare_exchange_strong(expected, true)) return;
@@ -1242,6 +1424,24 @@ void patch_device_descriptor_slot(void* device) {
     } else {
         g_desc_vtable_patched.store(false, std::memory_order_release);
         log("[descheap] FAILED to patch device vtable slot 14");
+    }
+    if(cvr::menu_preview::PreviewMetadataRequested()){
+        DWORD protection{};if(VirtualProtect(vt+23,2*sizeof(void*),PAGE_READWRITE,&protection)){
+            previewCopyOriginal=reinterpret_cast<PreviewCopyDescriptorsFn>(vt[23]);
+            previewCopySimpleOriginal=reinterpret_cast<PreviewCopySimpleFn>(vt[24]);
+            InterlockedExchangePointer(reinterpret_cast<void* volatile*>(vt+23),reinterpret_cast<void*>(&PreviewCopyDescriptors));
+            InterlockedExchangePointer(reinterpret_cast<void* volatile*>(vt+24),reinterpret_cast<void*>(&PreviewCopyDescriptorsSimple));
+            DWORD ignored{};VirtualProtect(vt+23,2*sizeof(void*),protection,&ignored);
+        }else cvr::menu_preview::BeginPreviewDescriptorCopies(reinterpret_cast<ID3D12Device*>(device),1,nullptr,nullptr,D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    }
+    if(cvr::menu_preview::UiStereoRequested()){
+        DWORD protection{};
+        if(VirtualProtect(vt+18,2*sizeof(void*),PAGE_READWRITE,&protection)){
+            uiCreateSrvOriginal=reinterpret_cast<UiCreateSrvFn>(vt[18]);uiCreateUavOriginal=reinterpret_cast<UiCreateUavFn>(vt[19]);
+            InterlockedExchangePointer(reinterpret_cast<void* volatile*>(vt+18),reinterpret_cast<void*>(&UiCreateSrv));
+            InterlockedExchangePointer(reinterpret_cast<void* volatile*>(vt+19),reinterpret_cast<void*>(&UiCreateUav));
+            DWORD ignored{};VirtualProtect(vt+18,2*sizeof(void*),protection,&ignored);
+        }
     }
     // ID3D12Device slot 8 = CreateCommandQueue (capture queues -> hook execute).
     if (g_enable_exec_probe) {
@@ -1283,6 +1483,13 @@ void patch_device_descriptor_slot(void* device) {
         DWORD junk = 0; VirtualProtect(&vt[slot], sizeof(void*), oldp, &junk);
     }
     log("[sightaxis] buffer-address map hooked dev=%p", device);
+    if(cvr::menu_preview::UiConsumerEnabled()){
+        // Interface version is queried before accessing its documented appended slots.
+        auto* base=static_cast<ID3D12Device*>(device);
+        HookCommittedAllocationMethod<ID3D12Device4>(base,53,g_orig_CreateCommitted1,&Hook_CreateCommitted1);
+        HookCommittedAllocationMethod<ID3D12Device8>(base,69,g_orig_CreateCommitted2,&Hook_CreateCommitted2);
+        HookCommittedAllocationMethod<ID3D12Device10>(base,76,g_orig_CreateCommitted3,&Hook_CreateCommitted3);
+    }
     DWORD o16 = 0;
     if (VirtualProtect(&vt[16], sizeof(void*), PAGE_READWRITE, &o16)) {
         g_orig_CreateRootSig = reinterpret_cast<PFN_CreateRootSignature>(vt[16]);
@@ -1347,3 +1554,158 @@ void patch_device_descriptor_slot(void* device) {
 
 }  // namespace detail
 }  // namespace cvr
+
+namespace cvr::menu_preview {
+bool ResolveComputeLocations(uintptr_t root,const ComputeShaderEvidence& shader,std::array<ComputeLocation,24>& out,uint32_t& count)noexcept {
+    out={};count=0;
+    if(!shader.bindingsKnown||shader.srvBindingCount>shader.srvBindings.size()||shader.uavBindingCount>shader.uavBindings.size())return false;
+    try {
+        std::vector<uint8_t> blob;
+        {std::lock_guard lock(detail::g_rootsig_mtx);const auto found=detail::g_rootsig_blobs.find(reinterpret_cast<void*>(root));if(found==detail::g_rootsig_blobs.end())return false;blob=found->second;}
+        Microsoft::WRL::ComPtr<ID3D12VersionedRootSignatureDeserializer> deserializer;
+        if(FAILED(D3D12CreateVersionedRootSignatureDeserializer(blob.data(),blob.size(),IID_PPV_ARGS(&deserializer))))return false;
+        const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc{};
+        if(FAILED(deserializer->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1,&desc))||!desc||desc->Desc_1_1.NumParameters>64)return false;
+        std::array<ComputeLocation,24> resolved{};uint32_t used{};
+        const auto bindings=shader.srvBindingCount+shader.uavBindingCount;
+        for(uint32_t s=0;s<bindings;++s){const bool uav=s>=shader.srvBindingCount;
+            const auto& binding=uav?shader.uavBindings[s-shader.srvBindingCount]:shader.srvBindings[s];
+            if(binding.resourceKind!=2||binding.firstRegister!=binding.lastRegister)continue;
+            bool matched=false;ComputeLocation location;
+            for(UINT r=0;r<desc->Desc_1_1.NumParameters;++r){const auto& parameter=desc->Desc_1_1.pParameters[r];
+                if(parameter.ParameterType!=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE||parameter.ShaderVisibility!=D3D12_SHADER_VISIBILITY_ALL)continue;
+                uint64_t next{};
+                for(UINT i=0;i<parameter.DescriptorTable.NumDescriptorRanges;++i){const auto& range=parameter.DescriptorTable.pDescriptorRanges[i];
+                    const uint64_t offset=range.OffsetInDescriptorsFromTableStart==D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND?next:range.OffsetInDescriptorsFromTableStart;next=offset+range.NumDescriptors;
+                    if(range.RangeType!=(uav?D3D12_DESCRIPTOR_RANGE_TYPE_UAV:D3D12_DESCRIPTOR_RANGE_TYPE_SRV)||range.RegisterSpace!=binding.registerSpace||binding.firstRegister<range.BaseShaderRegister)continue;
+                    const uint64_t relative=uint64_t(binding.firstRegister)-range.BaseShaderRegister;if(relative>=range.NumDescriptors)continue;
+                    if(matched||offset+relative>UINT32_MAX)return false;matched=true;location={r,uint32_t(offset+relative),uav};
+                }
+            }
+            if(!matched||used==resolved.size())return false;resolved[used++]=location;
+        }
+        out=resolved;count=used;return true;
+    }catch(...){return false;}
+}
+bool ResolvePixelSrvLocations(uintptr_t root,const PipelineShaderEvidence& shader,std::array<ShaderSrvLocation,16>& out,uint32_t& count)noexcept {
+    out={};count=0;
+    if(!shader.srvBindingsKnown||shader.srvBindingCount>shader.srvBindings.size())return false;
+    try {
+        std::vector<uint8_t> blob;
+        {std::lock_guard lock(detail::g_rootsig_mtx);const auto found=detail::g_rootsig_blobs.find(reinterpret_cast<void*>(root));if(found==detail::g_rootsig_blobs.end())return false;blob=found->second;}
+        Microsoft::WRL::ComPtr<ID3D12VersionedRootSignatureDeserializer> deserializer;
+        if(FAILED(D3D12CreateVersionedRootSignatureDeserializer(blob.data(),blob.size(),IID_PPV_ARGS(&deserializer))))return false;
+        const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc{};
+        if(FAILED(deserializer->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1,&desc))||!desc||desc->Desc_1_1.NumParameters>64)return false;
+        for(uint32_t s=0;s<shader.srvBindingCount;++s){const auto& binding=shader.srvBindings[s];
+            if(binding.resourceKind!=2||binding.firstRegister!=binding.lastRegister)continue;
+            bool matched=false;ShaderSrvLocation location;
+            for(UINT r=0;r<desc->Desc_1_1.NumParameters;++r){const auto& parameter=desc->Desc_1_1.pParameters[r];
+                if(parameter.ParameterType!=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE||(parameter.ShaderVisibility!=D3D12_SHADER_VISIBILITY_PIXEL&&parameter.ShaderVisibility!=D3D12_SHADER_VISIBILITY_ALL))continue;
+                uint64_t next{};
+                for(UINT i=0;i<parameter.DescriptorTable.NumDescriptorRanges;++i){const auto& range=parameter.DescriptorTable.pDescriptorRanges[i];
+                    const uint64_t offset=range.OffsetInDescriptorsFromTableStart==D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND?next:range.OffsetInDescriptorsFromTableStart;next=offset+range.NumDescriptors;
+                    if(range.RangeType!=D3D12_DESCRIPTOR_RANGE_TYPE_SRV||range.RegisterSpace!=binding.registerSpace||binding.firstRegister<range.BaseShaderRegister)continue;
+                    const uint64_t relative=uint64_t(binding.firstRegister)-range.BaseShaderRegister;if(relative>=range.NumDescriptors)continue;
+                    if(matched||offset+relative>UINT32_MAX)return false;matched=true;location={r,uint32_t(offset+relative)};
+                }
+            }
+            if(!matched)return false;if(count==out.size())return false;out[count++]=location;
+        }
+        return true;
+    }catch(...) {out={};count=0;return false;}
+}
+bool ResolveVertexConstantLocation(uintptr_t root,uint32_t shaderRegister,uint32_t registerSpace,VertexConstantLocation& out)noexcept {
+    out={};
+    try {
+        std::vector<uint8_t> blob;
+        {std::lock_guard lock(detail::g_rootsig_mtx);const auto found=detail::g_rootsig_blobs.find(reinterpret_cast<void*>(root));if(found==detail::g_rootsig_blobs.end())return false;blob=found->second;}
+        Microsoft::WRL::ComPtr<ID3D12VersionedRootSignatureDeserializer> deserializer;
+        if(FAILED(D3D12CreateVersionedRootSignatureDeserializer(blob.data(),blob.size(),IID_PPV_ARGS(&deserializer))))return false;
+        const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc{};
+        if(FAILED(deserializer->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1,&desc))||!desc||desc->Desc_1_1.NumParameters>64||
+           (desc->Desc_1_1.Flags&D3D12_ROOT_SIGNATURE_FLAG_DENY_VERTEX_SHADER_ROOT_ACCESS))return false;
+        VertexConstantLocation resolved;bool matched=false;
+        for(UINT index=0;index<desc->Desc_1_1.NumParameters;++index){const auto& parameter=desc->Desc_1_1.pParameters[index];
+            if(parameter.ShaderVisibility!=D3D12_SHADER_VISIBILITY_ALL&&parameter.ShaderVisibility!=D3D12_SHADER_VISIBILITY_VERTEX)continue;
+            if(parameter.ParameterType==D3D12_ROOT_PARAMETER_TYPE_CBV&&parameter.Descriptor.ShaderRegister==shaderRegister&&parameter.Descriptor.RegisterSpace==registerSpace){
+                if(matched)return false;matched=true;resolved={index,0,false};
+            }else if(parameter.ParameterType==D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS&&parameter.Constants.ShaderRegister==shaderRegister&&parameter.Constants.RegisterSpace==registerSpace)return false;
+            else if(parameter.ParameterType==D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE){uint64_t next{};
+                for(UINT r=0;r<parameter.DescriptorTable.NumDescriptorRanges;++r){const auto& range=parameter.DescriptorTable.pDescriptorRanges[r];
+                    const uint64_t offset=range.OffsetInDescriptorsFromTableStart==D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND?next:range.OffsetInDescriptorsFromTableStart;
+                    if(offset>UINT64_MAX-range.NumDescriptors)return false;next=offset+range.NumDescriptors;
+                    if(range.RangeType!=D3D12_DESCRIPTOR_RANGE_TYPE_CBV||range.RegisterSpace!=registerSpace||shaderRegister<range.BaseShaderRegister)continue;
+                    const uint64_t relative=uint64_t(shaderRegister)-range.BaseShaderRegister;
+                    if(relative>=range.NumDescriptors)continue;
+                    if(matched||offset>UINT32_MAX||relative>UINT32_MAX-offset)return false;
+                    matched=true;resolved={index,offset+relative,true};
+                }
+            }
+        }
+        if(!matched)return false;out=resolved;return true;
+    }catch(...){return false;}
+}
+bool ResolveVertexConstantRoot(uintptr_t root,uint32_t shaderRegister,uint32_t registerSpace,uint32_t& rootIndex)noexcept {
+    rootIndex=UINT32_MAX;
+    try {
+        std::vector<uint8_t> blob;
+        {std::lock_guard lock(detail::g_rootsig_mtx);const auto found=detail::g_rootsig_blobs.find(reinterpret_cast<void*>(root));if(found==detail::g_rootsig_blobs.end())return false;blob=found->second;}
+        Microsoft::WRL::ComPtr<ID3D12VersionedRootSignatureDeserializer> deserializer;
+        if(FAILED(D3D12CreateVersionedRootSignatureDeserializer(blob.data(),blob.size(),IID_PPV_ARGS(&deserializer))))return false;
+        const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc{};
+        if(FAILED(deserializer->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1,&desc))||!desc||desc->Desc_1_1.NumParameters>64||
+           (desc->Desc_1_1.Flags&D3D12_ROOT_SIGNATURE_FLAG_DENY_VERTEX_SHADER_ROOT_ACCESS))return false;
+        uint32_t resolved=UINT32_MAX;
+        for(UINT index=0;index<desc->Desc_1_1.NumParameters;++index){const auto& parameter=desc->Desc_1_1.pParameters[index];
+            if(parameter.ShaderVisibility!=D3D12_SHADER_VISIBILITY_ALL&&parameter.ShaderVisibility!=D3D12_SHADER_VISIBILITY_VERTEX)continue;
+            if(parameter.ParameterType==D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE){
+                for(UINT rangeIndex=0;rangeIndex<parameter.DescriptorTable.NumDescriptorRanges;++rangeIndex){const auto& range=parameter.DescriptorTable.pDescriptorRanges[rangeIndex];
+                    if(range.RangeType==D3D12_DESCRIPTOR_RANGE_TYPE_CBV&&range.RegisterSpace==registerSpace&&shaderRegister>=range.BaseShaderRegister&&
+                       uint64_t(shaderRegister)-range.BaseShaderRegister<range.NumDescriptors)return false;
+                }
+                continue;
+            }
+            if(parameter.ParameterType!=D3D12_ROOT_PARAMETER_TYPE_CBV||parameter.Descriptor.ShaderRegister!=shaderRegister||parameter.Descriptor.RegisterSpace!=registerSpace)continue;
+            if(resolved!=UINT32_MAX)return false;
+            resolved=index;
+        }
+        if(resolved==UINT32_MAX)return false;
+        rootIndex=resolved;return true;
+    }catch(...){return false;}
+}
+bool ResolveRootDescriptor(uintptr_t root,uint32_t rootIndex,uint64_t descriptorOffset,RootDescriptorEvidence& out)noexcept {
+    out={};
+    try {
+        std::vector<uint8_t> blob;
+        {
+            std::lock_guard lock(detail::g_rootsig_mtx);
+            const auto found=detail::g_rootsig_blobs.find(reinterpret_cast<void*>(root));
+            if(found==detail::g_rootsig_blobs.end())return false;
+            blob=found->second;
+        }
+        Microsoft::WRL::ComPtr<ID3D12VersionedRootSignatureDeserializer> deserializer;
+        if(FAILED(D3D12CreateVersionedRootSignatureDeserializer(blob.data(),blob.size(),IID_PPV_ARGS(&deserializer))))return false;
+        const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc{};
+        if(FAILED(deserializer->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1,&desc))||!desc||rootIndex>=desc->Desc_1_1.NumParameters)return false;
+        const auto& parameter=desc->Desc_1_1.pParameters[rootIndex];
+        if(parameter.ParameterType!=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)return false;
+        uint64_t nextOffset{};bool matched=false;RootDescriptorEvidence resolved;
+        for(UINT index=0;index<parameter.DescriptorTable.NumDescriptorRanges;++index){
+            const auto& range=parameter.DescriptorTable.pDescriptorRanges[index];
+            const uint64_t offset=range.OffsetInDescriptorsFromTableStart==D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND?nextOffset:range.OffsetInDescriptorsFromTableStart;
+            nextOffset=offset+range.NumDescriptors;
+            if(descriptorOffset<offset||descriptorOffset-offset>=range.NumDescriptors)continue;
+            const uint64_t shaderRegister=uint64_t(range.BaseShaderRegister)+descriptorOffset-offset;
+            // Aliased table offsets can name more than one shader register.
+            // Do not report an arbitrary first range as a unique resolution.
+            if(shaderRegister>UINT32_MAX||matched)return false;
+            resolved={parameter.ShaderVisibility,range.RangeType,index,range.BaseShaderRegister,uint32_t(shaderRegister),range.RegisterSpace,range.NumDescriptors,range.OffsetInDescriptorsFromTableStart,offset};
+            matched=true;
+        }
+        if(matched){out=resolved;return true;}
+    }catch(...){}
+    return false;
+}
+}
+#include "MenuPreview/EditorUiSurface.hpp"

@@ -73,12 +73,19 @@ void RecordImagePose(ID3D12GraphicsCommandList* list,ID3D12Resource* resource,co
     s_images->Record(reinterpret_cast<uintptr_t>(list),reinterpret_cast<uintptr_t>(resource),pose,stable);
     if(pose.view>=1 && pose.view<=2)CVR_DIAGNOSTIC(CyberpunkVR_PoseIdImageWrites[pose.view-1].fetch_add(1,std::memory_order_relaxed));
 }
-void CommitImagePoseLists(ID3D12CommandQueue* queue,UINT count,ID3D12CommandList* const* lists) {
-    if(!queue || !lists)return;
-    for(UINT i=0;i<count;++i)s_images->Submit(reinterpret_cast<uintptr_t>(queue),reinterpret_cast<uintptr_t>(lists[i]),GetTickCount64());
+ImagePoseSubmission PrepareImagePoseLists(ID3D12CommandQueue* queue,UINT count,
+                                         ID3D12CommandList* const* lists) noexcept {
+    if(!queue || (count && !lists)){s_images->InvalidatePublished();return {};}
+    return s_images->Prepare(reinterpret_cast<uintptr_t>(queue),count,[&](size_t i){
+        return reinterpret_cast<uintptr_t>(lists[i]);
+    });
+}
+void CommitImagePoseLists(ID3D12CommandQueue* queue,ImagePoseSubmission&& submission) noexcept {
+    s_images->Commit(reinterpret_cast<uintptr_t>(queue),std::move(submission),GetTickCount64());
 }
 ImagePoseIdentity ReadImagePose(ID3D12Resource* resource) { return s_images->Read(reinterpret_cast<uintptr_t>(resource)); }
+ImagePoseIdentity LatestSubmittedVrcamImageIdentity() { return s_images->LatestStable(); }
 ID3D12Resource* LatestSubmittedVrcamImage() {
-    return reinterpret_cast<ID3D12Resource*>(s_images->LatestStable().resource);
+    return reinterpret_cast<ID3D12Resource*>(LatestSubmittedVrcamImageIdentity().resource);
 }
 }

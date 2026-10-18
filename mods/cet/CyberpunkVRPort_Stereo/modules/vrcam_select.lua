@@ -13,6 +13,8 @@
 -- here: CET sandboxes Lua file IO to the mod folder, so this side cannot reach out, while the
 -- native side can and does.
 
+local previewOk, MenuPreview = pcall(require, "modules/menu_preview")
+
 local VrcamSelect = {
     selected     = nil,     -- component name from vrcam.json
     want         = true,    -- false once the overlay asks for VRCAM off
@@ -27,6 +29,11 @@ local VrcamSelect = {
     prevId       = nil,
     onBdReplacer = false,   -- the live player is the braindance replacer
     loadingActive = false,
+    aerToken = 0,
+    aerPreviousOff = true,
+    aerPendingOff = {},
+    aerPendingOverflow = false,
+    aerWorld = 0,
 }
 
 local RETRY_TICKS = 30      -- ~150 ms @ 200 fps; the player is not there during load
@@ -105,6 +112,56 @@ local function setEnabled(comp, want)
     return false, "no way to toggle"
 end
 
+-- AER activation needs observed component state, not a successful file write or
+-- the desired UI checkbox. Int32 native tokens are scoped to a world/resize.
+local function aerRequest()
+    local ok, token = pcall(function() return Game.GetVRAerVrcamOffRequest() end)
+    if ok and type(token) == "number" and token > 0 then return token end
+    return 0
+end
+
+local function verifyAllOff(ent)
+    if not ent then return 0, false end
+    local ok, comps = safeCall(ent, "GetComponents")
+    if not ok or not comps then return 0, false end
+    local count, verified = 0, true
+    local lengthOk, n = pcall(function() return #comps end)
+    if not lengthOk then return 0, false end
+    for i = 1, n do
+        local c = comps[i]
+        local nm = c and cnameToString(c.name) or nil
+        if nm and nm:sub(1, #NAME_PREFIX) == NAME_PREFIX then
+            count = count + 1
+            local readOk, enabled = pcall(function() return c.isEnabled end)
+            if not readOk or enabled ~= false then verified = false end
+        end
+    end
+    return count, verified
+end
+
+local function reportAerOff(player, token)
+    if token <= 0 then return end
+    -- A Toggle/readback may finish after this tick. Retain a bounded set of
+    -- previous entity handles until their cameras are actually observed off.
+    for i = #VrcamSelect.aerPendingOff, 1, -1 do
+        local old = VrcamSelect.aerPendingOff[i]
+        local ok, comps = safeCall(old.entity, "GetComponents")
+        if ok and comps then
+            local lengthOk, n = pcall(function() return #comps end)
+            if lengthOk then for j = 1, n do
+                local c = comps[j]
+                local name = c and cnameToString(c.name) or nil
+                if name and name:sub(1, #NAME_PREFIX) == NAME_PREFIX then setEnabled(c, false) end
+            end end
+        end
+        local _, off = verifyAllOff(old.entity)
+        if off then table.remove(VrcamSelect.aerPendingOff, i) end
+    end
+    VrcamSelect.aerPreviousOff = #VrcamSelect.aerPendingOff == 0 and not VrcamSelect.aerPendingOverflow
+    local seen, off = verifyAllOff(player)
+    pcall(function() Game.ConfirmVRAerVrcamOff(token, seen, seen > 0 and off and VrcamSelect.aerPreviousOff) end)
+end
+
 -- Turn every vrcam_* off on an entity we are walking away from. Two enabled render-to-texture
 -- cameras share one feed, and that is the flicker: the parked entity's transform lands in the same
 -- place ours does, every other frame.
@@ -160,6 +217,16 @@ local function apply(player, wanted, want_on)
     pcall(function() id = tostring(player:GetEntityID().hash) end)
     if id ~= nil and VrcamSelect.prevId ~= nil and id ~= VrcamSelect.prevId then
         local off = releaseEntity(VrcamSelect.prevPlayer)
+        local _, previousOff = verifyAllOff(VrcamSelect.prevPlayer)
+        if not previousOff then
+            local stored = false
+            for _, old in ipairs(VrcamSelect.aerPendingOff) do if old.id == VrcamSelect.prevId then stored = true end end
+            if not stored then
+                if #VrcamSelect.aerPendingOff < 4 then
+                    table.insert(VrcamSelect.aerPendingOff, {entity=VrcamSelect.prevPlayer, id=VrcamSelect.prevId})
+                else VrcamSelect.aerPendingOverflow = true end
+            end
+        end
         print(string.format("[Stereo.VRCAM] player changed (%s -> %s): %d component(s) released",
                             tostring(VrcamSelect.prevId), tostring(id), off))
     end
@@ -270,10 +337,29 @@ end
 
 function VrcamSelect.tick(dt)
     local player = Game.GetPlayer and Game.GetPlayer() or nil
+    local token = aerRequest()
+    local worldOk, world = pcall(function() return Game.GetVRAerWorldGeneration() end)
+    if worldOk and type(world) == "number" and world > 0 and world ~= VrcamSelect.aerWorld then
+        -- Native world detach/attach is stronger evidence than a resize/token
+        -- change. Old-world components cannot own this world's eye resources.
+        VrcamSelect.aerWorld = world
+        VrcamSelect.aerPendingOff = {}
+        VrcamSelect.aerPendingOverflow = false
+        VrcamSelect.aerPreviousOff = true
+        VrcamSelect.prevPlayer, VrcamSelect.prevId = nil, nil
+        VrcamSelect.appliedName, VrcamSelect.appliedWant, VrcamSelect.appliedId = nil, nil, nil
+        VrcamSelect.ticksToRetry = 0
+    end
+    if token ~= VrcamSelect.aerToken then
+        VrcamSelect.aerToken = token
+        VrcamSelect.appliedWant = nil
+        VrcamSelect.ticksToRetry = 0
+    end
     local okSession,preGame=pcall(preGameActive)
     local okLoading,loading=pcall(loadingScreenActive)
     if not okLoading then loading=VrcamSelect.loadingActive end
     if not okSession or preGame or loading then
+        if token > 0 then pcall(function() Game.ConfirmVRAerVrcamOff(token, 0, false) end) end
         if not VrcamSelect.loadingActive then
             -- A player can exist throughout save replacement, and the new
             -- player may reuse its EntityID. Release the previous entity and
@@ -315,6 +401,13 @@ function VrcamSelect.tick(dt)
 
     local req = readEnableRequest()
     if req ~= nil then VrcamSelect.want = req end
+    -- Preserve the user's paired-mode preference. AER temporarily owns the
+    -- second-view disable, and returning to paired mode restores that preference.
+    local editorOk, editorOwns = pcall(function()
+        return previewOk and MenuPreview.ownsAppearanceStereo and MenuPreview.ownsAppearanceStereo()
+    end)
+    -- Only the authored player VRCAM is suspended; native appearance RTT is independent.
+    local effectiveWant = VrcamSelect.want and token == 0 and not (editorOk and editorOwns == true)
 
     -- Re-apply only when the DESIRED state changed. The old guard compared tostring(player),
     -- but CET hands out a fresh wrapper on every Game.GetPlayer() call, so that string differed
@@ -329,16 +422,18 @@ function VrcamSelect.tick(dt)
     local id = nil
     pcall(function() id = tostring(player:GetEntityID().hash) end)
     if VrcamSelect.appliedName == VrcamSelect.selected and
-       VrcamSelect.appliedWant == VrcamSelect.want and
+       VrcamSelect.appliedWant == effectiveWant and
        VrcamSelect.appliedId == id then
+        reportAerOff(player, token)
         return
     end
 
-    if apply(player, VrcamSelect.selected, VrcamSelect.want) then
+    if apply(player, VrcamSelect.selected, effectiveWant) then
         VrcamSelect.appliedName = VrcamSelect.selected
-        VrcamSelect.appliedWant = VrcamSelect.want
+        VrcamSelect.appliedWant = effectiveWant
         VrcamSelect.appliedId   = id
     end
+    reportAerOff(player, token)
 end
 
 function VrcamSelect.status()

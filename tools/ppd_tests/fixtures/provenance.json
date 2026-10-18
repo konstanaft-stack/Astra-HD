@@ -1,0 +1,18 @@
+{
+  "archive_sha256": "EDED1057AA7DF6E8DA31CB77F9BF06ABC7B06B675F852C8FF3E2AEFB7D31445C",
+  "exporter": "WolvenKit 9.0.1 convert serialize",
+  "fixtures": [
+    {
+      "fixture": "player_ma_fpp.ent.json.gz",
+      "source_json_sha256": "C8B394D992CCE1A172292AF9ED6EE200A44BEA4C105ACA4E8946A9E57DB4D5AA",
+      "bytes_uncompressed": 2157349,
+      "source": "<WORKSPACE_ROOT>\\research\\2026-09-30-cpvr-open-nvidia\\audit\\tofu-ppd-20261003\\asset-smoke\\entity-json\\player_ma_fpp.ent.json"
+    },
+    {
+      "fixture": "player_wa_fpp_ep1.ent.json.gz",
+      "source_json_sha256": "7C9ADA2686704BF30D1D919838EDA046552EF45412D371A8FD8D646F74F8A212",
+      "bytes_uncompressed": 2303079,
+      "source": "<WORKSPACE_ROOT>\\research\\2026-09-30-cpvr-open-nvidia\\audit\\tofu-ppd-20261003\\asset-smoke\\entity-json\\player_wa_fpp_ep1.ent.json"
+    }
+  ]
+}

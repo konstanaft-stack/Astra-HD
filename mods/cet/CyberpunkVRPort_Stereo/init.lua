@@ -22,8 +22,11 @@ local HudPanel = require("modules/hud_panel")
 local VrOverlay = require("modules/vr_overlay")
 local KeypadInput = require("modules/keypad_input")
 local StoryAttention = require("modules/story_attention")
+local GameGeneration = require("modules/game_generation")
+local MenuPreview = require("modules/menu_preview")
 
 local Stereo = { ready = false, VrcamSel = VrcamSel, HudPanel = HudPanel, VrOverlay = VrOverlay, KeypadInput = KeypadInput, StoryAttention = StoryAttention }
+Stereo.GetMenuPreviewState = MenuPreview.getState
 
 -- Bind in CET > Bindings if vrcam.json was edited by hand.
 registerHotkey("vrcam_reload_selection", "VRCAM: re-read vrcam.json", function()
@@ -32,14 +35,18 @@ registerHotkey("vrcam_reload_selection", "VRCAM: re-read vrcam.json", function()
 end)
 
 registerForEvent("onInit", function()
+    MenuPreview.init()
     VrcamSel.init()
     Stereo.ready = true
+    GameGeneration.sample()
     print("[Stereo] " .. VrcamSel.status())
 
 end)
 
 registerForEvent("onUpdate", function(dt)
     if not Stereo.ready then return end
+    GameGeneration.tick(dt)
+    MenuPreview.tick(dt)
     VrcamSel.tick(dt)
     HudPanel.tick()
     VrOverlay.tick()
@@ -47,6 +54,20 @@ registerForEvent("onUpdate", function(dt)
     StoryAttention.tick(dt, VrOverlay.active)
 end)
 
-registerForEvent("onShutdown", function() StoryAttention.shutdown();KeypadInput.shutdown();VrOverlay.shutdown();HudPanel.shutdown() end)
+registerForEvent("onShutdown", function()
+    MenuPreview.shutdown()
+    GameGeneration.shutdown()
+    SetVRCetOverlayVisible(0)
+    StoryAttention.shutdown();KeypadInput.shutdown();VrOverlay.shutdown();HudPanel.shutdown()
+end)
+
+registerForEvent("onOverlayOpen", function()
+    GameGeneration.sample()
+    SetVRCetOverlayVisible(1)
+end)
+
+registerForEvent("onOverlayClose", function()
+    SetVRCetOverlayVisible(0)
+end)
 
 return Stereo

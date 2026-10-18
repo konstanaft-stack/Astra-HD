@@ -15,10 +15,14 @@
 
 #include <MinHook.h>
 #include "Hooks/SwapChainInternal.hpp"
+#include "Render/DesktopMirror.hpp"
+#include <algorithm>
+#include <cmath>
 #include <thread>
 #include "Hooks/SwapChain.hpp"
 #include "Overlay/ImGuiOverlay.hpp"
 #include "Overlay/LauncherDialog.hpp"
+#include "Overlay/PpdNativeApply.hpp"
 #include "Hooks/Ngx.hpp"
 #include <cstdint>
 #include <cstdio>
@@ -147,6 +151,360 @@ static GetSystemMetricsFn g_origGetSystemMetrics = nullptr;
 static GetMessagePosFn g_origGetMessagePos = nullptr;
 HWND g_gameHwnd = nullptr;
 
+static std::atomic<bool> g_cetVirtualCursorActive{false};
+static std::atomic<bool> g_cetVirtualCursorValid{false};
+static std::atomic<LONG> g_cetVirtualCursorX{0};
+static std::atomic<LONG> g_cetVirtualCursorY{0};
+static std::atomic<LONG> g_cetPhysicalCursorX{0};
+static std::atomic<LONG> g_cetPhysicalCursorY{0};
+static std::atomic<uint32_t> g_cetBoundaryCaptureMask{0};
+static RECT g_cetBoundarySavedClip{};
+static bool g_cetBoundarySavedClipValid = false;
+static std::mutex g_cetBoundaryCaptureMutex;
+
+enum CetBoundaryCapture : uint32_t {
+    CetCaptureLeft = 1u << 0,
+    CetCaptureRight = 1u << 1,
+    CetCaptureTop = 1u << 2,
+    CetCaptureBottom = 1u << 3,
+};
+
+static BOOL WINAPI HookedGetCursorPos(LPPOINT lpPoint);
+static BOOL WINAPI HookedSetCursorPos(int X, int Y);
+
+static BOOL SetPhysicalCursorClip(const RECT* rect) {
+    static const auto clipCursor = reinterpret_cast<ClipCursorFn>(
+        GetProcAddress(GetModuleHandleW(L"user32.dll"), "ClipCursor"));
+    return clipCursor ? clipCursor(rect) : FALSE;
+}
+
+struct DesktopCursorTransform {
+    DesktopCoverTransform cover;
+    POINT clientOrigin{};
+    int clientWidth = 0;
+    int clientHeight = 0;
+};
+
+static RECT GetCetBoundaryClipRect(const DesktopCursorTransform& transform, uint32_t mask) {
+    RECT rect{
+        transform.clientOrigin.x,
+        transform.clientOrigin.y,
+        transform.clientOrigin.x + transform.clientWidth,
+        transform.clientOrigin.y + transform.clientHeight,
+    };
+    if (mask & CetCaptureLeft) rect.right = rect.left + 1;
+    if (mask & CetCaptureRight) rect.left = rect.right - 1;
+    if (mask & CetCaptureTop) rect.bottom = rect.top + 1;
+    if (mask & CetCaptureBottom) rect.top = rect.bottom - 1;
+    return rect;
+}
+
+static bool ApplyCetBoundaryCursorClip(const DesktopCursorTransform& transform, uint32_t mask) {
+    if (!mask) return false;
+    const RECT rect = GetCetBoundaryClipRect(transform, mask);
+    return SetPhysicalCursorClip(&rect) != FALSE;
+}
+
+static void SetCetBoundaryCaptureMask(uint32_t mask, const DesktopCursorTransform& transform) {
+    std::lock_guard<std::mutex> lock(g_cetBoundaryCaptureMutex);
+    const uint32_t previous = g_cetBoundaryCaptureMask.load(std::memory_order_relaxed);
+    if (previous == mask) {
+        if (mask) ApplyCetBoundaryCursorClip(transform, mask);
+        return;
+    }
+
+    if (!previous && mask) {
+        g_cetBoundarySavedClipValid = GetClipCursor(&g_cetBoundarySavedClip) != FALSE;
+    }
+
+    g_cetBoundaryCaptureMask.store(mask, std::memory_order_release);
+    if (mask) {
+        ApplyCetBoundaryCursorClip(transform, mask);
+        return;
+    }
+
+    if (previous) {
+        SetPhysicalCursorClip(g_cetBoundarySavedClipValid ? &g_cetBoundarySavedClip : nullptr);
+        g_cetBoundarySavedClipValid = false;
+    }
+}
+
+static void ReleaseCetBoundaryCapture() {
+    std::lock_guard<std::mutex> lock(g_cetBoundaryCaptureMutex);
+    if (!g_cetBoundaryCaptureMask.exchange(0, std::memory_order_acq_rel)) return;
+    SetPhysicalCursorClip(g_cetBoundarySavedClipValid ? &g_cetBoundarySavedClip : nullptr);
+    g_cetBoundarySavedClipValid = false;
+}
+
+static cvr::ppd::NativeSize CurrentVirtualGameSize(){
+    if(const auto native=cvr::ppd::ReadNativeRequestedSize())return native->size;
+    return {GetForcedDisplayModeWidth(),GetForcedDisplayModeHeight()};
+}
+static bool GetDesktopCursorTransform(DesktopCursorTransform& out) {
+    if (!g_gameHwnd) return false;
+    const auto virtualSize=CurrentVirtualGameSize();
+    const UINT virtualWidth = virtualSize.width;
+    const UINT virtualHeight = virtualSize.height;
+    RECT client{};
+    if (!virtualWidth || !virtualHeight ||
+        !GetDesktopPhysicalClientRect(g_gameHwnd, client, out.clientOrigin)) {
+        return false;
+    }
+    out.clientWidth = client.right - client.left;
+    out.clientHeight = client.bottom - client.top;
+    return out.clientWidth > 0 && out.clientHeight > 0 &&
+           ComputeDesktopCoverTransform(virtualWidth, virtualHeight,
+                                        static_cast<UINT>(out.clientWidth),
+                                        static_cast<UINT>(out.clientHeight), out.cover);
+}
+
+static POINT PhysicalToVirtualScreen(POINT point, const DesktopCursorTransform& transform) {
+    const double x = transform.cover.sourceX +
+        static_cast<double>(point.x - transform.clientOrigin.x) * transform.cover.sourceWidth /
+            transform.clientWidth;
+    const double y = transform.cover.sourceY +
+        static_cast<double>(point.y - transform.clientOrigin.y) * transform.cover.sourceHeight /
+            transform.clientHeight;
+    return {
+        transform.clientOrigin.x + static_cast<LONG>(std::lround(x)),
+        transform.clientOrigin.y + static_cast<LONG>(std::lround(y))
+    };
+}
+
+static POINT VirtualToPhysicalScreen(POINT point, const DesktopCursorTransform& transform) {
+    double x = (static_cast<double>(point.x - transform.clientOrigin.x) - transform.cover.sourceX) *
+        transform.clientWidth / transform.cover.sourceWidth;
+    double y = (static_cast<double>(point.y - transform.clientOrigin.y) - transform.cover.sourceY) *
+        transform.clientHeight / transform.cover.sourceHeight;
+    x = (std::max)(0.0, (std::min)(static_cast<double>(transform.clientWidth - 1), x));
+    y = (std::max)(0.0, (std::min)(static_cast<double>(transform.clientHeight - 1), y));
+    return {
+        transform.clientOrigin.x + static_cast<LONG>(std::lround(x)),
+        transform.clientOrigin.y + static_cast<LONG>(std::lround(y))
+    };
+}
+
+static LONG ClampCetVirtualCoordinate(LONG value, bool horizontal) {
+    const auto virtualSize=CurrentVirtualGameSize();
+    const LONG size = static_cast<LONG>(horizontal ? virtualSize.width : virtualSize.height);
+    if (size <= 0) return 0;
+    return (std::max)(0L, (std::min)(size - 1, value));
+}
+
+static bool InitializeCetVirtualCursorFromPhysical() {
+    if (!g_origGetCursorPos) return false;
+
+    DesktopCursorTransform transform{};
+    POINT physical{};
+    if (!GetDesktopCursorTransform(transform) || !g_origGetCursorPos(&physical)) return false;
+
+    const POINT virtualScreen = PhysicalToVirtualScreen(physical, transform);
+    g_cetVirtualCursorX.store(
+        ClampCetVirtualCoordinate(virtualScreen.x - transform.clientOrigin.x, true), std::memory_order_relaxed);
+    g_cetVirtualCursorY.store(
+        ClampCetVirtualCoordinate(virtualScreen.y - transform.clientOrigin.y, false), std::memory_order_relaxed);
+    g_cetPhysicalCursorX.store(physical.x - transform.clientOrigin.x, std::memory_order_relaxed);
+    g_cetPhysicalCursorY.store(physical.y - transform.clientOrigin.y, std::memory_order_relaxed);
+    g_cetVirtualCursorValid.store(true, std::memory_order_release);
+    return true;
+}
+
+void SetCetVirtualCursorVisible(bool visible) {
+    if (!visible) {
+        ReleaseCetBoundaryCapture();
+        g_cetVirtualCursorActive.store(false, std::memory_order_release);
+        g_cetVirtualCursorValid.store(false, std::memory_order_release);
+        return;
+    }
+
+    ReleaseCetBoundaryCapture();
+    const bool initialized = InitializeCetVirtualCursorFromPhysical();
+    g_cetVirtualCursorActive.store(initialized, std::memory_order_release);
+}
+
+bool GetCetVirtualCursorClientPosition(float* x, float* y) {
+    if (!x || !y || !g_cetVirtualCursorActive.load(std::memory_order_acquire) ||
+        !g_cetVirtualCursorValid.load(std::memory_order_acquire)) {
+        return false;
+    }
+    *x = static_cast<float>(g_cetVirtualCursorX.load(std::memory_order_relaxed));
+    *y = static_cast<float>(g_cetVirtualCursorY.load(std::memory_order_relaxed));
+    return true;
+}
+
+void SyncCetVirtualCursorFromPhysicalClient(LPARAM lParam) {
+    if (!g_cetVirtualCursorActive.load(std::memory_order_acquire)) return;
+
+    DesktopCursorTransform transform{};
+    if (!GetDesktopCursorTransform(transform)) return;
+
+    const LONG physicalX = static_cast<short>(LOWORD(lParam));
+    const LONG physicalY = static_cast<short>(HIWORD(lParam));
+    g_cetPhysicalCursorX.store(physicalX, std::memory_order_relaxed);
+    g_cetPhysicalCursorY.store(physicalY, std::memory_order_relaxed);
+
+    const uint32_t capture = g_cetBoundaryCaptureMask.load(std::memory_order_acquire);
+    LONG nextX = g_cetVirtualCursorX.load(std::memory_order_relaxed);
+    LONG nextY = g_cetVirtualCursorY.load(std::memory_order_relaxed);
+    if (!(capture & (CetCaptureLeft | CetCaptureRight))) {
+        nextX = ClampCetVirtualCoordinate(static_cast<LONG>(std::lround(
+            transform.cover.sourceX + static_cast<double>(physicalX) * transform.cover.sourceWidth /
+                transform.cover.destinationWidth)), true);
+    }
+    if (!(capture & (CetCaptureTop | CetCaptureBottom))) {
+        nextY = ClampCetVirtualCoordinate(static_cast<LONG>(std::lround(
+            transform.cover.sourceY + static_cast<double>(physicalY) * transform.cover.sourceHeight /
+                transform.cover.destinationHeight)), false);
+    }
+
+    g_cetVirtualCursorX.store(nextX, std::memory_order_relaxed);
+    g_cetVirtualCursorY.store(nextY, std::memory_order_relaxed);
+    g_cetVirtualCursorValid.store(true, std::memory_order_release);
+}
+
+void UpdateCetVirtualCursorFromRawInput(LPARAM lParam) {
+    if (!g_cetVirtualCursorActive.load(std::memory_order_acquire) ||
+        !g_cetVirtualCursorValid.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    RAWINPUT input{};
+    UINT size = sizeof(input);
+    if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, &input, &size,
+                        sizeof(RAWINPUTHEADER)) != sizeof(input) ||
+        input.header.dwType != RIM_TYPEMOUSE || (input.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)) {
+        return;
+    }
+
+    DesktopCursorTransform transform{};
+    if (!GetDesktopCursorTransform(transform)) return;
+
+    LONG x = g_cetVirtualCursorX.load(std::memory_order_relaxed);
+    LONG y = g_cetVirtualCursorY.load(std::memory_order_relaxed);
+    const LONG physicalX = g_cetPhysicalCursorX.load(std::memory_order_relaxed);
+    const LONG physicalY = g_cetPhysicalCursorY.load(std::memory_order_relaxed);
+    const double visibleMinX = transform.cover.sourceX;
+    const double visibleMaxX = transform.cover.sourceX + transform.cover.sourceWidth - 1.0;
+    const double visibleMinY = transform.cover.sourceY;
+    const double visibleMaxY = transform.cover.sourceY + transform.cover.sourceHeight - 1.0;
+    const LONG dx = input.data.mouse.lLastX;
+    const LONG dy = input.data.mouse.lLastY;
+    const LONG scaledDx = static_cast<LONG>(std::lround(
+        static_cast<double>(dx) * transform.cover.sourceWidth / transform.cover.destinationWidth));
+    const LONG scaledDy = static_cast<LONG>(std::lround(
+        static_cast<double>(dy) * transform.cover.sourceHeight / transform.cover.destinationHeight));
+    const LONG minX = static_cast<LONG>(std::lround(visibleMinX));
+    const LONG maxX = static_cast<LONG>(std::lround(visibleMaxX));
+    const LONG minY = static_cast<LONG>(std::lround(visibleMinY));
+    const LONG maxY = static_cast<LONG>(std::lround(visibleMaxY));
+    const auto virtualSize=CurrentVirtualGameSize();
+    const LONG virtualMaxX = static_cast<LONG>(virtualSize.width) - 1;
+    const LONG virtualMaxY = static_cast<LONG>(virtualSize.height) - 1;
+    uint32_t capture = g_cetBoundaryCaptureMask.load(std::memory_order_acquire);
+    const uint32_t previousCapture = capture;
+
+    if (capture & CetCaptureLeft) {
+        const LONG candidate = ClampCetVirtualCoordinate(x + scaledDx, true);
+        if (scaledDx > 0 && candidate >= minX) {
+            x = minX;
+            capture &= ~CetCaptureLeft;
+        } else {
+            x = candidate;
+        }
+    } else if (capture & CetCaptureRight) {
+        const LONG candidate = ClampCetVirtualCoordinate(x + scaledDx, true);
+        if (scaledDx < 0 && candidate <= maxX) {
+            x = maxX;
+            capture &= ~CetCaptureRight;
+        } else {
+            x = candidate;
+        }
+    } else if (minX > 0 && physicalX <= 0 && dx < 0) {
+        capture |= CetCaptureLeft;
+        x = ClampCetVirtualCoordinate(x + scaledDx, true);
+    } else if (maxX < virtualMaxX && physicalX >= transform.clientWidth - 1 && dx > 0) {
+        capture |= CetCaptureRight;
+        x = ClampCetVirtualCoordinate(x + scaledDx, true);
+    }
+
+    if (capture & CetCaptureTop) {
+        const LONG candidate = ClampCetVirtualCoordinate(y + scaledDy, false);
+        if (scaledDy > 0 && candidate >= minY) {
+            y = minY;
+            capture &= ~CetCaptureTop;
+        } else {
+            y = candidate;
+        }
+    } else if (capture & CetCaptureBottom) {
+        const LONG candidate = ClampCetVirtualCoordinate(y + scaledDy, false);
+        if (scaledDy < 0 && candidate <= maxY) {
+            y = maxY;
+            capture &= ~CetCaptureBottom;
+        } else {
+            y = candidate;
+        }
+    } else if (minY > 0 && physicalY <= 0 && dy < 0) {
+        capture |= CetCaptureTop;
+        y = ClampCetVirtualCoordinate(y + scaledDy, false);
+    } else if (maxY < virtualMaxY && physicalY >= transform.clientHeight - 1 && dy > 0) {
+        capture |= CetCaptureBottom;
+        y = ClampCetVirtualCoordinate(y + scaledDy, false);
+    }
+
+    g_cetVirtualCursorX.store(x, std::memory_order_relaxed);
+    g_cetVirtualCursorY.store(y, std::memory_order_relaxed);
+    if (capture != previousCapture) SetCetBoundaryCaptureMask(capture, transform);
+}
+
+static BOOL WINAPI HookedCetGetCursorPos(LPPOINT lpPoint) {
+    if (lpPoint && g_cetVirtualCursorActive.load(std::memory_order_acquire) &&
+        g_cetVirtualCursorValid.load(std::memory_order_acquire)) {
+        DesktopCursorTransform transform{};
+        if (GetDesktopCursorTransform(transform)) {
+            lpPoint->x = transform.clientOrigin.x + g_cetVirtualCursorX.load(std::memory_order_relaxed);
+            lpPoint->y = transform.clientOrigin.y + g_cetVirtualCursorY.load(std::memory_order_relaxed);
+            return TRUE;
+        }
+    }
+    return HookedGetCursorPos(lpPoint);
+}
+
+static BOOL WINAPI HookedCetSetCursorPos(int X, int Y) {
+    if (g_cetVirtualCursorActive.load(std::memory_order_acquire)) {
+        DesktopCursorTransform transform{};
+        if (GetDesktopCursorTransform(transform)) {
+            const LONG virtualX = ClampCetVirtualCoordinate(X - transform.clientOrigin.x, true);
+            const LONG virtualY = ClampCetVirtualCoordinate(Y - transform.clientOrigin.y, false);
+            g_cetVirtualCursorX.store(virtualX, std::memory_order_relaxed);
+            g_cetVirtualCursorY.store(virtualY, std::memory_order_relaxed);
+            g_cetVirtualCursorValid.store(true, std::memory_order_release);
+            uint32_t capture = 0;
+            const double visibleMinX = transform.cover.sourceX;
+            const double visibleMaxX = transform.cover.sourceX + transform.cover.sourceWidth - 1.0;
+            const double visibleMinY = transform.cover.sourceY;
+            const double visibleMaxY = transform.cover.sourceY + transform.cover.sourceHeight - 1.0;
+            if (virtualX < visibleMinX) capture |= CetCaptureLeft;
+            else if (virtualX > visibleMaxX) capture |= CetCaptureRight;
+            if (virtualY < visibleMinY) capture |= CetCaptureTop;
+            else if (virtualY > visibleMaxY) capture |= CetCaptureBottom;
+            SetCetBoundaryCaptureMask(capture, transform);
+            const POINT mapped = VirtualToPhysicalScreen({X, Y}, transform);
+            return g_origSetCursorPos ? g_origSetCursorPos(mapped.x, mapped.y) : FALSE;
+        }
+    }
+    return HookedSetCursorPos(X, Y);
+}
+
+static LONG VirtualEdgeToPhysical(LONG value, bool horizontal, const DesktopCursorTransform& transform) {
+    const double origin = horizontal ? transform.clientOrigin.x : transform.clientOrigin.y;
+    const double cropOrigin = horizontal ? transform.cover.sourceX : transform.cover.sourceY;
+    const double cropSize = horizontal ? transform.cover.sourceWidth : transform.cover.sourceHeight;
+    const double destinationSize = horizontal ? transform.clientWidth : transform.clientHeight;
+    double mapped = (static_cast<double>(value) - origin - cropOrigin) * destinationSize / cropSize;
+    mapped = (std::max)(0.0, (std::min)(destinationSize, mapped));
+    return static_cast<LONG>(std::lround(origin + mapped));
+}
+
 static BOOL WINAPI HookedGetCursorPos(LPPOINT lpPoint) {
     BOOL res = g_origGetCursorPos ? g_origGetCursorPos(lpPoint) : FALSE;
     if(IsLauncherOpen())return res;
@@ -156,26 +514,9 @@ static BOOL WINAPI HookedGetCursorPos(LPPOINT lpPoint) {
             callCount, lpPoint, lpPoint ? lpPoint->x : 0, lpPoint ? lpPoint->y : 0, g_gameHwnd);
     }
     if (res && lpPoint && g_gameHwnd) {
-        UINT virtualWidth = GetForcedDisplayModeWidth();
-        UINT virtualHeight = GetForcedDisplayModeHeight();
-        
-        if (virtualWidth > 0 && virtualHeight > 0) {
-            RECT rect;
-            BOOL getRectRes = g_origGetClientRect ? g_origGetClientRect(g_gameHwnd, &rect) : GetClientRect(g_gameHwnd, &rect);
-            if (getRectRes) {
-                int winWidth = rect.right - rect.left;
-                int winHeight = rect.bottom - rect.top;
-                
-                if (winWidth > 0 && winHeight > 0 && (static_cast<UINT>(winWidth) != virtualWidth || static_cast<UINT>(winHeight) != virtualHeight)) {
-                    POINT clientPt = *lpPoint;
-                    if (ScreenToClient(g_gameHwnd, &clientPt)) {
-                        clientPt.x = (clientPt.x * virtualWidth) / winWidth;
-                        clientPt.y = (clientPt.y * virtualHeight) / winHeight;
-                        ClientToScreen(g_gameHwnd, &clientPt);
-                        *lpPoint = clientPt;
-                    }
-                }
-            }
+        DesktopCursorTransform transform{};
+        if (GetDesktopCursorTransform(transform)) {
+            *lpPoint = PhysicalToVirtualScreen(*lpPoint, transform);
         }
     }
     return res;
@@ -190,27 +531,11 @@ static BOOL WINAPI HookedSetCursorPos(int X, int Y) {
         Log("HookedSetCursorPos: called %d times, target=(%d,%d) g_gameHwnd=%p\n", callCount, X, Y, g_gameHwnd);
     }
     if (g_gameHwnd) {
-        UINT virtualWidth = GetForcedDisplayModeWidth();
-        UINT virtualHeight = GetForcedDisplayModeHeight();
-        
-        if (virtualWidth > 0 && virtualHeight > 0) {
-            RECT rect;
-            BOOL getRectRes = g_origGetClientRect ? g_origGetClientRect(g_gameHwnd, &rect) : GetClientRect(g_gameHwnd, &rect);
-            if (getRectRes) {
-                int winWidth = rect.right - rect.left;
-                int winHeight = rect.bottom - rect.top;
-                
-                if (winWidth > 0 && winHeight > 0 && (static_cast<UINT>(winWidth) != virtualWidth || static_cast<UINT>(winHeight) != virtualHeight)) {
-                    POINT clientPt = { X, Y };
-                    if (ScreenToClient(g_gameHwnd, &clientPt)) {
-                        clientPt.x = (clientPt.x * winWidth) / virtualWidth;
-                        clientPt.y = (clientPt.y * winHeight) / virtualHeight;
-                        ClientToScreen(g_gameHwnd, &clientPt);
-                        X = clientPt.x;
-                        Y = clientPt.y;
-                    }
-                }
-            }
+        DesktopCursorTransform transform{};
+        if (GetDesktopCursorTransform(transform)) {
+            const POINT mapped = VirtualToPhysicalScreen({X, Y}, transform);
+            X = mapped.x;
+            Y = mapped.y;
         }
     }
     return g_origSetCursorPos ? g_origSetCursorPos(X, Y) : FALSE;
@@ -225,26 +550,9 @@ static BOOL WINAPI HookedGetCursorInfo(PCURSORINFO pci) {
             callCount, (res && pci) ? pci->ptScreenPos.x : 0, (res && pci) ? pci->ptScreenPos.y : 0);
     }
     if (res && pci && g_gameHwnd) {
-        UINT virtualWidth = GetForcedDisplayModeWidth();
-        UINT virtualHeight = GetForcedDisplayModeHeight();
-        
-        if (virtualWidth > 0 && virtualHeight > 0) {
-            RECT rect;
-            BOOL getRectRes = g_origGetClientRect ? g_origGetClientRect(g_gameHwnd, &rect) : GetClientRect(g_gameHwnd, &rect);
-            if (getRectRes) {
-                int winWidth = rect.right - rect.left;
-                int winHeight = rect.bottom - rect.top;
-                
-                if (winWidth > 0 && winHeight > 0 && (static_cast<UINT>(winWidth) != virtualWidth || static_cast<UINT>(winHeight) != virtualHeight)) {
-                    POINT clientPt = pci->ptScreenPos;
-                    if (ScreenToClient(g_gameHwnd, &clientPt)) {
-                        clientPt.x = (clientPt.x * virtualWidth) / winWidth;
-                        clientPt.y = (clientPt.y * virtualHeight) / winHeight;
-                        ClientToScreen(g_gameHwnd, &clientPt);
-                        pci->ptScreenPos = clientPt;
-                    }
-                }
-            }
+        DesktopCursorTransform transform{};
+        if (GetDesktopCursorTransform(transform)) {
+            pci->ptScreenPos = PhysicalToVirtualScreen(pci->ptScreenPos, transform);
         }
     }
     return res;
@@ -269,36 +577,16 @@ static BOOL WINAPI HookedClipCursor(const RECT* lpRect) {
             }
         }
 
-        UINT virtualWidth = GetForcedDisplayModeWidth();
-        UINT virtualHeight = GetForcedDisplayModeHeight();
-        
-        if (virtualWidth > 0 && virtualHeight > 0) {
-            RECT rect;
-            BOOL getRectRes = g_origGetClientRect ? g_origGetClientRect(g_gameHwnd, &rect) : GetClientRect(g_gameHwnd, &rect);
-            if (getRectRes) {
-                int winWidth = rect.right - rect.left;
-                int winHeight = rect.bottom - rect.top;
-                
-                if (winWidth > 0 && winHeight > 0 && (static_cast<UINT>(winWidth) != virtualWidth || static_cast<UINT>(winHeight) != virtualHeight)) {
-                    int inputWidth = lpRect->right - lpRect->left;
-                    int inputHeight = lpRect->bottom - lpRect->top;
-                    
-                    if (inputWidth > winWidth || inputHeight > winHeight || lpRect->right > winWidth || lpRect->bottom > winHeight) {
-                        POINT winPos = { 0, 0 };
-                        ClientToScreen(g_gameHwnd, &winPos);
-                        
-                        scaledRect.left = ((lpRect->left - winPos.x) * winWidth) / virtualWidth + winPos.x;
-                        scaledRect.top = ((lpRect->top - winPos.y) * winHeight) / virtualHeight + winPos.y;
-                        scaledRect.right = ((lpRect->right - winPos.x) * winWidth) / virtualWidth + winPos.x;
-                        scaledRect.bottom = ((lpRect->bottom - winPos.y) * winHeight) / virtualHeight + winPos.y;
-                        
-                        rectToUse = &scaledRect;
-                        if (g_verboseLog) Log("ClipCursor scaled: (%ld,%ld)-(%ld,%ld) -> (%ld,%ld)-(%ld,%ld)\n",
-                            lpRect->left, lpRect->top, lpRect->right, lpRect->bottom,
-                            scaledRect.left, scaledRect.top, scaledRect.right, scaledRect.bottom);
-                    }
-                }
-            }
+        DesktopCursorTransform transform{};
+        if (GetDesktopCursorTransform(transform)) {
+            scaledRect.left = VirtualEdgeToPhysical(lpRect->left, true, transform);
+            scaledRect.top = VirtualEdgeToPhysical(lpRect->top, false, transform);
+            scaledRect.right = VirtualEdgeToPhysical(lpRect->right, true, transform);
+            scaledRect.bottom = VirtualEdgeToPhysical(lpRect->bottom, false, transform);
+            rectToUse = &scaledRect;
+            if (g_verboseLog) Log("ClipCursor cover map: (%ld,%ld)-(%ld,%ld) -> (%ld,%ld)-(%ld,%ld)\n",
+                lpRect->left, lpRect->top, lpRect->right, lpRect->bottom,
+                scaledRect.left, scaledRect.top, scaledRect.right, scaledRect.bottom);
         }
     }
     
@@ -314,8 +602,9 @@ static BOOL WINAPI HookedGetClientRect(HWND hWnd, LPRECT lpRect) {
     }
     if (res && lpRect) {
         if (hWnd && (hWnd == g_gameHwnd || (g_gameHwnd == nullptr && IsGameWindowForeground(hWnd)))) {
-            UINT virtualWidth = GetForcedDisplayModeWidth();
-            UINT virtualHeight = GetForcedDisplayModeHeight();
+            const auto virtualSize=CurrentVirtualGameSize();
+            UINT virtualWidth = virtualSize.width;
+            UINT virtualHeight = virtualSize.height;
             if (virtualWidth > 0 && virtualHeight > 0) {
                 lpRect->left = 0;
                 lpRect->top = 0;
@@ -336,8 +625,9 @@ static BOOL WINAPI HookedGetWindowRect(HWND hWnd, LPRECT lpRect) {
     }
     if (res && lpRect) {
         if (hWnd && (hWnd == g_gameHwnd || (g_gameHwnd == nullptr && IsGameWindowForeground(hWnd)))) {
-            UINT virtualWidth = GetForcedDisplayModeWidth();
-            UINT virtualHeight = GetForcedDisplayModeHeight();
+            const auto virtualSize=CurrentVirtualGameSize();
+            UINT virtualWidth = virtualSize.width;
+            UINT virtualHeight = virtualSize.height;
             if (virtualWidth > 0 && virtualHeight > 0) {
                 lpRect->right = lpRect->left + virtualWidth;
                 lpRect->bottom = lpRect->top + virtualHeight;
@@ -351,17 +641,33 @@ static BOOL WINAPI HookedSetWindowPos(HWND hWnd, HWND hWndInsertAfter, int X, in
     if (!(uFlags & SWP_NOSIZE)) {
         HMONITOR monitor = MonitorFromWindow(hWnd, MONITOR_DEFAULTTOPRIMARY);
         MONITORINFO mi = { sizeof(MONITORINFO) };
-        if (GetMonitorInfoA(monitor, &mi)) {
-            int monWidth = mi.rcMonitor.right - mi.rcMonitor.left;
-            int monHeight = mi.rcMonitor.bottom - mi.rcMonitor.top;
-            
-            if (cx > monWidth) {
-                cx = monWidth;
-                if (!(uFlags & SWP_NOMOVE)) X = mi.rcMonitor.left;
-            }
-            if (cy > monHeight) {
-                cy = monHeight;
-                if (!(uFlags & SWP_NOMOVE)) Y = mi.rcMonitor.top;
+        if (cx > 0 && cy > 0 && GetMonitorInfoA(monitor, &mi)) {
+            const UINT monWidth = static_cast<UINT>(mi.rcMonitor.right - mi.rcMonitor.left);
+            const UINT monHeight = static_cast<UINT>(mi.rcMonitor.bottom - mi.rcMonitor.top);
+            const UINT forcedWindowWidth = GetForcedWindowWidth();
+            const bool automaticWindow = hWnd == g_gameHwnd && !cvr::ppd::ReadNativeRequestedSize() &&
+                (forcedWindowWidth == 0 || forcedWindowWidth == GetForcedDisplayModeWidth());
+            if (automaticWindow) {
+                RECT windowRect{};
+                if (GetDesktopMonitorWindowRect(hWnd, windowRect)) {
+                    cx = windowRect.right - windowRect.left;
+                    cy = windowRect.bottom - windowRect.top;
+                    X = windowRect.left;
+                    Y = windowRect.top;
+                    uFlags &= ~SWP_NOMOVE;
+                }
+            } else {
+                UINT fitWidth = 0;
+                UINT fitHeight = 0;
+                FitRenderSizeInsideBounds(static_cast<UINT>(cx), static_cast<UINT>(cy),
+                                          monWidth, monHeight, fitWidth, fitHeight);
+                if (fitWidth != static_cast<UINT>(cx) || fitHeight != static_cast<UINT>(cy)) {
+                    cx = static_cast<int>(fitWidth);
+                    cy = static_cast<int>(fitHeight);
+                    X = mi.rcMonitor.left + (static_cast<int>(monWidth) - cx) / 2;
+                    Y = mi.rcMonitor.top + (static_cast<int>(monHeight) - cy) / 2;
+                    uFlags &= ~SWP_NOMOVE;
+                }
             }
         }
     }
@@ -371,17 +677,31 @@ static BOOL WINAPI HookedSetWindowPos(HWND hWnd, HWND hWndInsertAfter, int X, in
 static BOOL WINAPI HookedMoveWindow(HWND hWnd, int X, int Y, int nWidth, int nHeight, BOOL bRepaint) {
     HMONITOR monitor = MonitorFromWindow(hWnd, MONITOR_DEFAULTTOPRIMARY);
     MONITORINFO mi = { sizeof(MONITORINFO) };
-    if (GetMonitorInfoA(monitor, &mi)) {
-        int monWidth = mi.rcMonitor.right - mi.rcMonitor.left;
-        int monHeight = mi.rcMonitor.bottom - mi.rcMonitor.top;
-        
-        if (nWidth > monWidth) {
-            nWidth = monWidth;
-            X = mi.rcMonitor.left;
-        }
-        if (nHeight > monHeight) {
-            nHeight = monHeight;
-            Y = mi.rcMonitor.top;
+    if (nWidth > 0 && nHeight > 0 && GetMonitorInfoA(monitor, &mi)) {
+        const UINT monWidth = static_cast<UINT>(mi.rcMonitor.right - mi.rcMonitor.left);
+        const UINT monHeight = static_cast<UINT>(mi.rcMonitor.bottom - mi.rcMonitor.top);
+        const UINT forcedWindowWidth = GetForcedWindowWidth();
+        const bool automaticWindow = hWnd == g_gameHwnd && !cvr::ppd::ReadNativeRequestedSize() &&
+            (forcedWindowWidth == 0 || forcedWindowWidth == GetForcedDisplayModeWidth());
+        if (automaticWindow) {
+            RECT windowRect{};
+            if (GetDesktopMonitorWindowRect(hWnd, windowRect)) {
+                nWidth = windowRect.right - windowRect.left;
+                nHeight = windowRect.bottom - windowRect.top;
+                X = windowRect.left;
+                Y = windowRect.top;
+            }
+        } else {
+            UINT fitWidth = 0;
+            UINT fitHeight = 0;
+            FitRenderSizeInsideBounds(static_cast<UINT>(nWidth), static_cast<UINT>(nHeight),
+                                      monWidth, monHeight, fitWidth, fitHeight);
+            if (fitWidth != static_cast<UINT>(nWidth) || fitHeight != static_cast<UINT>(nHeight)) {
+                nWidth = static_cast<int>(fitWidth);
+                nHeight = static_cast<int>(fitHeight);
+                X = mi.rcMonitor.left + (static_cast<int>(monWidth) - nWidth) / 2;
+                Y = mi.rcMonitor.top + (static_cast<int>(monHeight) - nHeight) / 2;
+            }
         }
     }
     return g_origMoveWindow ? g_origMoveWindow(hWnd, X, Y, nWidth, nHeight, bRepaint) : FALSE;
@@ -391,8 +711,9 @@ static int WINAPI HookedGetSystemMetrics(int nIndex) {
     int res = g_origGetSystemMetrics ? g_origGetSystemMetrics(nIndex) : 0;
     if(IsLauncherOpen())return res;
     
-    UINT virtualWidth = GetForcedDisplayModeWidth();
-    UINT virtualHeight = GetForcedDisplayModeHeight();
+    const auto virtualSize=CurrentVirtualGameSize();
+    UINT virtualWidth = virtualSize.width;
+    UINT virtualHeight = virtualSize.height;
     
     if (virtualWidth > 0 && virtualHeight > 0) {
         // SM_CXSCREEN = 0, SM_CYSCREEN = 1, SM_CXFULLSCREEN = 16, SM_CYFULLSCREEN = 17, SM_CXVIRTUALSCREEN = 78, SM_CYVIRTUALSCREEN = 79
@@ -412,36 +733,11 @@ static DWORD WINAPI HookedGetMessagePos(VOID) {
     DWORD res = g_origGetMessagePos ? g_origGetMessagePos() : 0;
     if(IsLauncherOpen())return res;
     if (g_gameHwnd) {
-        UINT virtualWidth = GetForcedDisplayModeWidth();
-        UINT virtualHeight = GetForcedDisplayModeHeight();
-        
-        if (virtualWidth > 0 && virtualHeight > 0) {
-            RECT rect;
-            BOOL getRectRes = g_origGetClientRect ? g_origGetClientRect(g_gameHwnd, &rect) : GetClientRect(g_gameHwnd, &rect);
-            if (getRectRes) {
-                int winWidth = rect.right - rect.left;
-                int winHeight = rect.bottom - rect.top;
-                
-                if (winWidth > 0 && winHeight > 0 && (static_cast<UINT>(winWidth) != virtualWidth || static_cast<UINT>(winHeight) != virtualHeight)) {
-                    int x = (short)LOWORD(res);
-                    int y = (short)HIWORD(res);
-                    
-                    POINT clientPt = { x, y };
-                    if (ScreenToClient(g_gameHwnd, &clientPt)) {
-                        clientPt.x = (clientPt.x * virtualWidth) / winWidth;
-                        clientPt.y = (clientPt.y * virtualHeight) / winHeight;
-                        ClientToScreen(g_gameHwnd, &clientPt);
-                        
-                        DWORD newRes = MAKELONG(static_cast<WORD>(clientPt.x), static_cast<WORD>(clientPt.y));
-                        static int logCount = 0;
-    if (g_verboseLog && logCount++ % 100 == 0) {
-        Log("GetMessagePos override: (%d,%d) -> (%ld,%ld) win=%dx%d virt=%ux%u\n",
-                                x, y, clientPt.x, clientPt.y, winWidth, winHeight, virtualWidth, virtualHeight);
-                        }
-                        return newRes;
-                    }
-                }
-            }
+        DesktopCursorTransform transform{};
+        if (GetDesktopCursorTransform(transform)) {
+            const POINT source{static_cast<short>(LOWORD(res)), static_cast<short>(HIWORD(res))};
+            const POINT mapped = PhysicalToVirtualScreen(source, transform);
+            return MAKELONG(static_cast<WORD>(mapped.x), static_cast<WORD>(mapped.y));
         }
     }
     return res;
@@ -503,6 +799,16 @@ void InstallOSHooks() {
         HookIAT(hMod, "user32.dll", "GetSystemMetrics", reinterpret_cast<void*>(HookedGetSystemMetrics), reinterpret_cast<void**>(&g_origGetSystemMetrics));
         HookIAT(hMod, "user32.dll", "GetMessagePos", reinterpret_cast<void*>(HookedGetMessagePos), reinterpret_cast<void**>(&g_origGetMessagePos));
     }
+
+    // CET has its own Win32 ImGui backend. Give it the same virtual client and cursor
+    // coordinates as the game; its mouse-message path is handled by OverlayWndProc.
+    if (HMODULE hCet = GetModuleHandleA("cyber_engine_tweaks.asi")) {
+        HookIAT(hCet, "user32.dll", "GetClientRect", reinterpret_cast<void*>(HookedGetClientRect), reinterpret_cast<void**>(&g_origGetClientRect));
+        HookIAT(hCet, "user32.dll", "GetCursorPos", reinterpret_cast<void*>(HookedCetGetCursorPos), reinterpret_cast<void**>(&g_origGetCursorPos));
+        HookIAT(hCet, "user32.dll", "SetCursorPos", reinterpret_cast<void*>(HookedCetSetCursorPos), reinterpret_cast<void**>(&g_origSetCursorPos));
+    } else {
+        Log("InstallOSHooks: CET module not loaded; CET cursor hooks unavailable\n");
+    }
 }
 
 static bool GetClampedClientRect(HWND hwnd, RECT* outRect) {
@@ -541,21 +847,31 @@ static bool GetClampedClientRect(HWND hwnd, RECT* outRect) {
 void UpdateCursorCapture(HWND hwnd) {
     if (IsLauncherOpen() || OverlayIsVisible()) {
         if (g_cursorClipped) {
-            ClipCursor(nullptr);
+            SetPhysicalCursorClip(nullptr);
             g_cursorClipped = false;
         }
         return;
     }
 
+    const uint32_t cetCapture = g_cetBoundaryCaptureMask.load(std::memory_order_acquire);
+    if (cetCapture) {
+        DesktopCursorTransform transform{};
+        if (GetDesktopCursorTransform(transform) && ApplyCetBoundaryCursorClip(transform, cetCapture)) {
+            return;
+        }
+    }
+
     RECT clipRect{};
     if (IsGameWindowForeground(hwnd) && GetClampedClientRect(hwnd, &clipRect)) {
-        ClipCursor(&clipRect);
+        // clipRect is already in physical screen coordinates. Bypass our IAT hook, which maps
+        // virtual game coordinates into this same space and would otherwise transform it twice.
+        SetPhysicalCursorClip(&clipRect);
         g_cursorClipped = true;
         return;
     }
 
     if (g_cursorClipped) {
-        ClipCursor(nullptr);
+        SetPhysicalCursorClip(nullptr);
         g_cursorClipped = false;
     }
 }

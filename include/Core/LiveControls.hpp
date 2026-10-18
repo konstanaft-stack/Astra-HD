@@ -21,6 +21,9 @@ struct LiveControls {
     volatile int xrMonoSubmit;
     volatile float xrForceFov;
     volatile int xrMenuRect;
+    // Requested next-start mode; UiConsumer latches it before installing/using observers.
+    // INI polling must not turn an active stereo camera cycle on or off.
+    volatile int xrMenuStereo = 0;
     volatile float xrMenuFov;
     volatile float xrMenuFollowDeg; // head-vs-panel yaw offset (deg) that starts the lazy menu re-center
     volatile int xrHudPanel = 1;
@@ -60,12 +63,24 @@ struct LiveControls {
     volatile int xrSnapTurn;        // 1 = discrete snap turn from right-stick X
     volatile float xrSnapTurnAngleDeg; // degrees per snap pulse
     volatile int xrMovementSource;  // 0 = Game, 1 = HMD, 2 = LeftHand, 3 = RightHand
-    volatile int xrMovementSpeedMode = 0; // 0=current fixed speed, 1=analog on foot
+    volatile int xrLaserDotMode = 2; // 0 = steady projection, 1 = real world point, 2 = surface raycast (Tofu default)
+    volatile float xrLaserDotRadiusMm = 30.0f; // apparent world-space radius in millimetres
+    volatile int xrLaserDotScaleWithDistance = 1; // mode 2 only: scale spot footprint with surface distance
+    volatile int xrHideLaserDotAds = 0; // hide the dot and fire from the weapon sight while ADS
+    volatile int xrMovementSpeedMode = 1; // 0=current fixed speed, 1=analog on foot (Tofu default)
     volatile float xrLeftStickDeadzone = .15f;
     volatile float xrRightStickDeadzone = .15f;
     volatile float xrMaxInputThreshold = .90f;
     volatile int xrXInputInstall;   // 1 = install the XInput entry-point detour at startup (default 1, set 0 in vrport.ini to fully bypass)
     volatile int xrInputActions;    // 1 = create gameplay XrActions (thumbstick/trigger/buttons). 0 = pose-only legacy behaviour
+    volatile int xrChordActivation = 1; // 0 = L3 + right stick, 1 = R3 + left stick, 2 = right thumbrest + left stick
+    volatile int xrExtraChordActions = 1; // 1 = enable recenter/overlay/cyberware chords; D-pad and Back remain unconditional
+    volatile int xrClassicOnFootControls; // 1 = rebuild General/on-foot VR input from the complete Xbox baseline
+    volatile int xrClassicDisableLsSprint; // effective only with classic on-foot controls: disable full-forward LS sprint
+    volatile int xrClassicDisableRsDashCrouch; // effective only with classic on-foot controls: disable RS-Y dash/crouch
+    volatile int xrClassicVehicleControls; // 1 = rebuild mounted VR input from the Xbox baseline and disable wheel driving
+    volatile int xrClassicSwapTriggersGrips; // effective only with classic vehicle controls: triggers become shoulders, grips become analog triggers
+    volatile int xrClassicScannerControls; // 1 = keep the Scanner gesture but rebuild its active-mode input from the Xbox baseline
     volatile int xrMonoXQueueWait;  // 1 = mono path inserts cross-queue Wait before depth capture (legacy). 0 = skip it -- avoids CP2077 async-compute Wait cycle that froze present thread.
     volatile int xrSnapTurnPulseMs; // duration of the discrete snap turn pulse pushed into the right stick (ms)
     volatile int xrMonoDepthCapture; // 1 (default) = mono scene-depth for XR_KHR_composition_layer_depth. The resolve reads the game depth as an SRV WITHOUT transitioning it (D3D12 state is global -> barriering the game's resource device-removes CP2077), on our own capture queue (FIFO before the submit's depth copy, no cross-queue Wait), and only once the scene depth has been a stable shader-readable resource with menus closed for a warmup window (skips the intro/menu-load transient). 0 = no depth in mono.

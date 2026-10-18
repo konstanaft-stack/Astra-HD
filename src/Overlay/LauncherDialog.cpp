@@ -1,4 +1,6 @@
 #include "Overlay/LauncherDialog.hpp"
+#include "Overlay/PpdResolution.hpp"
+#include "Stereo/VrcamConfig.hpp"
 #include <windows.h>
 #include <commctrl.h>
 #include <iterator>
@@ -22,12 +24,15 @@ extern "C" void SetHmdTypeAndPersist(int hmdType);
 extern "C" int GetCurrentHmdType();
 extern "C" void SetLauncherDebugAndPersist(int on);
 extern "C" int GetLauncherDebug();
+extern "C" float GetForcedFov();
 
 #define ID_COMBO_RES     101
 #define ID_BUTTON_START  102
 #define ID_COMBO_RUNTIME 103
 #define ID_COMBO_HMD     104
 #define ID_CHECK_DEBUG   105
+#define ID_SLIDER_PPD    106
+#define ID_EDIT_PPD      107
 
 // --- Visual constants -------------------------------------------------------
 static const COLORREF kColBg     = RGB(248, 249, 251); // window background
@@ -35,8 +40,8 @@ static const COLORREF kColHeader = RGB(0, 120, 215);   // Windows accent blue
 static const COLORREF kColSub    = RGB(120, 124, 130);  // muted gray
 static const COLORREF kColLabel  = RGB(45, 48, 54);     // near-black label
 static const int kMargin  = 26;
-static const int kClientW = 372;
-static const int kClientH = 452;   // room for the DEBUG row under the resolution combo
+static const int kClientW = 500;
+static const int kClientH = 590;
 static const int kFieldW  = kClientW - 2 * kMargin;
 
 struct ResolutionPreset {
@@ -57,7 +62,7 @@ struct HmdPreset {
 // Risoluzioni NATIVE per ogni visore (per occhio)
 // --- Per-HMD resolution lists ---
 static const ResolutionPreset kQuest2Resolutions[] = {
-    {1832, 1920, L"1832 x 1920 (Native)"},
+    {1832, 1920, L"1832 x 1920 (Родное)"},
     {1680, 1760, L"1680 x 1760"},
     {2048, 2138, L"2048 x 2138"},
     {2560, 2672, L"2560 x 2672"},
@@ -67,7 +72,7 @@ static const ResolutionPreset kQuest2Resolutions[] = {
 };
 
 static const ResolutionPreset kQuest3SResolutions[] = {
-    {1920, 1880, L"1920 x 1880 (Native)"},
+    {1920, 1880, L"1920 x 1880 (Родное)"},
     {1680, 1646, L"1680 x 1646"},
     {2048, 2006, L"2048 x 2006"},
     {2560, 2507, L"2560 x 2507"},
@@ -101,7 +106,7 @@ static const ResolutionPreset kQuest3SResolutions[] = {
 // a symmetric 104x104 FOV, so its ideal AR really is 1.0. The square presets were never a mistake
 // -- they were simply Pico-shaped, and Quest 3 is not.
 static const ResolutionPreset kQuest3Resolutions[] = {
-    {2064, 2296, L"2064 x 2296 (Native width)"},
+    {2064, 2296, L"2064 x 2296 (Родная ширина)"},
     {1832, 2032, L"1832 x 2032"},
     {2296, 2552, L"2296 x 2552"},
     {2560, 2848, L"2560 x 2848"},
@@ -113,7 +118,7 @@ static const ResolutionPreset kQuest3Resolutions[] = {
 };
 
 static const ResolutionPreset kPico4Resolutions[] = {
-    {2160, 2160, L"2160 x 2160 (Native)"},
+    {2160, 2160, L"2160 x 2160 (Родное)"},
     {1920, 1920, L"1920 x 1920"},
     {2048, 2048, L"2048 x 2048"},
     {2560, 2560, L"2560 x 2560"},
@@ -124,7 +129,7 @@ static const ResolutionPreset kPico4Resolutions[] = {
 };
 
 static const ResolutionPreset kPico4UltraResolutions[] = {
-    {2160, 2160, L"2160 x 2160 (Native)"},
+    {2160, 2160, L"2160 x 2160 (Родное)"},
     {1920, 1920, L"1920 x 1920"},
     {2048, 2048, L"2048 x 2048"},
     {2560, 2560, L"2560 x 2560"},
@@ -137,18 +142,18 @@ static const ResolutionPreset kPico4UltraResolutions[] = {
 // Steam Frame preset from Crazymoniker's native-controller support. All sizes
 // already have square VRCAM assets; projection still follows the runtime FOV.
 static const ResolutionPreset kSteamFrameResolutions[] = {
-    {2160, 2160, L"2160 x 2160 (Native panel)"},
-    {1920, 1920, L"1920 x 1920 (Performance)"},
+    {2160, 2160, L"2160 x 2160 (Родное для панели)"},
+    {1920, 1920, L"1920 x 1920 (Производительность)"},
     {2048, 2048, L"2048 x 2048"},
-    {2560, 2560, L"2560 x 2560 (Balanced)"},
-    {3072, 3072, L"3072 x 3072 (High)"},
-    {4096, 4096, L"4096 x 4096 (Ultra)"},
+    {2560, 2560, L"2560 x 2560 (Баланс)"},
+    {3072, 3072, L"3072 x 3072 (Высокое)"},
+    {4096, 4096, L"4096 x 4096 (Ультра)"},
     {5000, 5000, L"5000 x 5000"},
     {6000, 6000, L"6000 x 6000"},
 };
 
 static const ResolutionPreset kCrystalOGResolutions[] = {
-    {2464, 2448, L"2464 x 2448 (Native)"},
+    {2464, 2448, L"2464 x 2448 (Родное)"},
     {2160, 2145, L"2160 x 2145"},
     {2048, 2034, L"2048 x 2034"},
     {2560, 2542, L"2560 x 2542"},
@@ -159,7 +164,7 @@ static const ResolutionPreset kCrystalOGResolutions[] = {
 };
 
 static const ResolutionPreset kCrystalLightResolutions[] = {
-    {2464, 2448, L"2464 x 2448 (Native)"},
+    {2464, 2448, L"2464 x 2448 (Родное)"},
     {2160, 2145, L"2160 x 2145"},
     {2048, 2034, L"2048 x 2034"},
     {2560, 2542, L"2560 x 2542"},
@@ -170,7 +175,7 @@ static const ResolutionPreset kCrystalLightResolutions[] = {
 };
 
 static const ResolutionPreset kCrystalSuperResolutions[] = {
-    {2464, 2448, L"2464 x 2448 (Native)"},
+    {2464, 2448, L"2464 x 2448 (Родное)"},
     {2160, 2145, L"2160 x 2145"},
     {2048, 2034, L"2048 x 2034"},
     {2560, 2542, L"2560 x 2542"},
@@ -182,7 +187,7 @@ static const ResolutionPreset kCrystalSuperResolutions[] = {
 
 // Crystal Super Ultra Wide: risoluzioni quadrate confermate (Crystal aspect ~1.0)
 static const ResolutionPreset kCrystalWFResolutions[] = {
-    {2464, 2448, L"2464 x 2448 (Native)"},
+    {2464, 2448, L"2464 x 2448 (Родное)"},
     {2160, 2145, L"2160 x 2145"},
     {2048, 2034, L"2048 x 2034"},
     {2560, 2542, L"2560 x 2542"},
@@ -194,7 +199,7 @@ static const ResolutionPreset kCrystalWFResolutions[] = {
 
 // Valve Index: aspect ratio nativo 0.9 (1440x1600)
 static const ResolutionPreset kValveIndexResolutions[] = {
-    {1440, 1600, L"1440 x 1600 (Native)"},
+    {1440, 1600, L"1440 x 1600 (Родное)"},
     {1260, 1400, L"1260 x 1400"},
     {1080, 1200, L"1080 x 1200"},
     {1800, 2000, L"1800 x 2000"},
@@ -216,7 +221,7 @@ static const ResolutionPreset kValveIndexResolutions[] = {
 // well above that, so anything smaller is giving away sharpness for frames the RTT view has to
 // render anyway. Both dimensions are multiples of 8 and every entry is within 0.2% of ideal.
 static const ResolutionPreset kPimaxDreamAirResolutions[] = {
-    {2504, 2064, L"2504 x 2064 (Runtime recommended)"},
+    {2504, 2064, L"2504 x 2064 (Рекомендация рантайма)"},
     {2760, 2280, L"2760 x 2280"},
     {3072, 2536, L"3072 x 2536"},
     {4096, 3384, L"4096 x 3384"},
@@ -234,12 +239,12 @@ static const ResolutionPreset kPimaxDreamAirResolutions[] = {
 //   PSVR2's runtime shape. Do NOT list 3400x3468 here until a matching vrcam_3400x3468 component and
 //   dynamic texture have actually been imported into the archive.
 static const ResolutionPreset kPlayStationVr2Resolutions[] = {
-    {1920, 1920, L"1920 x 1920 (Performance)"},
-    {2048, 2048, L"2048 x 2048 (Near panel resolution)"},
-    {2560, 2560, L"2560 x 2560 (Balanced)"},
-    {3072, 3072, L"3072 x 3072 (High)"},
-    {3584, 3584, L"3584 x 3584 (Near runtime scale)"},
-    {4096, 4096, L"4096 x 4096 (Ultra)"},
+    {1920, 1920, L"1920 x 1920 (Производительность)"},
+    {2048, 2048, L"2048 x 2048 (Около разрешения панели)"},
+    {2560, 2560, L"2560 x 2560 (Баланс)"},
+    {3072, 3072, L"3072 x 3072 (Высокое)"},
+    {3584, 3584, L"3584 x 3584 (Около масштаба рантайма)"},
+    {4096, 4096, L"4096 x 4096 (Ультра)"},
     {5000, 5000, L"5000 x 5000"},
     {6000, 6000, L"6000 x 6000"},
 };
@@ -261,7 +266,7 @@ static const ResolutionPreset kPlayStationVr2Resolutions[] = {
 static const ResolutionPreset kBigscreenBeyond2Resolutions[] = {
     {1920, 1552, L"1920 x 1552"},
     {2048, 1656, L"2048 x 1656"},
-    {2560, 2064, L"2560 x 2064 (Native panel width)"},
+    {2560, 2064, L"2560 x 2064 (Родная ширина панели)"},
     {3072, 2480, L"3072 x 2480"},
     {3584, 2888, L"3584 x 2888"},
     {4096, 3304, L"4096 x 3304"},
@@ -307,6 +312,73 @@ static HWND g_hRuntime = nullptr;
 static HWND g_hHmd     = nullptr;   // <-- NUOVO
 static HWND g_hRes     = nullptr;
 static HWND g_hDebug   = nullptr;
+static HWND g_hPpdSlider{},g_hPpdEdit{},g_hPpdDetails{},g_hStart{};
+static int g_selectedWidth{},g_selectedHeight{};
+static bool g_updatingPpd{},g_ppdTouched{},g_ppdError{};
+static std::vector<std::string> g_authoredCameras;
+
+static int SelectedHmdIndex(){return static_cast<int>(SendMessageW(g_hHmd,CB_GETCURSEL,0,0));}
+static bool Quest3Selected(){const int i=SelectedHmdIndex();return i>=0 && i<int(std::size(kHmdPresets)) && kHmdPresets[i].mhdType==2;}
+static double PpdFov(){const double forced=GetForcedFov();return cvr::ppd::ValidFov(forced)?forced:cvr::ppd::Quest3ReferenceFov;}
+static bool AuthoredSize(int width,int height){
+    char name[64]{};sprintf_s(name,"vrcam_%dx%d",width,height);
+    return std::find(g_authoredCameras.begin(),g_authoredCameras.end(),name)!=g_authoredCameras.end();
+}
+static bool HasFineSizes(){const auto low=cvr::ppd::ForWidth(cvr::ppd::MinWidth);const auto high=cvr::ppd::ForWidth(cvr::ppd::MaxWidth);return AuthoredSize(low.width,low.height)&&AuthoredSize(high.width,high.height);}
+static void PpdDetails(const wchar_t* text,bool error=false){
+    g_ppdError=error;if(g_hPpdDetails)SetWindowTextW(g_hPpdDetails,text);
+    if(g_hStart)EnableWindow(g_hStart,!error);
+}
+static void ShowSelectedPpd(){
+    wchar_t text[320]{};
+    swprintf_s(text,L"На глаз: %d × %d\nPPD в центре: %.2f · расчёт по FOV %.1f°\nРазмеры округляются до 8 пикселей; поле зрения не меняется.",
+        g_selectedWidth,g_selectedHeight,cvr::ppd::CenterPpd(g_selectedWidth,PpdFov()),PpdFov());
+    PpdDetails(text);
+}
+static void RefreshPpdFromSize(){
+    if(!g_hPpdSlider || !g_hPpdEdit)return;
+    const bool available=Quest3Selected() && HasFineSizes();
+    EnableWindow(g_hPpdSlider,available);EnableWindow(g_hPpdEdit,available);
+    g_updatingPpd=true;g_ppdTouched=false;
+    if(available){
+        const double fov=PpdFov(),value=cvr::ppd::CenterPpd(g_selectedWidth,fov);
+        SendMessageW(g_hPpdSlider,TBM_SETRANGEMIN,FALSE,cvr::ppd::MinTick(fov));
+        SendMessageW(g_hPpdSlider,TBM_SETRANGEMAX,TRUE,cvr::ppd::MaxTick(fov));
+        SendMessageW(g_hPpdSlider,TBM_SETPOS,TRUE,std::lround(value*10));
+        wchar_t text[32]{};swprintf_s(text,L"%.2f",value);SetWindowTextW(g_hPpdEdit,text);
+        ShowSelectedPpd();
+    }else{
+        SetWindowTextW(g_hPpdEdit,L"—");
+        PpdDetails(Quest3Selected()?L"Для точной шкалы нужен полный пакет ресурсов PPD.\nШтатные разрешения остаются доступны.":L"Точная шкала PPD подготовлена для Quest 3.\nДля выбранного шлема доступны штатные разрешения.");
+    }
+    g_updatingPpd=false;
+}
+static bool ApplyPpdValue(double value,bool updateEdit){
+    if(!Quest3Selected() || !HasFineSizes())return false;
+    const double fov=PpdFov();
+    const auto r=cvr::ppd::FromPpd(value,fov);
+    if(!r.valid){
+        wchar_t error[128]{};swprintf_s(error,L"Введите PPD от %.1f до %.1f.",cvr::ppd::MinTick(fov)/10.,cvr::ppd::MaxTick(fov)/10.);
+        PpdDetails(error,true);return false;
+    }
+    if(!AuthoredSize(r.width,r.height)){PpdDetails(L"Для этого размера отсутствует ресурс второго глаза.\nПрименение остановлено; проверьте комплект PPD.",true);return false;}
+    const auto& hmd=kHmdPresets[SelectedHmdIndex()];
+    if(SendMessageW(g_hRes,CB_GETCOUNT,0,0)>hmd.resolutionCount)SendMessageW(g_hRes,CB_DELETESTRING,hmd.resolutionCount,0);
+    int selection=-1;
+    for(int i=0;i<hmd.resolutionCount;++i)if(hmd.resolutions[i].width==r.width&&hmd.resolutions[i].height==r.height){selection=i;break;}
+    if(selection<0){wchar_t custom[96]{};swprintf_s(custom,L"Пользовательское: %d × %d",r.width,r.height);selection=int(SendMessageW(g_hRes,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(custom)));}
+    SendMessageW(g_hRes,CB_SETCURSEL,selection,0);
+    g_selectedWidth=r.width;g_selectedHeight=r.height;g_ppdTouched=true;
+    g_updatingPpd=true;
+    SendMessageW(g_hPpdSlider,TBM_SETPOS,TRUE,std::lround(value*10));
+    if(updateEdit){wchar_t text[32]{};swprintf_s(text,L"%.1f",value);SetWindowTextW(g_hPpdEdit,text);}
+    g_updatingPpd=false;ShowSelectedPpd();return true;
+}
+static bool ApplyPpdText(){
+    wchar_t text[64]{};GetWindowTextW(g_hPpdEdit,text,int(std::size(text)));double value{};
+    if(!cvr::ppd::ParsePpd(text,value)){PpdDetails(L"Введите число PPD, например 14,7.",true);return false;}
+    return ApplyPpdValue(value,false);
+}
 
 static HFONT MakeFont(int pointSize, int weight) {
     HDC hdc = GetDC(nullptr);
@@ -360,17 +432,28 @@ static void PopulateResolutionCombo(int hmdIndex) {
 
     // Se la risoluzione corrente non è nella lista del nuovo HMD,
     // seleziona la prima (quella nativa).
-    if (!found && hmd.resolutionCount > 0) {
-        resSel = 0;
+    const auto fine=cvr::ppd::ForWidth(currentWidth);
+    if(!found && hmd.mhdType==2 && fine.valid && fine.height==currentHeight && AuthoredSize(currentWidth,currentHeight)){
+        wchar_t custom[96]{};swprintf_s(custom,L"Пользовательское: %d × %d",currentWidth,currentHeight);
+        resSel=int(SendMessageW(g_hRes,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(custom)));found=true;
+        g_selectedWidth=currentWidth;g_selectedHeight=currentHeight;
+    }else{
+        if(!found)resSel=0;
+        g_selectedWidth=hmd.resolutions[resSel].width;g_selectedHeight=hmd.resolutions[resSel].height;
     }
 
     SendMessageW(g_hRes, CB_SETCURSEL, resSel, 0);
+    RefreshPpdFromSize();
 }
 
 LRESULT CALLBACK LauncherWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     static HWND hwndButton;
     switch (msg) {
     case WM_CREATE: {
+        g_authoredCameras.clear();std::string catalogue;
+        if(cvr::vrcam_config_read(&catalogue,nullptr,0))cvr::json_find_string_array(catalogue,"components",&g_authoredCameras);
+        g_hPpdSlider=g_hPpdEdit=g_hPpdDetails=g_hStart=nullptr;
+        g_ppdTouched=g_ppdError=g_updatingPpd=false;
         g_fontHeader = MakeFont(20, FW_SEMIBOLD);
         g_fontSub    = MakeFont(10, FW_NORMAL);
         g_fontBody   = MakeFont(11, FW_NORMAL);
@@ -378,11 +461,11 @@ LRESULT CALLBACK LauncherWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 
         g_hHeader = MakeLabel(hwnd, L"CyberpunkVRPort", kMargin, y, kFieldW, 44, g_fontHeader);
         y += 46;
-        g_hSub = MakeLabel(hwnd, L"VR Configuration", kMargin, y, kFieldW, 22, g_fontSub);
+        g_hSub = MakeLabel(hwnd, L"Настройка VR", kMargin, y, kFieldW, 22, g_fontSub);
         y += 38;
 
         // --- VR Headset (NUOVO) ---
-        MakeLabel(hwnd, L"VR Headset", kMargin, y, kFieldW, 24, g_fontBody);
+        MakeLabel(hwnd, L"VR-шлем", kMargin, y, kFieldW, 24, g_fontBody);
         y += 26;
         g_hHmd = MakeCombo(hwnd, ID_COMBO_HMD, kMargin, y, kFieldW);
         const int currentHmd = GetCurrentHmdType();
@@ -397,7 +480,7 @@ LRESULT CALLBACK LauncherWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         y += 50;
 
         // --- VR Runtime ---
-        MakeLabel(hwnd, L"VR Runtime", kMargin, y, kFieldW, 24, g_fontBody);
+        MakeLabel(hwnd, L"VR-рантайм", kMargin, y, kFieldW, 24, g_fontBody);
         y += 26;
         g_hRuntime = MakeCombo(hwnd, ID_COMBO_RUNTIME, kMargin, y, kFieldW);
         const int currentRuntime = GetXrRuntimeMode();
@@ -412,18 +495,29 @@ LRESULT CALLBACK LauncherWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         y += 50;
 
         // -- Render Resolution ---
-        MakeLabel(hwnd, L"Render Resolution (per eye)", kMargin, y, kFieldW, 24, g_fontBody);
+        MakeLabel(hwnd, L"Разрешение рендера (на глаз)", kMargin, y, kFieldW, 24, g_fontBody);
         y += 26;
         g_hRes = MakeCombo(hwnd, ID_COMBO_RES, kMargin, y, kFieldW);
         PopulateResolutionCombo(hmdSel);   // <-- Popola in base all'HMD selezionato
         y += 56;
+
+        MakeLabel(hwnd,L"Чёткость — PPD в центре",kMargin,y,kFieldW-105,24,g_fontBody);
+        g_hPpdEdit=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",WS_VISIBLE|WS_CHILD|WS_TABSTOP|ES_AUTOHSCROLL,
+            kMargin+kFieldW-90,y-2,90,28,hwnd,reinterpret_cast<HMENU>(ID_EDIT_PPD),nullptr,nullptr);
+        SendMessageW(g_hPpdEdit,WM_SETFONT,reinterpret_cast<WPARAM>(g_fontBody),TRUE);
+        SendMessageW(g_hPpdEdit,EM_SETLIMITTEXT,12,0);y+=30;
+        g_hPpdSlider=CreateWindowExW(0,TRACKBAR_CLASSW,L"",WS_VISIBLE|WS_CHILD|WS_TABSTOP|TBS_AUTOTICKS,
+            kMargin,y,kFieldW,34,hwnd,reinterpret_cast<HMENU>(ID_SLIDER_PPD),nullptr,nullptr);
+        SendMessageW(g_hPpdSlider,TBM_SETLINESIZE,0,1);SendMessageW(g_hPpdSlider,TBM_SETPAGESIZE,0,10);
+        SendMessageW(g_hPpdSlider,TBM_SETTICFREQ,50,0);y+=36;
+        g_hPpdDetails=MakeLabel(hwnd,L"",kMargin,y,kFieldW,62,g_fontSub);y+=68;
 
         // --- DEBUG ---
         // Master switch for every probe, census and dump in the mod (see debug_gate.cpp).
         // Off is the normal way to play: with it ticked the log grows by tens of MB and the
         // frame time goes with it, because probes like SightAxisProbe take a mutex thousands
         // of times a frame.
-        g_hDebug = CreateWindowW(L"BUTTON", L"DEBUG  (probes + verbose log, slow)",
+        g_hDebug = CreateWindowW(L"BUTTON", L"ОТЛАДКА (замеры и журнал; медленно)",
             WS_TABSTOP | WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX,
             kMargin, y, kFieldW, 24,
             hwnd, (HMENU)ID_CHECK_DEBUG, nullptr, nullptr);
@@ -433,11 +527,12 @@ LRESULT CALLBACK LauncherWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         y += 40;
 
         // --- Start button ---
-        hwndButton = CreateWindowW(L"BUTTON", L"Start Game",
+        hwndButton = CreateWindowW(L"BUTTON", L"Применить и запустить",
             WS_TABSTOP | WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON,
             kMargin, y, kFieldW, 38,
             hwnd, (HMENU)ID_BUTTON_START, nullptr, nullptr);
         SendMessageW(hwndButton, WM_SETFONT, (WPARAM)g_fontBody, TRUE);
+        g_hStart=hwndButton;RefreshPpdFromSize();
         break;
     }
     case WM_CTLCOLORSTATIC: {
@@ -446,6 +541,7 @@ LRESULT CALLBACK LauncherWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         SetBkMode(hdc, TRANSPARENT);
         if (ctrl == g_hHeader) {
             SetTextColor(hdc, kColHeader);
+        } else if(ctrl==g_hPpdDetails && g_ppdError){SetTextColor(hdc,RGB(170,30,30));
         } else if (ctrl == g_hSub) {
             SetTextColor(hdc, kColSub);
         } else {
@@ -453,9 +549,24 @@ LRESULT CALLBACK LauncherWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         }
         return (LRESULT)g_brushBg;
     }
+    case WM_HSCROLL:
+        if(reinterpret_cast<HWND>(lParam)==g_hPpdSlider && !g_updatingPpd)
+            ApplyPpdValue(SendMessageW(g_hPpdSlider,TBM_GETPOS,0,0)/10.0,true);
+        break;
     case WM_COMMAND: {
         const int notif = HIWORD(wParam);
         const int id    = LOWORD(wParam);
+        if(id==ID_EDIT_PPD && notif==EN_CHANGE && !g_updatingPpd){g_ppdTouched=true;ApplyPpdText();break;}
+        if(id==ID_COMBO_RES && notif==CBN_SELCHANGE){
+            const int hi=SelectedHmdIndex(),ri=int(SendMessageW(g_hRes,CB_GETCURSEL,0,0));
+            if(hi>=0 && hi<int(std::size(kHmdPresets)) && ri>=0 && ri<kHmdPresets[hi].resolutionCount){
+                // A previous custom row must not remain selectable with stale
+                // dimensions after returning to an authored stock preset.
+                if(SendMessageW(g_hRes,CB_GETCOUNT,0,0)>kHmdPresets[hi].resolutionCount)
+                    SendMessageW(g_hRes,CB_DELETESTRING,kHmdPresets[hi].resolutionCount,0);
+                g_selectedWidth=kHmdPresets[hi].resolutions[ri].width;g_selectedHeight=kHmdPresets[hi].resolutions[ri].height;RefreshPpdFromSize();
+            }break;
+        }
 
         // --- Cambio selezione HMD: aggiorna la lista risoluzioni ---
         if (id == ID_COMBO_HMD && notif == CBN_SELCHANGE) {
@@ -465,6 +576,7 @@ LRESULT CALLBACK LauncherWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         }
 
         if (id == ID_BUTTON_START) {
+            if(g_ppdTouched && !ApplyPpdText())break;
             SetLauncherDebugAndPersist(
                 SendMessageW(g_hDebug, BM_GETCHECK, 0, 0) == BST_CHECKED ? 1 : 0);
             // Salva la selezione HMD
@@ -478,18 +590,10 @@ LRESULT CALLBACK LauncherWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 SetRuntimeModeAndPersist(kRuntimeOptions[rIdx].mode);
             }
 
-            int idx = (int)SendMessageW(g_hRes, CB_GETCURSEL, 0, 0);
-            if (idx >= 0) {
-                // Recupera l'HMD corrente per leggere la sua lista risoluzioni
-                int curHmdIdx = (int)SendMessageW(g_hHmd, CB_GETCURSEL, 0, 0);
-                if (curHmdIdx >= 0 && curHmdIdx < static_cast<int>(std::size(kHmdPresets))) {
-                    const HmdPreset& hmd = kHmdPresets[curHmdIdx];
-                    if (idx < hmd.resolutionCount) {
-                        SetWindowResolutionAndPersist(
-                            hmd.resolutions[idx].width,
-                            hmd.resolutions[idx].height);
-                    }
-                }
+            if(g_selectedWidth>0 && g_selectedHeight>0){
+                SetWindowResolutionAndPersist(g_selectedWidth,g_selectedHeight);
+                Log("LauncherPPD: hmd=%d custom=%d render=%dx%d referenceFov=%.3f centerPpd=%.3f\n",
+                    GetCurrentHmdType(),g_ppdTouched?1:0,g_selectedWidth,g_selectedHeight,PpdFov(),cvr::ppd::CenterPpd(g_selectedWidth,PpdFov()));
             }
             g_restoreGameFocus=GetForegroundWindow()==hwnd;
             DestroyWindow(hwnd);
@@ -541,6 +645,8 @@ void WaitForLauncherStartup(unsigned int milliseconds) {
 
 void ShowLauncherDialog() {
     if(g_launcherOpen.exchange(true,std::memory_order_acq_rel))return;
+    INITCOMMONCONTROLSEX common{sizeof(common),ICC_BAR_CLASSES};
+    InitCommonControlsEx(&common);
     g_restoreGameFocus=false;
     struct StartupWindow {
         HWND game{};bool visible{};bool sameThread{};unsigned cursorShows{};
@@ -594,7 +700,7 @@ void ShowLauncherDialog() {
     HWND hwnd = CreateWindowExW(
         extended,
         L"CyberpunkVRPortLauncherClass",
-        L"CyberpunkVRPort Configuration",
+        L"Настройка CyberpunkVRPort",
         style,
         xPos, yPos, winW, winH,
         nullptr, nullptr, wc.hInstance, nullptr

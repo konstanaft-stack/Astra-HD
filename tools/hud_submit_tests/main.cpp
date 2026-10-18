@@ -37,12 +37,13 @@ void SetConsumerReady(bool ready,Channel) {mock::ready=ready;}
 }
 extern "C" {
 XrResult XRAPI_CALL xrEnumerateSwapchainFormats(XrSession,uint32_t capacity,uint32_t* count,int64_t* values) {
-    *count=1;if(capacity)values[0]=DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;return XR_SUCCESS;
+    const int64_t formats[]={DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,DXGI_FORMAT_R8G8B8A8_UNORM,DXGI_FORMAT_B8G8R8A8_UNORM,DXGI_FORMAT_R16G16B16A16_FLOAT};
+    *count=4;if(capacity)std::copy(std::begin(formats),std::end(formats),values);return XR_SUCCESS;
 }
 XrResult XRAPI_CALL xrCreateSwapchain(XrSession,const XrSwapchainCreateInfo* ci,XrSwapchain* out) {
     D3D12_HEAP_PROPERTIES heap{};heap.Type=D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC desc{};desc.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    desc.Width=ci->width;desc.Height=ci->height;desc.Format=DXGI_FORMAT_R8G8B8A8_TYPELESS;
+    desc.Width=ci->width;desc.Height=ci->height;desc.Format=static_cast<DXGI_FORMAT>(ci->format);
     desc.DepthOrArraySize=desc.MipLevels=1;desc.SampleDesc.Count=1;desc.Flags=D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     for(auto& texture:mock::textures)Hr(mock::device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,
         D3D12_RESOURCE_STATE_RENDER_TARGET,nullptr,IID_PPV_ARGS(&texture)));
@@ -79,12 +80,15 @@ int main() try {
         Hr(queue->Signal(done.Get(),++doneValue));HANDLE event=CreateEventW(nullptr,FALSE,FALSE,nullptr);
         Hr(done->SetEventOnCompletion(doneValue,event));auto status=WaitForSingleObject(event,5000);CloseHandle(event);Check(status==WAIT_OBJECT_0,"GPU timeout");
     };
-    auto frame=[&](uint64_t serial,unsigned size=32) {
+    auto frame=[&](uint64_t serial,unsigned size=32,DXGI_FORMAT format=DXGI_FORMAT_R8G8B8A8_UNORM,
+                   D3D12_RESOURCE_STATES state=D3D12_RESOURCE_STATE_COPY_SOURCE) {
         auto f=std::make_shared<Frame>();f->serial=serial;f->stamp=GetTickCount64();f->masked=true;
         D3D12_HEAP_PROPERTIES heap{};heap.Type=D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESOURCE_DESC desc{};desc.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;desc.Width=desc.Height=size;
-        desc.DepthOrArraySize=desc.MipLevels=1;desc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;desc.SampleDesc.Count=1;
-        Hr(device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,D3D12_RESOURCE_STATE_COPY_SOURCE,nullptr,IID_PPV_ARGS(&f->canvas)));
+        desc.DepthOrArraySize=desc.MipLevels=1;desc.Format=format;desc.SampleDesc.Count=1;
+        if(state==D3D12_RESOURCE_STATE_RENDER_TARGET)desc.Flags=D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        f->restingState=state;
+        Hr(device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,state,nullptr,IID_PPV_ARGS(&f->canvas)));
         return f;
     };
     g_liveControls.xrHudStereoDepth=1;g_liveControls.xrHudFollowMode=0;
@@ -129,16 +133,90 @@ int main() try {
     mock::source=frame(9,64);const auto destroyedBefore=mock::destroys;
     Check(prepare()==nullptr && mock::destroys==destroyedBefore,"unready image destroyed on resize");
     mock::timeout=false;Check(prepare()!=nullptr && mock::destroys==destroyedBefore+1,"resize recovery failed");drain();
-    mock::source=frame(10,64);CyberpunkVR_HudSubmitRing=0;Check(prepare()!=nullptr,"legacy A/B path failed");drain();
+    mock::source=frame(10,64);CyberpunkVR_HudSubmitRing=0;
+    mock::ready=true;
+    const XrExtent2Df explicitSize{2,2};
+    Check(!quad.PrepareExplicit(reinterpret_cast<XrSession>(1),reinterpret_cast<XrSpace>(1),
+          device.Get(),queue.Get(),mock::source,head,explicitSize,3),"HUD instance admitted explicit preparation");
+    Check(mock::ready,"wrong-mode explicit call changed HUD consumer readiness");
+    Check(prepare()!=nullptr,"wrong-mode call disabled subsequent ordinary HUD preparation");drain();
     CyberpunkVR_HudSubmitRing=1;mock::source.reset();Check(prepare()==nullptr && !mock::ready,"missing source retained HUD");
     quad.Shutdown();Check(!mock::acquired && mock::acquires==mock::releases,"unbalanced XR lifecycle");
 
+    {
+        mock::ready=true;
+        {Quad unusedEditor(Quad::Mode::Explicit);unusedEditor.Shutdown();}
+        Check(mock::ready,"unused explicit instance changed main HUD consumer readiness");
+        Quad editor(Quad::Mode::Explicit);
+        const auto session=reinterpret_cast<XrSession>(1);
+        const auto space=reinterpret_cast<XrSpace>(2);
+        XrPosef pose{{0,0,0,1},{0,1.6f,-1}};XrExtent2Df size{2.5139f,2.8f};
+        auto source=frame(100);source->masked=false;
+        auto owner=std::make_shared<int>(42);std::weak_ptr<int> held=owner;
+        source->retainedOwner=owner;source->producerFence=gate;source->producerValue=3;
+        auto explicitPrepare=[&](const std::shared_ptr<Frame>& f) {
+            return reinterpret_cast<const XrCompositionLayerQuad*>(editor.PrepareExplicit(session,space,device.Get(),queue.Get(),f,pose,size,3));
+        };
+        mock::ready=true;
+        auto invalid=std::make_shared<Frame>(*source);invalid->retainedOwner.reset();
+        const auto before=mock::acquires;
+        Check(!explicitPrepare(invalid) && mock::acquires==before,"unowned external source admitted");invalid.reset();
+        source->producerValue=UINT64_MAX;Check(!explicitPrepare(source),"sentinel producer value admitted");source->producerValue=3;
+        pose.orientation.w=0;Check(!explicitPrepare(source),"invalid pose admitted");pose.orientation.w=1;
+        auto layer=explicitPrepare(source);
+        Check(layer && layer->space==space && layer->eyeVisibility==XR_EYE_VISIBILITY_BOTH &&
+              !editor.SecondEye() && layer->layerFlags==3 && mock::ready,"explicit layer changed HUD handshake or eye policy");
+        Check(!memcmp(&layer->pose,&pose,sizeof(pose)) && !memcmp(&layer->size,&size,sizeof(size)),"explicit placement changed");
+        // This queue is blocked ONLY by the external producer dependency.
+        Hr(queue->Signal(done.Get(),++doneValue));Sleep(20);
+        Check(done->GetCompletedValue()<doneValue,"external producer fence was not queued before copy");
+        owner.reset();source.reset();Check(!held.expired(),"producer owner dropped before copy completion");
+        g_liveControls.xrHudPanel=0;g_liveControls.xrHudFollowMode=2;g_liveControls.xrHudDistance=5;
+        Hr(gate->Signal(3));drain();
+        explicitPrepare({});Check(held.expired(),"completed explicit copy retained producer owner");
+        source=frame(101);source->retainedOwner=std::make_shared<int>(7);source->producerFence=gate;source->producerValue=3;
+        layer=explicitPrepare(source);
+        Check(layer && !memcmp(&layer->pose,&pose,sizeof(pose)) && !memcmp(&layer->size,&size,sizeof(size)),"world-fixed pose followed HUD/category controls");
+        drain();
+        ComPtr<ID3D12CommandQueue> otherQueue;Hr(device->CreateCommandQueue(&qd,IID_PPV_ARGS(&otherQueue)));
+        Check(!editor.PrepareExplicit(session,space,device.Get(),otherQueue.Get(),source,pose,size,3),"different copy queue admitted");
+        Check(!editor.PrepareExplicit(reinterpret_cast<XrSession>(2),space,device.Get(),queue.Get(),source,pose,size,3),"different session admitted");
+        for(auto format:{DXGI_FORMAT_B8G8R8A8_UNORM,DXGI_FORMAT_R16G16B16A16_FLOAT}) {
+            source=frame(++clock,32,format,D3D12_RESOURCE_STATE_RENDER_TARGET);
+            source->retainedOwner=std::make_shared<int>(8);source->producerFence=gate;source->producerValue=3;
+            Check(explicitPrepare(source)!=nullptr,"supported format/state copy rejected");drain();
+        }
+        source=frame(++clock,32,DXGI_FORMAT_R32_FLOAT);source->retainedOwner=std::make_shared<int>(9);
+        source->producerFence=gate;source->producerValue=3;
+        const auto acquiredAtUnsupported=mock::acquires;
+        Check(!explicitPrepare(source) && mock::acquires==acquiredAtUnsupported,"unsupported source format was reinterpreted");
+        drain();editor.Shutdown();
+        g_liveControls.xrHudPanel=1;
+    }
     ComPtr<ID3D12InfoQueue> info;
     if(SUCCEEDED(device.As(&info)))for(UINT64 i=0;i<info->GetNumStoredMessages();++i) {
         SIZE_T bytes{};info->GetMessage(i,nullptr,&bytes);std::vector<uint8_t> storage(bytes);auto* message=reinterpret_cast<D3D12_MESSAGE*>(storage.data());
         info->GetMessage(i,message,&bytes);
         if(message->Severity<=D3D12_MESSAGE_SEVERITY_ERROR){std::cerr<<message->pDescription<<'\n';throw std::runtime_error("D3D12 validation failed");}
     }
-    std::cout<<"PASS delayed GPU, three fenced slots, source lifetime, busy/stale metadata, XR timeout recovery, repeat, disable, resize and legacy switch\n";
+    // A removed-device sentinel does not prove a queued copy completed.
+    Hr(queue->Wait(gate.Get(),4));
+    std::weak_ptr<Frame> pending;
+    std::weak_ptr<int> pendingOwner;
+    const auto destroyedAtRemoval=mock::destroys;
+    {
+        Quad removed(Channel::Interaction);
+        mock::source=frame(11);pending=mock::source;
+        auto owner=std::make_shared<int>(11);pendingOwner=owner;mock::source->retainedOwner=owner;owner.reset();
+        Check(removed.Prepare(reinterpret_cast<XrSession>(1),reinterpret_cast<XrSpace>(1),device.Get(),queue.Get(),true,true,head,1,clock)!=nullptr,"removal setup failed");
+        mock::source.reset();
+        ComPtr<ID3D12Device5> removal;Hr(device.As(&removal));removal->RemoveDevice();
+        Check(done->GetCompletedValue()==UINT64_MAX,"RemoveDevice did not produce sentinel");
+        removed.Prepare(reinterpret_cast<XrSession>(1),reinterpret_cast<XrSpace>(1),device.Get(),queue.Get(),false,true,head,1,clock);
+        Check(!pending.expired(),"removed-device sentinel retired a pending HUD source");
+        removed.Shutdown();
+    }
+    Check(!pending.expired() && !pendingOwner.expired() && mock::destroys==destroyedAtRemoval,"unsafe HUD teardown released pending copy ownership");
+    std::cout<<"PASS healthy HUD contracts; explicit pose/input/format/state/producer wait/owner lifetime; removed-device retention through disable/shutdown/destructor\n";
     return 0;
 } catch(const std::exception& e) {std::cerr<<e.what()<<'\n';return 1;}

@@ -35,6 +35,7 @@ struct QueueState {
     ComPtr<ID3D12CommandQueue> queue;
     ComPtr<ID3D12Fence> fence;
     uint64_t value{};
+    bool completionUnknown{};
     std::deque<Flight> flights;
 };
 std::mutex mutex;
@@ -50,8 +51,17 @@ void PruneRecordings() {
 void CollectLocked() {
     bool pending = false;
     for (auto& [_, state] : queues) {
-        const auto done = state.fence ? state.fence->GetCompletedValue() : 0;
-        while (!state.flights.empty() && state.flights.front().value <= done) state.flights.pop_front();
+        if (!state.completionUnknown) {
+            const auto done = state.fence ? state.fence->GetCompletedValue() : 0;
+            if (done == UINT64_MAX) {
+                // Device removal is not a completed watermark. Retain this
+                // queue's immutable batches even across later collection/reset.
+                state.completionUnknown = true;
+                failed.store(true, std::memory_order_relaxed);
+            } else {
+                while (!state.flights.empty() && state.flights.front().value <= done) state.flights.pop_front();
+            }
+        }
         pending |= !state.flights.empty();
     }
     haveFlights.store(pending, std::memory_order_release);
@@ -62,6 +72,7 @@ bool KeepCommandResources(ID3D12GraphicsCommandList* list, std::initializer_list
     if (!list || failed.load(std::memory_order_relaxed)) return false;
     try {
         std::lock_guard lock(mutex);
+        if (failed.load(std::memory_order_relaxed)) return false;
         PruneRecordings();
         auto batch = std::make_shared<ResourceBatch>();
         const auto previous = recordings.find(list);
@@ -103,6 +114,12 @@ void SubmitCommandResources(ID3D12CommandQueue* queue, ResourceSubmission submis
     if (submission.batches.empty()) return;
     std::lock_guard lock(mutex);
     CollectLocked();
+    if (failed.load(std::memory_order_relaxed)) {
+        // Execute has already happened; a delayed post-hook must keep its
+        // operands alive without issuing another signal on the failed device.
+        failedSubmissions.push_back(std::move(submission));
+        return;
+    }
     auto& state = queues[queue];
     if (!state.fence && queue) {
         ComPtr<ID3D12Device> device;

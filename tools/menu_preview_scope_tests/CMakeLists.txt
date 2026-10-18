@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.20)
+project(menu_preview_scope_tests LANGUAGES CXX)
+add_executable(menu_preview_scope_tests main.cpp)
+target_compile_features(menu_preview_scope_tests PRIVATE cxx_std_20)
+target_include_directories(menu_preview_scope_tests PRIVATE ../../include)
+enable_testing()
+add_test(NAME menu_preview_scope_policy COMMAND menu_preview_scope_tests)

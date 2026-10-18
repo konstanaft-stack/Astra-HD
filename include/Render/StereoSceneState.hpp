@@ -36,6 +36,9 @@ void Stencil(ID3D12GraphicsCommandList*,UINT);
 void ShadingRate(ID3D12GraphicsCommandList*,D3D12_SHADING_RATE,const D3D12_SHADING_RATE_COMBINER*);
 void ShadingRateImage(ID3D12GraphicsCommandList*,ID3D12Resource*);
 bool Snapshot(ID3D12GraphicsCommandList*,Bindings&);
+// Read-only compute bindings; does not relax the graphics replay contract.
+bool SnapshotCompute(ID3D12GraphicsCommandList*,Bindings&);
+void Retire(ID3D12GraphicsCommandList*);
 void RtvCreated(ID3D12Resource*,const D3D12_RENDER_TARGET_VIEW_DESC*,D3D12_CPU_DESCRIPTOR_HANDLE);
 void DsvCreated(ID3D12Resource*,const D3D12_DEPTH_STENCIL_VIEW_DESC*,D3D12_CPU_DESCRIPTOR_HANDLE);
 bool CaptureTargets(const native_probe::DrawRecord&,Targets&);

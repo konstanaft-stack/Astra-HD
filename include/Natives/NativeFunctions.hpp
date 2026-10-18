@@ -1,4 +1,5 @@
 #pragma once
+#include <RED4ext/Scripting/Natives/entIPlacedComponent.hpp>
 
 
 // ================================================================================================
@@ -25,6 +26,21 @@ void VRHudPanelUpdate(RED4ext::IScriptable*, RED4ext::CStackFrame*, int32_t*, in
 void VRReflexTiming(RED4ext::IScriptable*, RED4ext::CStackFrame*, RED4ext::CString*, int64_t);
 void GetVRMouseYDisabled(RED4ext::IScriptable*, RED4ext::CStackFrame*, bool*, int64_t);
 void VRShouldScanBodyCapsules(RED4ext::IScriptable*, RED4ext::CStackFrame*, bool*, int64_t);
+void VRPreviewScopeBegin(RED4ext::IScriptable*, RED4ext::CStackFrame*, uint32_t*, int64_t);
+void VRPreviewEditorActorAnchor(RED4ext::IScriptable*, RED4ext::CStackFrame*, bool*, int64_t);
+void VRPreviewScopeUpdate(RED4ext::IScriptable*, RED4ext::CStackFrame*, bool*, int64_t);
+void VRPreviewScopeClear(RED4ext::IScriptable*, RED4ext::CStackFrame*, bool*, int64_t);
+void VRPreviewLocalHalfIpd(RED4ext::IScriptable*, RED4ext::CStackFrame*, float*, int64_t);
+void VRPreviewStereoUiEnabled(RED4ext::IScriptable*, RED4ext::CStackFrame*, bool*, int64_t);
+void VRPreviewStereoUiPairSubmitted(RED4ext::IScriptable*, RED4ext::CStackFrame*, bool*, int64_t);
+void VRPreviewStereoUiCanAdvance(RED4ext::IScriptable*, RED4ext::CStackFrame*, bool*, int64_t);
+void VRPreviewLocalClock(RED4ext::IScriptable*, RED4ext::CStackFrame*, float*, int64_t);
+void VRPreviewLocalPrepare(RED4ext::IScriptable*, RED4ext::CStackFrame*, bool*, int64_t);
+void VRPreviewLocalPublish(RED4ext::IScriptable*, RED4ext::CStackFrame*, bool*, int64_t);
+void VRPreviewLocalReset(RED4ext::IScriptable*, RED4ext::CStackFrame*, bool*, int64_t);
+void VRPreviewWidgetAliasEnabled(RED4ext::IScriptable*, RED4ext::CStackFrame*, bool*, int64_t);
+void VRPreviewObserveTypedImage(RED4ext::IScriptable*, RED4ext::CStackFrame*, bool*, int64_t);
+void VRPreviewLocalCamera(RED4ext::IScriptable*, RED4ext::CStackFrame*, RED4ext::Handle<RED4ext::ent::IPlacedComponent>*, int64_t);
 
 void ArmVRAnimPosePlayer(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, int32_t* aOut, int64_t a4);
 void DumpAnimControllerComponents(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, int32_t* aOut, int64_t a4);
@@ -67,6 +83,7 @@ void GetVRProjDump(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame,
 void GetVRProjLiveDump(RED4ext::IScriptable*, RED4ext::CStackFrame* aFrame, float* aOut, int64_t);
 void GetVRProvDump(RED4ext::IScriptable*, RED4ext::CStackFrame* aFrame, float* aOut, int64_t);
 void GetVRSharedSlot(RED4ext::IScriptable*, RED4ext::CStackFrame* aFrame, float* aOut, int64_t);
+void SetVRRightGripRoute(RED4ext::IScriptable*, RED4ext::CStackFrame* aFrame, int32_t* aOut, int64_t);
 void GetVRSmokeCigVisualScaleY(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float* aOut, int64_t a4);
 void GetVRTrace(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float* aOut, int64_t a4);
 void GetVRTraceCaller(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, float* aOut, int64_t a4);
@@ -174,7 +191,11 @@ void VRScannerSlotSave(RED4ext::IScriptable*, RED4ext::CStackFrame* aFrame, int3
 // 1 while a device screen (computer, terminal) is up; lets the right stick's Y reach the game's UI.
 void SetVRDeviceScreen(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, int32_t* aOut, int64_t a4);
 void VRKeypadUpdate(RED4ext::IScriptable*, RED4ext::CStackFrame*, int32_t*, int64_t);
+void SetVRBarrelRayHit(RED4ext::IScriptable*, RED4ext::CStackFrame* aFrame, void*, int64_t);
+void QueryVRNpcHitSurface(RED4ext::IScriptable*, RED4ext::CStackFrame* aFrame, RED4ext::Vector4* aOut, int64_t);
+void SetVRLaserRangedWeaponState(RED4ext::IScriptable*, RED4ext::CStackFrame* aFrame, void*, int64_t);
 void SetVRMuzzlePos(RED4ext::IScriptable*, RED4ext::CStackFrame* aFrame, void*, int64_t);
+void SetVRSightOrigin(RED4ext::IScriptable*, RED4ext::CStackFrame* aFrame, void*, int64_t);
 // The aim line's hit point and surface normal, from the weapon module's own raycast.
 void SetVRAimHit(RED4ext::IScriptable*, RED4ext::CStackFrame* aFrame, void*, int64_t);
 // The equipped weapon's class, from its record: 0 unknown, 1 handgun/revolver, 2 rifle, 3 shotgun.

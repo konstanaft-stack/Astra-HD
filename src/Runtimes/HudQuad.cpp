@@ -18,12 +18,22 @@ __declspec(dllexport) std::atomic<uint32_t> CyberpunkVR_HudSubmitRing{1};
 }
 namespace cvr::hud {
 void Quad::RetireCompleted(uint64_t completed) {
+    if(submissionFailed)return;
+    if(completed==UINT64_MAX){submissionFailed=true;return;}
     for(auto& slot:copies) if(slot.frame && slot.fenceValue<=completed) slot.frame.reset();
 }
-bool Quad::Ensure(XrSession session, ID3D12Device* device, uint32_t w, uint32_t h) {
+bool Quad::Ensure(XrSession session, ID3D12Device* device, uint32_t w, uint32_t h,DXGI_FORMAT format) {
     if(submissionFailed)return false;
-    if (swapchain && w==width && h==height) return true;
-    if (fence && fence->GetCompletedValue()<fenceValue) return false;
+    if(swapchain && swapchainSession!=session)return false;
+    if(fence) {
+        Microsoft::WRL::ComPtr<ID3D12Device> ownerDevice;
+        if(FAILED(fence->GetDevice(IID_PPV_ARGS(&ownerDevice))) || ownerDevice.Get()!=device)return false;
+        const auto completed=fence->GetCompletedValue();
+        RetireCompleted(completed);
+        if(submissionFailed)return false;
+        if(swapchain && w==width && h==height && imageFormat==format)return true;
+        if(completed<fenceValue)return false;
+    }
     if (swapchain) {
         if(acquired) {
             XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};wait.timeout=0;
@@ -38,7 +48,7 @@ bool Quad::Ensure(XrSession session, ID3D12Device* device, uint32_t w, uint32_t 
     if (XR_FAILED(xrEnumerateSwapchainFormats(session,0,&count,nullptr))) return false;
     std::vector<int64_t> formats(count);
     if (XR_FAILED(xrEnumerateSwapchainFormats(session,count,&count,formats.data())) ||
-        std::find(formats.begin(),formats.end(),DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)==formats.end()) return false;
+        std::find(formats.begin(),formats.end(),format)==formats.end()) return false;
     if (!fence && FAILED(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence)))) return false;
     if (!event) event=CreateEventW(nullptr,FALSE,FALSE,nullptr);
     if (!event) return false;
@@ -51,14 +61,15 @@ bool Quad::Ensure(XrSession session, ID3D12Device* device, uint32_t w, uint32_t 
     }
     XrSwapchainCreateInfo ci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
     ci.usageFlags=XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT|XR_SWAPCHAIN_USAGE_SAMPLED_BIT|XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
-    ci.format=DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    ci.format=format;
     ci.sampleCount=1; ci.width=w; ci.height=h; ci.faceCount=1; ci.arraySize=1; ci.mipCount=1;
     if (XR_FAILED(xrCreateSwapchain(session,&ci,&swapchain))) return false;
+    swapchainSession=session;
     if (XR_FAILED(xrEnumerateSwapchainImages(swapchain,0,&count,nullptr)) || !count) return false;
     images.assign(count,{XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR});
     if (XR_FAILED(xrEnumerateSwapchainImages(swapchain,count,&count,
         reinterpret_cast<XrSwapchainImageBaseHeader*>(images.data())))) return false;
-    width=w; height=h; lastStamp=0;publishedTick=0;publishedMasked=publishedLootVisible=false;
+    width=w; height=h;imageFormat=format; lastStamp=0;publishedTick=0;publishedMasked=publishedLootVisible=false;
     Log("[hud-panel] XR layer ready %ux%u (%u images)\n",w,h,count);
     return true;
 }
@@ -105,13 +116,23 @@ bool Quad::UpdateImage(const std::shared_ptr<Frame>& frame,ID3D12CommandQueue* q
         b.Transition={images[acquiredIndex].texture,D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                       D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COPY_DEST};
         commands->ResourceBarrier(1,&b);
+        D3D12_RESOURCE_BARRIER source{};source.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        source.Transition={frame->canvas.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                          frame->restingState,D3D12_RESOURCE_STATE_COPY_SOURCE};
+        if(frame->restingState!=D3D12_RESOURCE_STATE_COPY_SOURCE)commands->ResourceBarrier(1,&source);
         commands->CopyResource(images[acquiredIndex].texture,frame->canvas.Get());
+        if(frame->restingState!=D3D12_RESOURCE_STATE_COPY_SOURCE) {
+            std::swap(source.Transition.StateBefore,source.Transition.StateAfter);commands->ResourceBarrier(1,&source);
+        }
         std::swap(b.Transition.StateBefore,b.Transition.StateAfter);commands->ResourceBarrier(1,&b);
     }
     if(FAILED(commands->Close())){release();return false;}
+    if(frame->producerFence && FAILED(queue->Wait(frame->producerFence.Get(),frame->producerValue))) {
+        submissionFailed=true;release();return false;
+    }
     // The exact source remains alive until THIS slot's submitted copy completes.
     // No slot or allocator is reused merely because another copy has completed.
-    slot.frame=frame;slot.fenceValue=++fenceValue;
+    slot.frame=frame;slot.fenceValue=++fenceValue;submittedQueue=queue;
     ID3D12CommandList* lists[]={commands};queue->ExecuteCommandLists(1,lists);
     const bool signaled=SUCCEEDED(queue->Signal(fence.Get(),slot.fenceValue));
     if(signaled)cvr::gpu::profile::Submitted(gpuProfile,queue,fence.Get(),slot.fenceValue);
@@ -128,6 +149,7 @@ const XrCompositionLayerBaseHeader* Quad::Prepare(XrSession session, XrSpace spa
     bool tracked, const XrPosef& head, uint64_t origin,
     XrTime displayTime, const XrVector3f* eyeOffsets, float bodyYaw) {
     secondEye=false;
+    if(explicitMode)return nullptr;
     if (!enabled || !g_liveControls.xrHudPanel || (channel==Channel::Interaction && !g_liveControls.xrInteractionPanel)) {
         if(fence && !submissionFailed)RetireCompleted(fence->GetCompletedValue());
         SetConsumerReady(false,channel); follow.Reset(); clock.Reset(); return nullptr;
@@ -214,23 +236,92 @@ const XrCompositionLayerBaseHeader* Quad::Prepare(XrSession session, XrSpace spa
     return reinterpret_cast<const XrCompositionLayerBaseHeader*>(&layer);
 }
 
+const XrCompositionLayerBaseHeader* Quad::PrepareExplicit(XrSession session,XrSpace space,
+    ID3D12Device* device,ID3D12CommandQueue* queue,const std::shared_ptr<Frame>& frame,
+    const XrPosef& pose,const XrExtent2Df& size,XrCompositionLayerFlags flags) {
+    if(!explicitMode)return nullptr;
+    secondEye=false;
+    if(!frame) {if(fence)RetireCompleted(fence->GetCompletedValue());return nullptr;}
+    constexpr auto allowed=XR_COMPOSITION_LAYER_CORRECT_CHROMATIC_ABERRATION_BIT |
+        XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT | XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
+    const auto& q=pose.orientation;const auto& p=pose.position;
+    const float norm=q.x*q.x+q.y*q.y+q.z*q.z+q.w*q.w;
+    if(!session || !space || !device || !queue || (submittedQueue && submittedQueue.Get()!=queue) || !frame->canvas || !frame->serial ||
+       !frame->retainedOwner || !frame->producerFence || !frame->producerValue ||
+       frame->producerValue==UINT64_MAX || (flags & ~allowed) ||
+       !std::isfinite(p.x)||!std::isfinite(p.y)||!std::isfinite(p.z)||
+       !std::isfinite(norm)||fabsf(norm-1.f)>.001f ||
+       !std::isfinite(size.width)||!std::isfinite(size.height)||size.width<=0||size.height<=0)return nullptr;
+    if(frame->restingState!=D3D12_RESOURCE_STATE_COPY_SOURCE &&
+       frame->restingState!=D3D12_RESOURCE_STATE_RENDER_TARGET &&
+       frame->restingState!=D3D12_RESOURCE_STATE_COMMON)return nullptr;
+    Microsoft::WRL::ComPtr<ID3D12Device> sourceDevice,queueDevice,producerDevice;
+    if(FAILED(frame->canvas->GetDevice(IID_PPV_ARGS(&sourceDevice))) ||
+       FAILED(queue->GetDevice(IID_PPV_ARGS(&queueDevice))) ||
+       FAILED(frame->producerFence->GetDevice(IID_PPV_ARGS(&producerDevice))) ||
+       sourceDevice.Get()!=device || queueDevice.Get()!=device || producerDevice.Get()!=device ||
+       queue->GetDesc().Type!=D3D12_COMMAND_LIST_TYPE_DIRECT)return nullptr;
+    if(frame->producerFence->GetCompletedValue()==UINT64_MAX){submissionFailed=true;return nullptr;}
+    const auto desc=frame->canvas->GetDesc();
+    auto format=desc.Format;
+    if(format==DXGI_FORMAT_R8G8B8A8_TYPELESS)format=DXGI_FORMAT_R8G8B8A8_UNORM;
+    if(format==DXGI_FORMAT_B8G8R8A8_TYPELESS)format=DXGI_FORMAT_B8G8R8A8_UNORM;
+    if(format!=DXGI_FORMAT_R8G8B8A8_UNORM && format!=DXGI_FORMAT_R8G8B8A8_UNORM_SRGB &&
+       format!=DXGI_FORMAT_B8G8R8A8_UNORM && format!=DXGI_FORMAT_B8G8R8A8_UNORM_SRGB &&
+       format!=DXGI_FORMAT_R16G16B16A16_FLOAT)return nullptr;
+    if(desc.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D || !desc.Width || desc.Width>INT32_MAX ||
+       !desc.Height || desc.Height>INT32_MAX || desc.DepthOrArraySize!=1 || desc.MipLevels!=1 ||
+       desc.SampleDesc.Count!=1 || desc.SampleDesc.Quality)return nullptr;
+    if(!Ensure(session,device,static_cast<uint32_t>(desc.Width),desc.Height,format) ||
+       !UpdateImage(frame,queue,true) || lastStamp!=frame->serial)return nullptr;
+    // No head/body/category state is read here: placement belongs to the caller.
+    layer.pose=pose;layer.size=size;layer.layerFlags=flags;layer.space=space;
+    layer.eyeVisibility=XR_EYE_VISIBILITY_BOTH;
+    layer.subImage={swapchain,{{0,0},{static_cast<int32_t>(width),static_cast<int32_t>(height)}},0};
+    return reinterpret_cast<const XrCompositionLayerBaseHeader*>(&layer);
+}
+
+void Quad::RetainUnsafe() {
+    // Completion is unknown, including a failed Signal after Execute. Intentionally
+    // quarantine this bounded ring until process exit; even destruction of Quad
+    // must not drop the external producer lease or destroy its XR destination.
+    struct Retained {
+        std::array<CopySlot,3> copies;
+        Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+        Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;
+        std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> images;
+        XrSwapchain swapchain;HANDLE event;
+    };
+    auto* retained=new Retained{std::move(copies),std::move(fence),std::move(submittedQueue),{},swapchain,event};
+    for(const auto& image:images)retained->images.emplace_back(image.texture);
+    images.clear();swapchain=XR_NULL_HANDLE;swapchainSession=XR_NULL_HANDLE;event=nullptr;acquired=false;
+    submissionFailed=true;
+    Log("[hud-panel] GPU completion unknown; retaining copy ring and XR destination\n");
+}
+
 void Quad::Shutdown() {
-    SetConsumerReady(false,channel);
-    if (fence && fence->GetCompletedValue()<fenceValue && event) {
-        fence->SetEventOnCompletion(fenceValue,event);
-        if (WaitForSingleObject(event,1000)!=WAIT_OBJECT_0) return;
+    if(!explicitMode)SetConsumerReady(false,channel);
+    if(fence) {
+        auto completed=fence->GetCompletedValue();RetireCompleted(completed);
+        if(submissionFailed){RetainUnsafe();return;}
+        if(completed<fenceValue) {
+            if(!event || FAILED(fence->SetEventOnCompletion(fenceValue,event)) ||
+               WaitForSingleObject(event,1000)!=WAIT_OBJECT_0){RetainUnsafe();return;}
+            completed=fence->GetCompletedValue();RetireCompleted(completed);
+            if(submissionFailed || completed<fenceValue){RetainUnsafe();return;}
+        }
     }
     if(swapchain && acquired) {
         XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};wait.timeout=100000000;
-        if(xrWaitSwapchainImage(swapchain,&wait)!=XR_SUCCESS)return;
+        if(xrWaitSwapchainImage(swapchain,&wait)!=XR_SUCCESS){RetainUnsafe();return;}
         XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-        if(XR_FAILED(xrReleaseSwapchainImage(swapchain,&release)))return;
+        if(XR_FAILED(xrReleaseSwapchainImage(swapchain,&release))){RetainUnsafe();return;}
         acquired=false;
     }
     if (swapchain) xrDestroySwapchain(swapchain);
-    swapchain=XR_NULL_HANDLE; acquired=false; images.clear(); width=height=0; lastStamp=0; follow.Reset();clock.Reset();secondEye=false;
+    swapchain=XR_NULL_HANDLE;swapchainSession=XR_NULL_HANDLE; acquired=false; images.clear(); width=height=0; lastStamp=0; follow.Reset();clock.Reset();secondEye=false;
     for(auto& slot:copies){slot.frame.reset();slot.commands.Reset();slot.allocator.Reset();slot.fenceValue=0;}
-    copyCursor=0;fence.Reset();fenceValue=0;publishedTick=0;publishedMasked=publishedLootVisible=false;submissionFailed=false;
+    copyCursor=0;fence.Reset();submittedQueue.Reset();fenceValue=0;imageFormat=DXGI_FORMAT_UNKNOWN;publishedTick=0;publishedMasked=publishedLootVisible=false;
     if (event) CloseHandle(event); event=nullptr;
 }
 }

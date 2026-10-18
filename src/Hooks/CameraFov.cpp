@@ -14,6 +14,8 @@
 #include "Utils/AobScanner.hpp"
 #include "Utils/MemorySafe.hpp"
 #include "Runtimes/RuntimeFovCorrection.hpp"
+#include "Overlay/PpdNativeApply.hpp"
+#include "Framegen/Framegen.hpp"
 
 #include <windows.h>
 #include <cstdint>
@@ -35,6 +37,7 @@ uint64_t g_normalFovHookHits = 0;
 // no LOD site consumes it. Kept because the log line is load-bearing for diagnosis, and
 // named here so the next reader does not spend an afternoon assuming the engine reads it.
 
+extern "C" int CyberpunkVR_StereoSubmit;
 extern "C" void __fastcall OnNormalFovHookCallback(void* cameraState, float originalFov) {
     g_normalFovHookHits++;
     g_dbgLastOriginalFov = originalFov;
@@ -49,12 +52,27 @@ extern "C" void __fastcall OnNormalFovHookCallback(void* cameraState, float orig
 
     // Moved above the decision: sizing the frustum to COVER the panel needs the aspect, because the
     // engine derives the vertical from it (PR #24).
-    const float aspect = (g_launcherWidth > 1 && g_launcherHeight > 1)
-        ? (static_cast<float>(g_launcherWidth) / static_cast<float>(g_launcherHeight))
+    // A live native request owns one coherent W/H pair. This is the projection
+    // input, not acknowledgment of a resized GPU source; source-epoch acceptance
+    // remains separate. The launcher/authored VRCAM selection is unchanged.
+    const auto nativeSize=cvr::ppd::ReadNativeRequestedSize();
+    const int projectionWidth=nativeSize ? static_cast<int>(nativeSize->size.width) : g_launcherWidth;
+    const int projectionHeight=nativeSize ? static_cast<int>(nativeSize->size.height) : g_launcherHeight;
+    const float aspect = (projectionWidth > 1 && projectionHeight > 1)
+        ? (static_cast<float>(projectionWidth) / static_cast<float>(projectionHeight))
         : 1.0f;
 
     float targetHDeg = 0.0f;
-    if (forced > 1.0f && forced < 170.0f) {
+    if(CyberpunkVR_StereoSubmit || cvr::framegen::GetSettings().aerV2){
+        XrFovf raw[2]{};
+        if(OpenXRManager::Get().GetCurrentEyeFovs(raw)){
+            const auto optics=cvr::ppd::BuildReferenceOptics({
+                cvr::ppd::PpdRenderedFov{raw[0].angleLeft,raw[0].angleRight,raw[0].angleUp,raw[0].angleDown},
+                cvr::ppd::PpdRenderedFov{raw[1].angleLeft,raw[1].angleRight,raw[1].angleUp,raw[1].angleDown}});
+            const auto fit=cvr::ppd::CalibrateReferenceOptics(projectionWidth,projectionHeight,optics);
+            if(fit.valid)targetHDeg=2.f*cvr::ppd::ReferenceSourceFov(projectionWidth,projectionHeight,fit).angleRight/kD2R;
+        }
+    } else if (forced > 1.0f && forced < 170.0f) {
         targetHDeg = forced;                      // xr_force_fov has always meant the horizontal
     } else {
         XrFovf lf{}, rf{};
@@ -91,7 +109,7 @@ extern "C" void __fastcall OnNormalFovHookCallback(void* cameraState, float orig
     if (s_fovLog < 20) {
         Log("NormalFOV: original=%.3f xr_force_fov=%.3f targetH=%.3f aspect=%.5f (%dx%d)"
             " -> wroteV=%.3f derivedH=%.3f\n",
-            originalFov, forced, targetHDeg, aspect, g_launcherWidth, g_launcherHeight,
+            originalFov, forced, targetHDeg, aspect, projectionWidth, projectionHeight,
             verticalDeg, horizontalDeg);
         s_fovLog++;
     }

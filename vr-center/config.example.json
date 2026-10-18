@@ -1,0 +1,11 @@
+{
+  "game": "C:\\Games\\Steam\\steamapps\\common\\Cyberpunk 2077",
+  "bundle": "C:\\VR-CENTR\\Cyberpunk-VR-Portable",
+  "hold": "C:\\VR-CENTR\\user-first-launch.json",
+  "data": "C:\\VR-CENTR\\data\\Cyberpunk2077",
+  "pwsh": "pwsh",
+  "vortex": "C:\\Program Files\\Vortex\\Vortex.exe",
+  "vortexData": "C:\\VR-CENTR\\Vortex-data",
+  "gameProfilesEnabled": true,
+  "imagePackage": ""
+}

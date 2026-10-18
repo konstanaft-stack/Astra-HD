@@ -1,4 +1,7 @@
 #include "Utils/DebugGate.hpp"
+#include "Framegen/Framegen.hpp"
+#include "Framegen/Inputs.hpp"
+#include "Framegen/SrIdentityDiagnostics.hpp"
 // ViewReuse -- the five things the second eye reuses instead of recomputing.
 //
 // Sky, clouds, distant shadows, local shadows and global illumination. Each of these is expensive and
@@ -686,8 +689,41 @@ using ViewDataCopyFn = __int64 (__fastcall*)(__int64, __int64);
 static ViewDataCopyFn g_orig_vd_copy = nullptr;
 
 static __int64 __fastcall Detour_ViewDataCopy(__int64 dst, __int64 src) {
+    const auto caller=uint64_t(reinterpret_cast<uintptr_t>(_ReturnAddress())-reinterpret_cast<uintptr_t>(g_exe_base));
+    uintptr_t beforeOwner{};uint32_t beforeFrame{};
+    // Only the primary factory293C7C. RTT calls this constructor directly from
+    // 4FBDE0 and supplies a zero index; it must never overwrite this observation.
+    const bool primary=dst && src && !t_rtt_prepare_ours && caller==0x293CD1 &&
+        read_sl_render_clock(&beforeOwner,&beforeFrame);
     if (src && t_rtt_prepare_ours) vd_run_params_for_source(src);
-    return g_orig_vd_copy(dst, src);
+    const auto result=g_orig_vd_copy(dst, src);
+    if(primary && result==dst){
+        __try {
+            uintptr_t afterOwner{};uint32_t afterFrame{};
+            if(read_sl_render_clock(&afterOwner,&afterFrame) && beforeOwner==afterOwner && beforeFrame==afterFrame){
+                // Constructor294C94 owns a16-byte shell;294D2C copied the data.
+                // Read the returned live object here, never after its lifetime.
+                publish_main_sl_frame(afterOwner,afterFrame,*reinterpret_cast<const uint32_t*>(dst+0x1B0));
+            }
+        } __except(EXCEPTION_EXECUTE_HANDLER){}
+    }
+    if(cvr::framegen::SrIdentityTraceRequested() && dst && src){
+        __try {
+            static std::atomic<uint64_t> until{},count{};
+            const uint64_t now=GetTickCount64();uint64_t zero{};
+            if(t_rtt_prepare_ours)until.compare_exchange_strong(zero,now+8000);
+            const auto n=++count;
+            if(n<=8 || (now<until.load()) || n%480==0){
+                uint32_t renderer{};const bool known=cvr::framegen::ReadRenderFrameIndex(&renderer);
+                log("[sl-view-create] dst=%p source=%p ours=%d caller=%llX srcIndex=%u dstIndex=%u key=%llX native=%u known=%d",
+                    reinterpret_cast<void*>(dst),reinterpret_cast<void*>(src),int(t_rtt_prepare_ours),
+                    uint64_t(reinterpret_cast<uintptr_t>(_ReturnAddress())-reinterpret_cast<uintptr_t>(g_exe_base)),
+                    *reinterpret_cast<const uint32_t*>(src+0x1A0),*reinterpret_cast<const uint32_t*>(dst+0x1B0),
+                    *reinterpret_cast<const uint64_t*>(src+0x268),renderer,int(known));
+            }
+        } __except(EXCEPTION_EXECUTE_HANDLER){log("[sl-view-create] unavailable");}
+    }
+    return result;
 }
 CVR_DETOUR("[viewparams] viewData copy sub_140294C94", VIEWDATA_COPY_RVA,
            Detour_ViewDataCopy, g_orig_vd_copy)
@@ -1980,6 +2016,7 @@ constexpr uint32_t kCascCentreLen = 12;
 
 uint8_t g_casc_rec[8][kCascRecScan] = {};
 bool    g_casc_rec_have[8] = {};
+uint64_t g_casc_rec_mode[8] = {};
 
 constexpr uintptr_t kCascBiasOffset = 2664;      // viewData + 2664 + 16 * cascade_idx
 float g_casc_bias_main[8] = {};
@@ -2348,7 +2385,8 @@ static int64_t __fastcall Detour_CascadeNode(void* a1, void* a2) {
 
     // The cascade placement: snapshot it from the view that runs FIRST and give it to the one that runs
     // second, so both eyes rasterise on one texel grid within the same frame.
-    if (CyberpunkVR_CascRecLend && idx >= 0 && idx < 8 && a2) {
+    const auto cascadeMode=cvr::framegen::CascadeLendingEpoch();
+    if (!(cascadeMode&1u) && CyberpunkVR_CascRecLend && idx >= 0 && idx < 8 && a2) {
         __try {
             const uintptr_t ctx = *reinterpret_cast<uintptr_t*>(
                 reinterpret_cast<uint8_t*>(a2) + 0x18);
@@ -2358,8 +2396,9 @@ static int64_t __fastcall Detour_CascadeNode(void* a1, void* a2) {
                 uint8_t* rec = reinterpret_cast<uint8_t*>(mgr + kCascRecBase + kCascRecStride * idx);
                 if (vrcam) {
                     memcpy(g_casc_rec[idx], rec, kCascRecScan);
+                    g_casc_rec_mode[idx] = cascadeMode;
                     g_casc_rec_have[idx] = true;
-                } else if (g_casc_rec_have[idx]) {
+                } else if (g_casc_rec_have[idx] && g_casc_rec_mode[idx]==cascadeMode) {
                     casc_rec_report(idx, rec, g_casc_rec[idx]);
                     if (CyberpunkVR_CascFitProbe) cascfit_note_pre(rec, idx);
                     // THE WHOLE FIT, not two field groups. The first attempt copied only the extent and the
@@ -2791,6 +2830,15 @@ extern "C" __declspec(dllexport) uint32_t CyberpunkVR_CompLendSet = 1;
 extern "C" __declspec(dllexport) uint64_t CyberpunkVR_DebugCompLendWrites = 0;
 extern "C" __declspec(dllexport) uint64_t CyberpunkVR_DebugCompLendSkips = 0;
 
+static bool comp_lend_full_size(const uint32_t wh[2]) {
+    const uint32_t vrcam_w = g_vrcam_sel_w.load(std::memory_order_relaxed);
+    const uint32_t vrcam_h = g_vrcam_sel_h.load(std::memory_order_relaxed);
+    if (!vrcam_w || !vrcam_h) return false;
+    const uint32_t half_w = (vrcam_w / 2u) + (vrcam_w & 1u);
+    const uint32_t half_h = (vrcam_h / 2u) + (vrcam_h & 1u);
+    return wh[0] > half_w && wh[1] > half_h;
+}
+
 static void vd_lend_composition(uintptr_t vd) {
     if (!vd || !CyberpunkVR_CompLendSet) return;
     const uintptr_t set = g_comp_set.load(std::memory_order_acquire);
@@ -2805,12 +2853,11 @@ static void vd_lend_composition(uintptr_t vd) {
         CVR_DIAGNOSTIC(InterlockedIncrement64(reinterpret_cast<volatile LONG64*>(&CyberpunkVR_DebugCompLendSkips)));
         return;
     }
-    // The node loads the pass size out of this object at +0x50/+0x54 and both eyes render at 3072, so
-    // requiring a full-size object is the same guard, for the same reason, as the viewData capture: a
-    // recycled or half-built one does not carry it.
+    // The node loads the pass size out of this object at +0x50/+0x54. Reject half-size or half-built
+    // objects relative to the selected VRCAM resolution, not the original 3072 capture size.
     uint32_t wh[2] = {0, 0};
     if (!cloud_cb_raw_copy(wh, reinterpret_cast<const uint8_t*>(pair[0]) + 0x50, 8) ||
-            wh[0] < 2048 || wh[1] < 2048) {
+            !comp_lend_full_size(wh)) {
         CVR_DIAGNOSTIC(InterlockedIncrement64(reinterpret_cast<volatile LONG64*>(&CyberpunkVR_DebugCompLendSkips)));
         return;
     }
@@ -2833,11 +2880,10 @@ static bool comp_lend_fetch(uint64_t out[2]) {
     uint64_t pair[2] = {0, 0};                              // {value, refcount} at holder + 600
     if (!cloud_cb_raw_copy(pair, reinterpret_cast<const uint8_t*>(holder) + 600, 16) || !pair[0])
         return false;
-    // The node loads the pass size out of this object at +0x50/+0x54 and both eyes render at 3072,
-    // so requiring a full-size object rejects a recycled or half-built one.
+    // Use the same selected-resolution guard as the producer to reject recycled or half-built objects.
     uint32_t wh[2] = {0, 0};
     if (!cloud_cb_raw_copy(wh, reinterpret_cast<const uint8_t*>(pair[0]) + 0x50, 8) ||
-            wh[0] < 2048 || wh[1] < 2048)
+            !comp_lend_full_size(wh))
         return false;
     out[0] = pair[0];
     out[1] = 0;                                             // no refcount, on purpose

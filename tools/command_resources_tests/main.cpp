@@ -94,6 +94,46 @@ int main() try {
     const auto completed = WaitForSingleObject(done, 5000); CloseHandle(done); Check(completed == WAIT_OBJECT_0, "reader timeout");
     CollectCommandResources(); Check(destroyed == 6, "reader resources leaked");
 
-    std::cout << "PASS reset cancellation, GPU-delayed resize, prepare/reset race, replay, list destruction, two queues and retirement\n";
+    // Device removal is not completion. This is a private software WARP device,
+    // never the game's hardware adapter. Block both batches before removing it.
+    ComPtr<ID3D12GraphicsCommandList> removedList, lateList, rejectedList;
+    Hr(device->CreateCommandList(0, desc.Type, allocator(), nullptr, IID_PPV_ARGS(&removedList)));
+    Hr(device->CreateCommandList(0, desc.Type, allocator(), nullptr, IID_PPV_ARGS(&lateList)));
+    Hr(device->CreateCommandList(0, desc.Type, allocator(), nullptr, IID_PPV_ARGS(&rejectedList)));
+    ComPtr<ID3D12Fence> removedGate;
+    Hr(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&removedGate)));
+    Hr(queue->Wait(removedGate.Get(), 1));
+    for (auto* target : {removedList.Get(), lateList.Get()}) {
+        auto* object = new Object;
+        Check(KeepCommandResources(target, {object}), "removed-device setup failed");
+        object->Release(); Hr(target->Close());
+    }
+    ID3D12CommandList* removedCommands[]{removedList.Get()};
+    ID3D12CommandList* lateCommands[]{lateList.Get()};
+    auto removedBatch = PrepareCommandResources(1, removedCommands);
+    auto lateBatch = PrepareCommandResources(1, lateCommands);
+    queue->ExecuteCommandLists(1, removedCommands);
+    SubmitCommandResources(queue.Get(), std::move(removedBatch));
+    queue->ExecuteCommandLists(1, lateCommands);
+    removedList.Reset(); lateList.Reset();
+    CollectCommandResources(); Check(destroyed == 6, "blocked batch was prematurely retired");
+    ComPtr<ID3D12Device5> removal; Hr(device.As(&removal));
+    removal->RemoveDevice();
+    Check(completion->GetCompletedValue() == UINT64_MAX, "WARP did not report removed-device fence sentinel");
+    CollectCommandResources();
+    Check(destroyed == 6, "removed-device sentinel retired a pending GPU resource");
+    // The post-submit hook can arrive after the failure has been latched.
+    SubmitCommandResources(queue.Get(), std::move(lateBatch));
+    CollectCommandResources();
+    Check(destroyed == 6, "late submission lost ownership after device removal");
+    auto* rejected = new Object;
+    const bool accepted = KeepCommandResources(rejectedList.Get(), {rejected});
+    rejected->Release();
+    Check(!accepted, "new recording accepted after completion became unknown");
+    Check(destroyed == 7, "rejected resource retained or removed flights released");
+    CollectCommandResources();
+    Check(destroyed == 7, "repeat collection cleared removed-device retention");
+
+    std::cout << "PASS reset cancellation, GPU-delayed resize, prepare/reset race, replay, two queues, removed-device retention and late submission\n";
     return 0;
 } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }

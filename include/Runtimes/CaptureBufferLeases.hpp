@@ -36,6 +36,9 @@ public:
         const auto found=m_uses.find(resource);
         return found!=m_uses.end() && found->second.writing;
     }
+    uint32_t Readers(uintptr_t resource) const {
+        const auto found=m_uses.find(resource);return found==m_uses.end()?0:found->second.readers;
+    }
 private:
     struct Use { uint32_t readers{};bool writing{}; };
     std::unordered_map<uintptr_t,Use> m_uses;

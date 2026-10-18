@@ -189,6 +189,10 @@ extern "C" void __fastcall OnFinalCameraCallback(float* rsiPtr) {
     // first -- two changes at once and a regression tells you nothing. Flip live to compare.
     {
         if (!CyberpunkVR_CamWriteInFinal) return;
+        // MAIN's AER source already carries an immutable pose and physical eye.
+        // This experimental path uses an unrelated quaternion and adds IPD
+        // again. Keep the readback/overlay above, but never overwrite that source.
+        if (cvr::camera::MainEyeSourceRequested()) return;
 
         // ASK THE DISPATCHER, DO NOT HASH A NAME.
         //

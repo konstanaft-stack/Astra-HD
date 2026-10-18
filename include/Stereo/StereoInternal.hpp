@@ -35,6 +35,11 @@ extern "C" __declspec(dllexport) extern uint64_t CyberpunkVR_DebugVrcamNodeHits;
 
 namespace cvr {
 namespace detail {
+// Process-local, bounded observation of the original native-color/backbuffer junction.
+// Optional native pixel readback has a separate process-local opt-in; render targets are unchanged.
+void ColorPathAuditReset(ID3D12GraphicsCommandList*);
+void ColorPathAuditBeforeSubmit(ID3D12CommandQueue*,UINT,ID3D12CommandList* const*);
+void ColorPathAuditSubmitted(ID3D12CommandQueue*);
 using CloudsNodeFn = char(__fastcall*)(void*, void*);
 using NodeDispatchFn = uint8_t (__fastcall *)(uintptr_t* node, uint8_t* work_context, void* args);
 using WaitOnAddressFn = BOOL (WINAPI *)(volatile VOID*, PVOID, SIZE_T, DWORD);
@@ -233,6 +238,7 @@ struct CommandListVtableHook {
     PFN_ProbeShadingRate shading_rate_original = nullptr; // slot 77, optional list5
     PFN_ProbeShadingImage shading_image_original = nullptr; // slot 78, optional list5
     bool shading_state_known = false;
+    HRESULT (STDMETHODCALLTYPE* close_original)(ID3D12GraphicsCommandList*) = nullptr;
 };
 
 // Function-pointer types the trampoline pointers are declared in terms of. They have to be here
@@ -424,6 +430,9 @@ extern thread_local bool t_vrcam_dlss_post;
 extern thread_local bool t_vrcam_sl_active;
 // Which view an engine object belongs to. Defined with the camera writer.
 uintptr_t sl_view_obj(void* work_context);
+bool read_sl_render_clock(uintptr_t* owner,uint32_t* frame);
+void publish_main_sl_frame(uintptr_t owner,uint32_t frame,uint32_t index);
+bool paired_sl_frame_index(uint32_t* index);
 
 // REPAIRED: this declaration was on the same line as sl_view_obj and three comment fragments, so it
 // sat AFTER a `//` and was switched off. Same generator fault as the nine in Camera/CameraState.hpp.
@@ -523,6 +532,7 @@ extern "C" float    CyberpunkVR_BarrelDotNdcX2;
 extern "C" float    CyberpunkVR_BarrelDotNdcY;
 extern "C" float    CyberpunkVR_BarrelDotRadiusPx;
 extern "C" int      CyberpunkVR_BarrelDotSecondEye;
+extern "C" int      CyberpunkVR_BarrelDotSecondVisible;
 extern "C" unsigned long long CyberpunkVR_BarrelDotTick;
 extern D3D12_CPU_DESCRIPTOR_HANDLE g_own_rtv;
 extern DXGI_FORMAT           g_d12_fmt;
@@ -657,6 +667,7 @@ void STDMETHODCALLTYPE hk_ClearDepthStencilView(ID3D12GraphicsCommandList*, D3D1
                                                D3D12_CLEAR_FLAGS, FLOAT, UINT8, UINT, const D3D12_RECT*);
 void STDMETHODCALLTYPE hk_CopyBufferRegion(ID3D12GraphicsCommandList*, ID3D12Resource*, UINT64, ID3D12Resource*, UINT64, UINT64);
 void STDMETHODCALLTYPE probe_CopyResource(ID3D12GraphicsCommandList*, ID3D12Resource*, ID3D12Resource*);
+void STDMETHODCALLTYPE probe_CopyTextureRegion(ID3D12GraphicsCommandList*, const D3D12_TEXTURE_COPY_LOCATION*, UINT, UINT, UINT, const D3D12_TEXTURE_COPY_LOCATION*, const D3D12_BOX*);
 
 void expo_probe_copy(ID3D12GraphicsCommandList*, ID3D12Resource*, bool);
 void expo_mirror(ID3D12GraphicsCommandList*, ID3D12Resource*, bool);

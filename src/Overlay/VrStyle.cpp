@@ -47,7 +47,7 @@ void ApplyVrStyle(){
 bool DrawVrShell(LiveControlsUiState& state){
     using namespace cvr::vrui;
     static int selected=6;
-    const char* tabs[]={"GENERAL","FRAMEGEN","HUD","CONTROLS","STEREO","AVATAR","OVERLAY"};
+    const char* tabs[]={"ОБЩЕЕ","ГЕНЕРАЦИЯ КАДРОВ","ИНТЕРФЕЙС (HUD)","УПРАВЛЕНИЕ","СТЕРЕО","АВАТАР","ПАНЕЛЬ"};
     ImGui::SetNextWindowPos({0,0});ImGui::SetNextWindowSize({CanvasWidth,CanvasHeight});
     ImGui::Begin("##VR controls",nullptr,ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoSavedSettings);
     auto* background=ImGui::GetWindowDrawList();
@@ -55,7 +55,7 @@ bool DrawVrShell(LiveControlsUiState& state){
     background->AddLine({12,12},{12,CanvasHeight-91},IM_COL32(242,70,75,240),2);
     ImGui::TextColored(Yellow,"cyberpunk-vr-port");
     ImGui::SameLine(1170);
-    if(AngularButton("CLOSE##close_overlay",{220,55}))Close();
+    if(AngularButton("ЗАКРЫТЬ##close_overlay",{220,55}))Close();
     {
         const auto a=ImGui::GetItemRectMin(),b=ImGui::GetItemRectMax();
         const ImVec2 center{b.x-25,(a.y+b.y)*.5f};
@@ -90,25 +90,25 @@ bool DrawVrShell(LiveControlsUiState& state){
     bool changed=false;
     if(selected==6){
         auto& v=state.overlay;
-        widgets::Section("OVERLAY PANEL");
-        changed|=widgets::SliderFloat("Distance",&v.distance,v.minDistance,v.maxDistance,"%.2f m");
-        changed|=widgets::SliderFloat("Minimum distance",&v.minDistance,.35f,2,"%.2f m");
-        changed|=widgets::SliderFloat("Maximum distance",&v.maxDistance,v.minDistance+.1f,5,"%.2f m");
-        changed|=widgets::SliderFloat("Panel size",&v.scale,.6f,1.5f,"%.2fx");
-        changed|=widgets::SliderFloat("Text size",&v.fontScale,.8f,1.4f,"%.2fx");
-        changed|=widgets::Combo("Pointer hand",&v.hand,"Left\0Right\0Automatic\0");
-        changed|=ImGui::Checkbox("Free look",&v.follow);
-        changed|=widgets::SliderFloat("Free-look cone",&v.cone,5,90,"%.0f deg");
-        changed|=widgets::SliderFloat("Distance speed",&v.depthSpeed,.1f,2,"%.2f m/s");
-        if(AngularButton("CENTER PANEL",{260,60})){Recenter();v=GetSettings();changed=true;}
-        ImGui::SameLine();if(AngularButton("RESET",{200,60})){v={};SetSettings(v);Recenter();changed=true;}
-        ImGui::TextWrapped("Catch up after 3 seconds at rest when the offset is over 10 degrees inside the cone.");
-        widgets::Section("FPS OVERLAY");
+        widgets::Section("ПАНЕЛЬ НАСТРОЕК");
+        changed|=widgets::SliderFloat("Расстояние",&v.distance,v.minDistance,v.maxDistance,"%.2f м");
+        changed|=widgets::SliderFloat("Минимальное расстояние",&v.minDistance,.35f,2,"%.2f м");
+        changed|=widgets::SliderFloat("Максимальное расстояние",&v.maxDistance,v.minDistance+.1f,5,"%.2f м");
+        changed|=widgets::SliderFloat("Размер панели",&v.scale,.6f,1.5f,"%.2fx");
+        changed|=widgets::SliderFloat("Размер текста",&v.fontScale,.8f,1.4f,"%.2fx");
+        changed|=widgets::Combo("Рука указателя",&v.hand,"Левая\0Правая\0Автоматически\0");
+        changed|=ImGui::Checkbox("Свободный обзор",&v.follow);
+        changed|=widgets::SliderFloat("Угол свободного обзора",&v.cone,5,90,"%.0f град.");
+        changed|=widgets::SliderFloat("Скорость изменения расстояния",&v.depthSpeed,.1f,2,"%.2f м/с");
+        if(AngularButton("ПАНЕЛЬ ПО ЦЕНТРУ",{260,60})){Recenter();v=GetSettings();changed=true;}
+        ImGui::SameLine();if(AngularButton("СБРОС",{200,60})){v={};SetSettings(v);Recenter();changed=true;}
+        ImGui::TextWrapped("Панель возвращается к направлению взгляда после 3 секунд покоя, если отклонение внутри угла свободного обзора превышает 10 градусов.");
+        widgets::Section("СТАТИСТИКА FPS");
         changed|=DrawFpsOverlayControls(state);
     }else changed=DrawLiveControls(state,selected);
     ImGui::PopItemWidth();ImGui::EndChild();ImGui::EndChild();ImGui::Separator();
-    ImGui::TextColored(Cyan,"TRIGGER  Select     STICK  Scroll     GRIP  Drag     GRIP + STICK  Distance");
-    ImGui::TextDisabled("L3 + R3  Hold 1 sec     F10 / INSERT  Toggle     ESC  Close");
+    ImGui::TextColored(Cyan,"КУРОК - выбор   СТИК - прокрутка   ЗАХВАТ - перенос   ЗАХВАТ + СТИК - расстояние");
+    ImGui::TextDisabled("Кнопки: УПРАВЛЕНИЕ > НАЗНАЧЕНИЯ КНОПОК   F10 / INSERT - открыть/закрыть   ESC - закрыть");
     ImGui::End();
     auto* draw=ImGui::GetForegroundDrawList();
     draw->AddRectFilled({0,0},{4,4},IM_COL32(76,224,240,255));

@@ -77,6 +77,9 @@ file(GLOB_RECURSE CPVR_SOURCES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/*.hpp"
 )
+# Upgrading from the former two-plugin tree can leave its ignored in-source build directory
+# under src/red4ext_plugin/. Never compile generated CMake compiler-identification sources.
+list(FILTER CPVR_SOURCES EXCLUDE REGEX "/src/red4ext_plugin/build/")
 
 # Keep the folder shape in the IDE -- Hooks/, Runtimes/, Anim/, Utils/ are the reading order.
 source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${CPVR_SOURCES})
@@ -84,6 +87,8 @@ source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${CPVR_SOURCES})
 add_library(cyberpunkvrport_stereo SHARED
     ${CPVR_SOURCES}
     src/Hooks/CameraPoseLeafThunks.asm
+    src/MenuPreview/ImageAliasAssignThunk.asm
+    src/MenuPreview/SpatialEditorCopyThunk.asm
     src/Hooks/SwimmingActionLeafThunk.asm
     src/Hooks/WorldMarkerTextThunk.asm
     src/Hooks/PhotoCaptureClampThunk.asm
@@ -95,6 +100,21 @@ add_library(cyberpunkvrport_stereo SHARED
 include(cmake/WorldMarkerShaders.cmake)
 cvr_world_marker_shaders(cyberpunkvrport_stereo)
 include(cmake/NativeFramegen.cmake)
+# Existing NVIDIA owner worker only. No CpvrOwn game hooks, camera writer,
+# plugin/runtime, OpenXR output or second frame loop is linked into this port.
+set(CVR_GENERATION_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/native" CACHE PATH "Existing CPVR generation worker source")
+add_library(cpvr_generation_worker STATIC
+    ${CVR_GENERATION_ROOT}/src/generation.cpp ${CVR_GENERATION_ROOT}/src/core.cpp
+    ${CVR_GENERATION_ROOT}/src/phase_metrics.cpp ${CVR_GENERATION_ROOT}/src/resource_metrics.cpp
+    ${CVR_GENERATION_ROOT}/src/resource_pool.cpp)
+target_include_directories(cpvr_generation_worker PUBLIC ${CVR_GENERATION_ROOT}/include)
+target_compile_features(cpvr_generation_worker PUBLIC cxx_std_20)
+target_compile_definitions(cpvr_generation_worker PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+if(MSVC)
+    target_compile_options(cpvr_generation_worker PRIVATE /EHsc /utf-8)
+endif()
+target_link_libraries(cpvr_generation_worker PUBLIC d3d12.lib dxgi.lib d3dcompiler)
+target_link_libraries(cyberpunkvrport_stereo PRIVATE cpvr_generation_worker)
 target_compile_features(cyberpunkvrport_stereo PRIVATE cxx_std_20)
 target_compile_definitions(cyberpunkvrport_stereo PRIVATE
     WIN32_LEAN_AND_MEAN NOMINMAX
@@ -107,6 +127,7 @@ target_link_libraries(cyberpunkvrport_stereo PRIVATE
     imgui
     d3d12.lib
     d3dcompiler
+    comctl32
     dxgi.lib        # the SYSTEM import lib -- bare "dxgi" would resolve to our own target
     psapi
     RED4ext::SDK
@@ -124,6 +145,7 @@ target_include_directories(cyberpunkvrport_stereo PRIVATE
     # what let the monoliths grow: nothing about an include said where the thing belonged.
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/externals/streamline/include
+    ${CVR_GENERATION_ROOT}/nvidia_backend/snapshot/include
     # --- third-party / vendored ---
     ${CMAKE_CURRENT_SOURCE_DIR}/externals/im3d
     ${CMAKE_CURRENT_SOURCE_DIR}/externals/minhook/include
@@ -152,6 +174,33 @@ set_target_properties(cyberpunkvrport_stereo PROPERTIES
     OUTPUT_NAME CyberpunkVR_Stereo
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/red4ext/plugins/CyberpunkVR_Stereo"
 )
+
+add_executable(classic_controller_mapping_tests EXCLUDE_FROM_ALL
+    tests/ClassicControllerMappingTests.cpp
+    src/Hooks/ClassicControllerMapping.cpp
+)
+target_compile_features(classic_controller_mapping_tests PRIVATE cxx_std_20)
+target_compile_definitions(classic_controller_mapping_tests PRIVATE
+    WIN32_LEAN_AND_MEAN NOMINMAX XR_USE_PLATFORM_WIN32 XR_USE_GRAPHICS_API_D3D12
+)
+target_include_directories(classic_controller_mapping_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+target_link_libraries(classic_controller_mapping_tests PRIVATE openxr_loader d3d12.lib dxgi.lib)
+if(MSVC)
+    target_compile_options(classic_controller_mapping_tests PRIVATE /W4 /permissive- /EHsc)
+endif()
+
+add_executable(openxr_swapchain_format_tests EXCLUDE_FROM_ALL
+    tests/OpenXRSwapchainFormatTests.cpp
+)
+target_compile_features(openxr_swapchain_format_tests PRIVATE cxx_std_20)
+target_compile_definitions(openxr_swapchain_format_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_include_directories(openxr_swapchain_format_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(openxr_swapchain_format_tests PRIVATE d3d12.lib dxgi.lib)
+if(MSVC)
+    target_compile_options(openxr_swapchain_format_tests PRIVATE /W4 /permissive- /EHsc)
+endif()
 
 # ============================================================================================
 # Tools. Separate targets, never deployed with the plugin.

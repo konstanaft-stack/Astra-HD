@@ -1,0 +1,14 @@
+LIBRARY cpvr_nv_backend
+EXPORTS
+cpvr_nv_configure
+fg_nv_attach
+fg_nv_run
+fg_nv_run_ready
+fg_nv_get_status
+fg_nv_queue
+fg_nv_fence
+fg_nv_evaluation_count
+fg_nv_enable_gpu_timing
+fg_nv_get_gpu_timing
+fg_nv_detach
+fg_nv_abort_unstarted_attach

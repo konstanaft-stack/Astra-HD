@@ -13,6 +13,7 @@
 
 #include <MinHook.h>
 #include "Hooks/SwapChainInternal.hpp"
+#include "Framegen/NativeFgObservation.hpp"
 #include <thread>
 #include "Hooks/SwapChain.hpp"
 #include "Overlay/ImGuiOverlay.hpp"
@@ -24,6 +25,8 @@
 #include <mutex>
 #include <atomic>
 #include <wrl.h>
+#include <d3d12sdklayers.h>
+#include <array>
 
 extern void Log(const char* fmt, ...);
 extern volatile int g_verboseLog; // gate per-frame spam (ClipCursor / depth-diag)
@@ -39,6 +42,52 @@ extern "C" UINT GetForcedWindowWidth();
 extern "C" UINT GetForcedWindowHeight();
 extern "C" int GetMenuMode();
 
+namespace {
+// Opt-in diagnostic only. The external, per-executable debug-layer setting
+// must take effect before device creation; this listener cannot enable it late.
+void RegisterValidationMessages(ID3D12Device* device) {
+    wchar_t value[2]{};
+    if(GetEnvironmentVariableW(L"CPVR_D3D12_VALIDATION",value,2)!=1||value[0]!=L'1')return;
+    static std::once_flag once;
+    std::call_once(once,[&]{
+        Microsoft::WRL::ComPtr<ID3D12InfoQueue1> info;
+        if(FAILED(device->QueryInterface(IID_PPV_ARGS(&info)))){
+            Log("[D3D-VALIDATION] InfoQueue1 unavailable; messages NOT_RUN\n");return;
+        }
+        static std::array<std::atomic<uint32_t>,4096> seen{};
+        DWORD cookie{};
+        const auto result=info->RegisterMessageCallback([](D3D12_MESSAGE_CATEGORY category,
+            D3D12_MESSAGE_SEVERITY severity,D3D12_MESSAGE_ID id,LPCSTR message,void*){
+                if(severity>D3D12_MESSAGE_SEVERITY_WARNING)return;
+                // Keep the generic rate-limited log, and separately retain the
+                // exact errors inside native FG Close. Earlier startup errors
+                // with the same ID must not hide the first resize failure.
+                if(severity<=D3D12_MESSAGE_SEVERITY_ERROR)
+                    (void)cvr::framegen::TraceNativeFgCloseValidation(uint32_t(id),message);
+                const auto slot=std::min(static_cast<uint32_t>(id),uint32_t(seen.size()-1));
+                const auto count=seen[slot].fetch_add(1,std::memory_order_relaxed)+1;
+                if(count>(unsigned(id)==921?16u:2u)&&(count&1023)!=0)return;
+                Log("[D3D-VALIDATION] tick=%llu thread=%lu category=%u severity=%u id=%u count=%u %.*s\n",
+                    GetTickCount64(),GetCurrentThreadId(),unsigned(category),unsigned(severity),unsigned(id),count,
+                    1800,message?message:"");
+                if((unsigned(id)==1314||unsigned(id)==921)&&count<=2){
+                    void* frames[24]{};const auto depth=CaptureStackBackTrace(0,24,frames,nullptr);
+                    for(USHORT i=0;i<depth;++i){
+                        HMODULE module{};wchar_t path[MAX_PATH]{};
+                        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(frames[i]),&module);
+                        if(module)GetModuleFileNameW(module,path,MAX_PATH);
+                        Log("[D3D-STACK] id=%u occurrence=%u frame=%u pc=%p base=%p rva=%llX module=%ls\n",
+                            unsigned(id),count,unsigned(i),frames[i],module,
+                            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(frames[i])-reinterpret_cast<uintptr_t>(module)),path);
+                    }
+                }
+            },D3D12_MESSAGE_CALLBACK_FLAG_NONE,nullptr,&cookie);
+        Log("[D3D-VALIDATION] callback result=0x%08X cookie=%lu (per-ID bounded)\n",unsigned(result),cookie);
+    });
+}
+}
+
 void RememberDredDevice(ID3D12Device* device) {
     if (!device) {
         return;
@@ -48,6 +97,7 @@ void RememberDredDevice(ID3D12Device* device) {
         g_dredDevice = device;
         g_dredDumped = false;
         Log("[DRED] Tracking D3D12 device %p\n", device);
+        RegisterValidationMessages(device);
     }
 }
 

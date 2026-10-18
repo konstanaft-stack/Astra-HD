@@ -1,4 +1,5 @@
 #include "Utils/DebugGate.hpp"
+#include "Framegen/SrHistoryIntegration.hpp"
 // NGX DLSS EvaluateFeature read-only hook.
 //
 // Patches nvngx_dlss.dll!NVSDK_NGX_D3D12_EvaluateFeature with a JMP that
@@ -533,6 +534,8 @@ void ProcessTag(const uint8_t* tagBytes) {
 }
 
 uint32_t HookedSlSetTag(const void* vp, const void* tags, uint32_t numTags, void* cmdBuf) {
+    auto historyCall=cvr::framegen::BeginSrTags(vp,tags,numTags,cmdBuf);
+    cvr::framegen::SrTagsCleanup historyCleanup(historyCall);
     // This owns the real per-eye framegen input path, including its enable and
     // resource-lifetime checks. Never gate it with runtime diagnostics.
     cvr::framegen::RecordTags(vp,tags,numTags,cmdBuf);
@@ -558,8 +561,10 @@ uint32_t HookedSlSetTag(const void* vp, const void* tags, uint32_t numTags, void
         ReleaseDiagnosticCapture();
     }
     if (g_origSlSetTag) {
-        return g_origSlSetTag(vp, tags, numTags, cmdBuf);
+        const uint32_t result=g_origSlSetTag(vp,tags,numTags,cmdBuf);
+        cvr::framegen::EndSrTags(historyCall,result);return result;
     }
+    cvr::framegen::EndSrTags(historyCall,1,false);
     return 1; // SL_RESULT_FAIL
 }
 
@@ -602,9 +607,11 @@ uint8_t* InstallE9HookAt(uint8_t* target, void* hookFn, TFnPtr* outOriginal) {
 }
 
 bool NgxInstallEvaluateFeatureHook() {
-    cvr::framegen::InstallInputHooks();
+    // This readiness covers SL input/lifecycle + tag ownership. Native NGX
+    // Create/Evaluate/Release readiness is separate in SrNativeApi.hpp.
+    const bool inputHooksReady=cvr::framegen::InstallInputHooks();
     if (g_setTagHookInstalled.load(std::memory_order_acquire)) {
-        return true;
+        return inputHooksReady;
     }
     HMODULE dll = GetModuleHandleA("sl.interposer.dll");
     if (!dll) return false;
@@ -637,7 +644,7 @@ bool NgxInstallEvaluateFeatureHook() {
     // is sufficient — that's where the game tags MV / Depth / Color resources
     // by purpose, exactly what we need for forward extrapolation.
 
-    return g_setTagHookInstalled.load(std::memory_order_acquire);
+    return inputHooksReady && g_setTagHookInstalled.load(std::memory_order_acquire);
 }
 
 ID3D12Resource* NgxAcquireMotionVectors() {

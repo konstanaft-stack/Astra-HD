@@ -23,6 +23,8 @@
 
 #include "Camera/CameraLink.hpp"
 #include "Camera/PoseIdentity.hpp"
+#include "Camera/MainEyeWriteDiagnostics.hpp"
+#include "Framegen/MainEyePoseSample.hpp"
 #include "Camera/CameraState.hpp"
 #include "Camera/VehicleStereoHeading.hpp"
 #include "Camera/SceneCameraHeading.hpp"
@@ -123,6 +125,19 @@ extern "C" void __fastcall OnPatchCameraCallback(float* cameraState, void* owner
     g_patchCameraHits++;
 
     const int camKind = ClassifyPatchCameraOwner(ownerState);
+    // Reserved by the actual scene FrameBegin owner before camera writes.
+    // Default OFF, and unavailable until VRCAM-off + epochs/clock are proved.
+    // Do not derive eye from a Present count, pose sequence or the late render token.
+    // During scene ownership this component is not the rendered MAIN writer.
+    // Locate samples and labels the actual scene setup instead.
+    const bool sceneOwnsMain=g_bdActive.load(std::memory_order_relaxed) && g_bdScenePoseValid.load(std::memory_order_acquire);
+    const auto mainEyeSource=camKind==1 && !sceneOwnsMain ? cvr::camera::AcquireMainEyeSourceForWrite(
+        OpenXRManager::Get().GetTrackingOriginSerial()) : std::optional<cvr::framegen::MainEyeSourceReceipt>{};
+    bool mainEyePoseLocated=false;
+    const bool auditMainWrite=camKind==1 && (mainEyeSource || cvr::camera::MainEyeSourceRequested());
+    cvr::camera::MainEyeWriteObservation writeAudit{};
+    if(mainEyeSource){writeAudit.sourceId=mainEyeSource->sourceId;writeAudit.requestedTimeNs=mainEyeSource->requestedPoseTimeNs;}
+    writeAudit.Set(cvr::camera::WriteSourcePresent,bool(mainEyeSource));
     if(camKind>=1 && camKind<=3)
         cvr::camera::InvalidatePoseAddress(reinterpret_cast<uintptr_t>(ownerState)+0xE0);
     CameraOwnerWorld cameraOwnerBefore{};
@@ -438,8 +453,12 @@ extern "C" void __fastcall OnPatchCameraCallback(float* cameraState, void* owner
             OpenXRHeadPose selectedPose{};
             cvr::roomscale::Vec2 selectedConsumed{};
             uint64_t selectedSequence{};
-            const bool selected=CyberpunkVR_OneSamplePerFrame &&
-                OpenXRManager::Get().AcquireCameraPoseFrame(&selectedPose,&selectedConsumed,&selectedSequence) && selectedPose.valid;
+            const bool selected=cvr::framegen::SelectMainEyePosePath(bool(mainEyeSource),
+                [&]{return cvr::camera::AcquireMainEyeSourcePose(*mainEyeSource,&selectedPose,&selectedConsumed,&selectedSequence);},
+                [&]{return CyberpunkVR_OneSamplePerFrame &&
+                    OpenXRManager::Get().AcquireCameraPoseFrame(&selectedPose,&selectedConsumed,&selectedSequence) &&
+                    cvr::camera::ApplyReferenceCameraOptics(selectedPose);});
+            mainEyePoseLocated=mainEyeSource && selected;
             // GATE ON THE AIM EPOCH, NOT ON THE PRESENT COUNT.
             //
             // m_presentCount is incremented at the very TOP of OnPresent, but the aim time for
@@ -511,7 +530,7 @@ extern "C" void __fastcall OnPatchCameraCallback(float* cameraState, void* owner
                 // path already uses, measured at ~24.3 ms per frame.
                 OpenXRHeadPose p{};
                 bool got = false;
-                if (CyberpunkVR_OneSamplePerFrame) {
+                if (mainEyeSource || CyberpunkVR_OneSamplePerFrame) {
                     // THE FRAME'S SAMPLE -- the very struct LocateCamera placed the eye with.
                     //
                     // Not a second locate of our own: that is how the orientation and the
@@ -527,7 +546,7 @@ extern "C" void __fastcall OnPatchCameraCallback(float* cameraState, void* owner
                         if (got) CVR_DIAGNOSTIC(++CyberpunkVR_DebugPoseLocatedAtWrite);
                     }
                 }
-                if (!got) {   // no aim yet, or the locate failed -- the cached value still works
+                if (!got && !mainEyeSource) {   // legacy fallback only; source-time query must succeed
                     got = OpenXRManager::Get().GetHeadPose(&p) && p.valid;
                     if (got) CVR_DIAGNOSTIC(++CyberpunkVR_DebugPoseFromCache);
                 }
@@ -1241,8 +1260,11 @@ extern "C" void __fastcall OnPatchCameraCallback(float* cameraState, void* owner
                                    !DeviceCamActive() && !bdOnScene &&
                                    (CyberpunkVR_VrcamPosFromMain != 3) &&
                                    !bdPushOwns && !bdEditorAlign;
+        writeAudit.Set(cvr::camera::WriteTranslationWanted,wantMainHere);
+        writeAudit.Set(cvr::camera::WriteBdOnScene,bdOnScene);
+        bool headDeltaReady=false;
         if (ok && (wantMainHere || wantVrcamHere) &&
-            g_headDeltaValid.load(std::memory_order_acquire)) {
+            (headDeltaReady=g_headDeltaValid.load(std::memory_order_acquire)!=0)) {
             // THE DELTA IS REBUILT HERE, NOT READ. g_headDeltaFP is computed by LocateCamera, and
             // LocateCamera runs AFTER this write (measured: engine writes +0xE0, we write, then
             // SerializeSetup reads). So the published vector belongs to frame N-1, and using it
@@ -1266,7 +1288,11 @@ extern "C" void __fastcall OnPatchCameraCallback(float* cameraState, void* owner
             // won the orientation-composition gate. Otherwise the second eye
             // falls back to the preceding frame's displacement/consumption.
             cvr::camera::AnchorRecipe anchor{};
-            if (CyberpunkVR_DeltaFromFreshSample && translationValid && cvr::camera::AnchorRecipeRead(&anchor)) {
+            const bool freshDelta=CyberpunkVR_DeltaFromFreshSample!=0;
+            bool anchorRead=false;
+            writeAudit.Set(cvr::camera::WriteTranslationValid,translationValid);
+            writeAudit.Set(cvr::camera::WriteFreshDeltaEnabled,freshDelta);
+            if (freshDelta && translationValid && (anchorRead=cvr::camera::AnchorRecipeRead(&anchor))) {
                 const float sc = anchor.scale;
                 const auto consumed = (!orientationWritten || writtenConsumedKnown)
                     ? translationConsumed : cvr::roomscale::CameraConsumed(translationPose.originSerial);
@@ -1288,6 +1314,7 @@ extern "C" void __fastcall OnPatchCameraCallback(float* cameraState, void* owner
                 }
                 CVR_DIAGNOSTIC(++CyberpunkVR_DebugDeltaRebuilt);
             }
+            writeAudit.Set(cvr::camera::WriteAnchorRead,anchorRead);
             // THE ENGINE'S OWN CAMERA POSITION, PUBLISHED BEFORE WE MOVE IT.
             //
             // The pose path needs this and must not reconstruct it. Rebuilding it as (view - head
@@ -1323,9 +1350,16 @@ extern "C" void __fastcall OnPatchCameraCallback(float* cameraState, void* owner
         // ...and not during a takeover either, for the same reason: the push has already put this eye half
         // an IPD off MAIN's centre, so a second half here doubles it.
         const int32_t centreBeforeIpd[3] = {p[0], p[1], p[2]};
+        bool mainEyeSourceApplied=false;
+        const bool sourcePoseMatches=mainEyeSource && mainEyeSource->MatchesWrittenPose(writtenPose.originSerial,writtenPose.locatedTime);
+        bool sourceReceiptUsable=false;
+        const bool useMainEyeSource=camKind==1 && mainEyeSource && mainEyePoseLocated && writtenPose.valid &&
+            sourcePoseMatches && (sourceReceiptUsable=cvr::camera::ValidateMainEyeSourceReceipt(*mainEyeSource));
+        writeAudit.Set(cvr::camera::WriteIpdEnabled,CyberpunkVR_IpdInWorldPos!=0);
         if (ok && CyberpunkVR_IpdInWorldPos && IsPlausibleUnitQuaternion(quat) &&
             !(camKind == 2 && (bdPushOwns || LocateOwnsTakeover()))) {
             const float half = GetDesiredHalfIpd();
+            writeAudit.Set(cvr::camera::WriteIpdNonzero,half!=0.0f);
             if (half != 0.0f) {
                 float r[3] = {};
                 ComputeRightVectorFromQuaternion(quat, r);
@@ -1338,16 +1372,22 @@ extern "C" void __fastcall OnPatchCameraCallback(float* cameraState, void* owner
                     (camKind == 1) && CyberpunkVR_BdIpdInLocate &&
                     g_bdActive.load(std::memory_order_relaxed) &&
                     g_bdScenePoseValid.load(std::memory_order_acquire);
-                if (IsPlausibleUnitVector3(r) && !bdMainSkip) {
+                const bool rightValid=IsPlausibleUnitVector3(r);
+                writeAudit.Set(cvr::camera::WriteRightVectorValid,rightValid);
+                writeAudit.Set(cvr::camera::WriteBdMainSkip,bdMainSkip);
+                if (rightValid && !bdMainSkip) {
                     // MAIN is the left eye by default; with the swap it becomes the right one,
                     // so the separation has to change hands too or each eye gets the other's
                     // viewpoint -- pseudo-stereo, which reads as depth turned inside out.
                     const float sgn0 = (camKind == 2) ? +1.0f : -1.0f;
-                    const float sign = CyberpunkVR_MainIsRightEye ? -sgn0 : sgn0;
+                    const float sign = useMainEyeSource
+                        ? (mainEyeSource->physicalEye==cvr::framegen::AerV2Eye::Right ? 1.0f : -1.0f)
+                        : (CyberpunkVR_MainIsRightEye ? -sgn0 : sgn0);
                     for (int i = 0; i < 3; ++i) {
                         p[i] += static_cast<int32_t>(r[i] * half * sign * 131072.0f);
                     }
                     dirty = true;
+                    mainEyeSourceApplied=useMainEyeSource;
                     CVR_DIAGNOSTIC(++CyberpunkVR_DebugIpdWorldWrites);
                 }
             }
@@ -1357,12 +1397,19 @@ extern "C" void __fastcall OnPatchCameraCallback(float* cameraState, void* owner
             bool positionWritten=true;
             for (int i = 0; i < 3; ++i)
                 positionWritten &= WriteU32Safe(posAddr + i * 4, static_cast<uint32_t>(p[i]));
+            writeAudit.Set(cvr::camera::WritePositionWritten,positionWritten);
             if (positionWritten && orientationWritten && translationLabelKnown &&
                 cvr::camera::PlacedCameraPoseEnabled() && (camKind==1 || camKind==2))
                 cvr::camera::PlacedCameraPosePush(camKind,hq,p,writtenPose);
             if(positionWritten && orientationWritten && translationLabelKnown && writtenPoseId &&
-               camKind>=1 && camKind<=3)
-                cvr::camera::PublishComponentPose(owner,camKind==2 ? 2u : 1u,writtenPoseId,writtenPose);
+               camKind>=1 && camKind<=3){
+                writeAudit.Set(cvr::camera::WritePublisherCalled,true);
+                writeAudit.Set(cvr::camera::WritePublisherHasSource,mainEyeSourceApplied);
+                cvr::camera::PublishComponentPose(owner,camKind==2 ? 2u : 1u,writtenPoseId,writtenPose,
+                    mainEyeSourceApplied ? *mainEyeSource : cvr::framegen::MainEyeSourceReceipt{},
+                    cvr::camera::MakeAppliedEyeReference(centreBeforeIpd,p,quat,cvr::camera::AppliedEyeRoute::Component,
+                        positionWritten && mainEyeSourceApplied,orientationWritten));
+            }
             if (positionWritten && camKind == 1 && !DeviceCamActive() &&
                 !g_bdActive.load(std::memory_order_relaxed)) {
                 cvr::camera::MainEyeCentrePublish(p, centreBeforeIpd, bodyBaseBeforeVr);
@@ -1375,6 +1422,24 @@ extern "C" void __fastcall OnPatchCameraCallback(float* cameraState, void* owner
                         cameraOwnerBefore.owner,writtenPose.originSerial,stable);
                 }
             }
+        }
+
+        if(auditMainWrite){
+            writeAudit.Set(cvr::camera::WritePoseLocated,mainEyePoseLocated);
+            writeAudit.Set(cvr::camera::WriteHaveQuaternion,haveWriteQuat);
+            writeAudit.Set(cvr::camera::WriteOrientationWritten,orientationWritten);
+            writeAudit.Set(cvr::camera::WritePositionReadable,ok);
+            writeAudit.Set(cvr::camera::WriteHeadDeltaReady,headDeltaReady);
+            writeAudit.Set(cvr::camera::WriteTranslationLabelKnown,translationLabelKnown);
+            writeAudit.Set(cvr::camera::WriteDirty,dirty);
+            writeAudit.Set(cvr::camera::WritePoseValid,writtenPose.valid);
+            writeAudit.Set(cvr::camera::WritePoseIdPresent,writtenPoseId!=0);
+            writeAudit.Set(cvr::camera::WritePoseTimeOriginMatch,sourcePoseMatches);
+            writeAudit.Set(cvr::camera::WriteReceiptUsable,sourceReceiptUsable);
+            writeAudit.Set(cvr::camera::WriteUseSource,useMainEyeSource);
+            writeAudit.Set(cvr::camera::WriteSourceApplied,mainEyeSourceApplied);
+            writeAudit.poseId=writtenPoseId;writeAudit.writtenTimeNs=writtenPose.locatedTime;
+            cvr::camera::RecordMainEyeWrite(writeAudit);
         }
 
         // AND THE SAME COMPOSITION INTO THE LENS, which is what the main view is rendered from during a

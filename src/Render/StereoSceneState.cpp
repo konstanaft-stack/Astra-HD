@@ -1,19 +1,30 @@
 #include "Render/StereoSceneState.hpp"
 #include "Render/RenderProbeScope.hpp"
+#include "MenuPreview/UiConsumer.hpp"
 #include <mutex>
 #include <unordered_map>
 namespace cvr::stereo::scene_state {
 namespace {
-std::mutex mutex;
-std::unordered_map<ID3D12RootSignature*,uint64_t> roots;
-std::unordered_map<ID3D12PipelineState*,bool> pipelines;
-std::unordered_map<ID3D12GraphicsCommandList*,Bindings> bindings;
+// D3D12 private-data release callbacks can run after our CRT globals have
+// been torn down. Keep these bounded, weak-only metadata stores addressable
+// through process exit, like the UI observer which calls Retire(). They hold
+// no COM references and retain the same mutex/limits/reset behavior.
+std::mutex& mutex=*new std::mutex;
+std::unordered_map<ID3D12RootSignature*,uint64_t>& roots=*new std::unordered_map<ID3D12RootSignature*,uint64_t>;
+std::unordered_map<ID3D12PipelineState*,bool>& pipelines=*new std::unordered_map<ID3D12PipelineState*,bool>;
+std::unordered_map<ID3D12GraphicsCommandList*,Bindings>& bindings=*new std::unordered_map<ID3D12GraphicsCommandList*,Bindings>;
 struct View {ID3D12Resource* resource{};bool depth{};};
 // Weak metadata only. Retention happens at an actual draw where the engine owns
 // every bound target. Rewrites invalidate previous entries, including null views.
-std::unordered_map<SIZE_T,View> targets;
+std::unordered_map<SIZE_T,View>& targets=*new std::unordered_map<SIZE_T,View>;
+bool Tracking() {
+    if(probe::internalCommands)return false;
+    if(CyberpunkVR_NativeStereoProbeState.load(std::memory_order_relaxed)==1)return true;
+    cvr::menu_preview::Lease preview;
+    return cvr::menu_preview::UiConsumerEnabled()&&cvr::menu_preview::TryAcquireCurrent(preview);
+}
 template<class F> void Edit(ID3D12GraphicsCommandList* list,F f) {
-    if(probe::internalCommands || CyberpunkVR_NativeStereoProbeState.load(std::memory_order_relaxed)!=1)return;
+    if(!Tracking())return;
     std::lock_guard lock(mutex);auto it=bindings.find(list);
     if(it!=bindings.end())f(it->second);else if(bindings.size()<512)f(bindings[list]);
 }
@@ -35,7 +46,12 @@ void RootCreated(ID3D12RootSignature* root,const void* data,size_t bytes) {
 void PipelineCreated(ID3D12PipelineState* pso,bool compatible){std::lock_guard lock(mutex);if(pipelines.size()<8)pipelines[pso]=compatible;}
 bool Compatible(ID3D12PipelineState* pso){std::lock_guard lock(mutex);const auto it=pipelines.find(pso);return it!=pipelines.end() && it->second;}
 void ResetCapture(){std::lock_guard lock(mutex);bindings.clear();}
-void Reset(ID3D12GraphicsCommandList* list,bool rateKnown){Edit(list,[&](auto& b){b={};b.resetSeen=true;b.rate.known=rateKnown;});}
+void Reset(ID3D12GraphicsCommandList* list,bool rateKnown){
+    if(probe::internalCommands)return;
+    if(!Tracking()){std::lock_guard lock(mutex);bindings.erase(list);return;}
+    Edit(list,[&](auto& b){b={};b.resetSeen=true;b.rate.known=rateKnown;});
+}
+void Retire(ID3D12GraphicsCommandList* list){std::lock_guard lock(mutex);bindings.erase(list);}
 void Root(ID3D12GraphicsCommandList* list,ID3D12RootSignature* root){Edit(list,[&](auto& b){if(b.root!=root){b.root=root;b.tableMask=0;b.tables={};}});}
 void Table(ID3D12GraphicsCommandList* list,UINT index,D3D12_GPU_DESCRIPTOR_HANDLE h){if(index<64)Edit(list,[&](auto& b){b.tables[index]=h;b.tableMask|=uint64_t(1)<<index;});}
 void ComputeRoot(ID3D12GraphicsCommandList* list,ID3D12RootSignature* root){Edit(list,[&](auto& b){if(b.computeRoot!=root){b.computeRoot=root;b.computeTableMask=0;b.computeTables={};}});}
@@ -49,6 +65,13 @@ void Stencil(ID3D12GraphicsCommandList* list,UINT s){Edit(list,[&](auto& b){b.st
 void ShadingRate(ID3D12GraphicsCommandList* list,D3D12_SHADING_RATE rate,const D3D12_SHADING_RATE_COMBINER* combiners){Edit(list,[&](auto& b){b.rate.value=rate;
     b.rate.combiners=combiners?std::array{combiners[0],combiners[1]}:std::array{D3D12_SHADING_RATE_COMBINER_PASSTHROUGH,D3D12_SHADING_RATE_COMBINER_PASSTHROUGH};});}
 void ShadingRateImage(ID3D12GraphicsCommandList* list,ID3D12Resource* image){Edit(list,[&](auto& b){b.rate.image=image;});}
+bool SnapshotCompute(ID3D12GraphicsCommandList* list,Bindings& result) {
+    std::lock_guard lock(mutex);const auto it=bindings.find(list);if(it==bindings.end())return false;
+    const auto& b=it->second;
+    if(!b.resetSeen||!b.heapsSeen||!b.heapCount||b.heapCount>b.heaps.size()||!b.computeRoot||!b.computeTableMask)return false;
+    for(UINT i=0;i<b.heapCount;++i)if(!b.heaps[i])return false;
+    result=b;return true;
+}
 bool Snapshot(ID3D12GraphicsCommandList* list,Bindings& result) {
     std::lock_guard lock(mutex);const auto it=bindings.find(list);if(it==bindings.end())return false;const auto& b=it->second;
     // Reset was observed, so a table never bound since then is known-unbound.

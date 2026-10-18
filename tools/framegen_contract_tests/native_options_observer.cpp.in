@@ -1,0 +1,125 @@
+#include "Framegen/NativeFgPolicyTypes.hpp"
+#include "Framegen/PresentationStatus.hpp"
+#include <atomic>
+#include <array>
+#include <cstring>
+#include <cstddef>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
+#include <Windows.h>
+using namespace cvr::framegen;
+struct Settings { bool aerV2{}; } settings;
+Settings GetSettings(){return settings;}
+bool hostViewOnly=true, nativeRequested=true;
+bool HostViewOnly(){return hostViewOnly;}
+bool NativeFgStereoRequested(){return nativeRequested;}
+int32_t CyberpunkVR_VrcamDlssViewport=2;
+std::atomic<bool> everEnabled{};
+std::array<std::atomic<unsigned>,2> modes{};
+NativePolicyStatusTracker policyStatus;
+void Log(const char*,...){}
+unsigned calls{}, observedMode{}, observedFlags{}, observedCount{};
+sl::Result nextResult=sl::Result::eOk;
+const sl::DLSSGOptions* observedPointer{};
+std::array<unsigned char,sizeof(sl::DLSSGOptions)> observedBytes{};
+size_t VersionBytes(unsigned version){
+    switch(version){
+    case 1:return offsetof(sl::DLSSGOptions,bReserved15);
+    case 2:return offsetof(sl::DLSSGOptions,queueParallelismMode);
+    case 3:return offsetof(sl::DLSSGOptions,enableUserInterfaceRecomposition);
+    case 4:return offsetof(sl::DLSSGOptions,dynamicTargetFrameRate);
+    default:return sizeof(sl::DLSSGOptions);
+    }
+}
+sl::Result RecordOptions(const sl::ViewportHandle&,const sl::DLSSGOptions& o){
+    ++calls; observedPointer=&o; observedMode=unsigned(o.mode);
+    observedFlags=unsigned(o.flags);observedCount=o.numFramesToGenerate;
+    std::memcpy(observedBytes.data(),&o,VersionBytes(unsigned(o.structVersion)));
+    return nextResult;
+}
+auto originalOptions=&RecordOptions;
+// Production function is inserted here by native_options_observer_test.py.
+@@PRODUCTION_OBSERVER@@
+unsigned stateCalls{};
+sl::Result RecordState(const sl::ViewportHandle&,sl::DLSSGState&,const sl::DLSSGOptions*){++stateCalls;return sl::Result::eOk;}
+auto originalState=&RecordState;
+sl::Result ObserveState(const sl::ViewportHandle& view,sl::DLSSGState& state,const sl::DLSSGOptions* options){return originalState(view,state,options);}
+using GetFunction=sl::Result(*)(sl::Feature,const char*,void*&);
+std::mutex install;
+std::atomic<bool> ready{true};
+void EnsureCpuReflexTiming(){}
+bool NativeFgPolicyObservationRequested(){return nativeRequested;}
+constexpr int MH_OK=0;
+int MH_CreateHook(void*,void*,void**){return 1;}
+int MH_RemoveHook(void*){return 0;}
+int MH_QueueEnableHook(void*){return 1;}
+int MH_ApplyQueued(){return 1;}
+int MH_DisableHook(void*){return 0;}
+@@PRODUCTION_POLICY_POLL@@
+void Check(bool ok,const char* message){if(!ok){std::fprintf(stderr,"FAIL: %s\n",message);std::exit(1);}}
+int main(){
+    modes[0]=1;modes[1]=1;
+    EnsureNativeFgPolicyObservation();
+    EnsureNativeFgPolicyObservation();
+    Check(stateCalls==0,"installed policy poll must not consume SDK state from the Present thread");
+    constexpr unsigned retain=unsigned(sl::DLSSGFlags::eRetainResourcesWhenOff);
+    constexpr unsigned other=unsigned(sl::DLSSGFlags::eEnableFullscreenMenuDetection);
+    unsigned cases{};
+    for(unsigned version=1;version<=5;++version)for(unsigned generated=1;generated<=3;++generated){
+        sl::DLSSGOptions options;options.structVersion=version;
+        options.mode=sl::DLSSGMode::eOn;options.numFramesToGenerate=generated;
+        options.flags=sl::DLSSGFlags(retain|other);
+        auto unchanged=options;unsigned before=calls;
+        const auto result=ObserveOptions(sl::ViewportHandle(0),options);
+        Check(calls==before+1&&result==sl::Result::eOk,"forward must happen exactly once");
+        Check(observedMode==unsigned(sl::DLSSGMode::eOn)&&observedFlags==(retain|other)&&observedCount==generated,"active host X2/X3/X4 options changed");
+        Check(std::memcmp(&options,&unchanged,sizeof options)==0,"caller options were mutated");
+        options.mode=sl::DLSSGMode::eOff;unchanged=options;before=calls;
+        ObserveOptions(sl::ViewportHandle(0),options);
+        Check(calls==before+1&&observedMode==0&&observedCount==generated,"OFF changed mode/count or forwarded twice");
+        Check(observedFlags==other,"disabled host retains NVIDIA resources");
+        Check(std::memcmp(&options,&unchanged,sizeof options)==0,"OFF mutated caller storage");
+        options.mode=sl::DLSSGMode::eOn;unchanged=options;
+        ObserveOptions(sl::ViewportHandle(2),options);
+        Check(observedMode==0&&observedFlags==other,"disabled companion retains NVIDIA resources");
+        Check(std::memcmp(&options,&unchanged,sizeof options)==0,"companion mutated caller storage");
+        settings.aerV2=true;ObserveOptions(sl::ViewportHandle(2),options);
+        Check(observedMode==1&&observedFlags==(retain|other),"AER companion changed");settings.aerV2=false;
+        cases+=4;
+    }
+    sl::DLSSGOptions options;options.mode=sl::DLSSGMode::eOff;
+    options.flags=sl::DLSSGFlags(retain|other);
+    nativeRequested=false;hostViewOnly=false;
+    ObserveOptions(sl::ViewportHandle(0),options);
+    Check(observedPointer==&options&&observedFlags==(retain|other),"policy-only observer changed game behavior");
+    nativeRequested=true;hostViewOnly=true;
+    for(unsigned version:{0u,6u}){
+        options.structVersion=version;ObserveOptions(sl::ViewportHandle(0),options);
+        Check(observedPointer==&options&&observedFlags==(retain|other),"unknown ABI must pass through unchanged");++cases;
+    }
+    options.structVersion=3;nextResult=sl::Result(39);
+    Check(ObserveOptions(sl::ViewportHandle(0),options)==sl::Result(39),"NVIDIA error result was hidden");
+    Check(!policyStatus.Read().known,"failed request must not advertise confirmed OFF");
+    nextResult=sl::Result::eOk;
+    SYSTEM_INFO system{};GetSystemInfo(&system);
+    auto memory=static_cast<unsigned char*>(VirtualAlloc(nullptr,system.dwPageSize*2,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE));
+    Check(memory!=nullptr,"guard fixture allocation");DWORD protection{};
+    Check(VirtualProtect(memory+system.dwPageSize,system.dwPageSize,PAGE_NOACCESS,&protection)!=0,"guard page protection");
+    for(unsigned version=1;version<=5;++version)for(unsigned viewport:{0u,2u}){
+        sl::DLSSGOptions tail, input;input.structVersion=version;input.next=&tail;
+        input.mode=viewport==0?sl::DLSSGMode::eOff:sl::DLSSGMode::eOn;
+        input.flags=sl::DLSSGFlags(retain|other);input.numFramesToGenerate=3;
+        input.numBackBuffers=17;input.colorWidth=1776;input.colorHeight=1888;
+        input.dynamicResWidth=192;input.dynamicResHeight=224;
+        const size_t size=VersionBytes(version);auto address=memory+system.dwPageSize-size;
+        std::memcpy(address,&input,size);
+        ObserveOptions(sl::ViewportHandle(viewport),*reinterpret_cast<const sl::DLSSGOptions*>(address));
+        Check(std::memcmp(address,&input,size)==0,"short caller structure mutated");
+        auto expected=input;expected.mode=sl::DLSSGMode::eOff;expected.flags=sl::DLSSGFlags(other);
+        Check(std::memcmp(observedBytes.data(),&expected,size)==0,"forwarded ABI prefix/next chain/options changed");
+        ++cases;
+    }
+    VirtualFree(memory,0,MEM_RELEASE);
+    std::printf("PASS: %u production observer cases, caller immutability, no extra state calls and failure propagation\n",cases+3);
+}

@@ -1,12 +1,17 @@
 // SettingsRes -- one hook, one file. Installed from the registry it registers itself with at the
 // bottom; see Hooks/Hook.hpp for why the order is declared here rather than in a boot function.
 //
-// The render-settings object, as the engine finalises it. Read-only: it reports the active and
-// target resolutions and the size the XR runtime recommends, which is a REFERENCE value --
+// The render-settings object, as the engine finalises it. The live PPD owner writes pending
+// dimensions only here; the legacy author override remains outside that ownership.
+// The reported size the XR runtime recommends is a REFERENCE value --
 // printing it beside the others has already been misread once as evidence of a forced override.
 
 #include "Core/VrCoreShared.hpp"
+#include "Overlay/PpdNativeApply.hpp"
+#include "Framegen/NativeFgOutput.hpp"
 #include "Hooks/Hook.hpp"
+#include "Hooks/CetLifecycle.hpp"
+#include "Hooks/NativeSettingsAdmission.hpp"
 #include "Hooks/Trampoline.hpp"
 #include "Utils/AobScanner.hpp"
 #include "Utils/MemorySafe.hpp"
@@ -14,12 +19,32 @@
 #include <windows.h>
 #include <cstdint>
 #include <cstddef>
+#include <cstring>
+#include <mutex>
 
 namespace {
 uint64_t g_settingsResHits = 0;
+std::mutex resizeGateMutex;
+uint64_t drainedRevision{};
+bool drained{};
+bool NativeFgResizeReady(){
+    if(cvr::cet::LifecycleRequested())return true; // the native apply entry owns quiescence
+    if(!cvr::framegen::NativeFgStereoRequested())return true;
+    const auto request=cvr::ppd::ReadNativeRequestedSize();
+    if(!request||request->stage!=cvr::ppd::NativeApplyStage::Requested)return true;
+    std::lock_guard lock(resizeGateMutex);
+    if(drainedRevision!=request->revision){
+        drainedRevision=request->revision;
+        drained=cvr::framegen::DrainNativeFgResizeQueues(2000);
+        Log("[NATIVE-FG-RESIZE] revision=%llu allowPendingWrite=%d\n",drainedRevision,int(drained));
+    }
+    return drained;
+}
 }  // namespace
+extern "C" {__declspec(dllexport) std::atomic<uint64_t> CyberpunkVR_PpdSettingsHookVisits{0};}
 
 extern "C" void __fastcall OnSettingsResCallback(void* settingsPtr) {
+    CyberpunkVR_PpdSettingsHookVisits.fetch_add(1,std::memory_order_relaxed);
     g_settingsResHits++;
 
     const uintptr_t settings = reinterpret_cast<uintptr_t>(settingsPtr);
@@ -29,7 +54,9 @@ extern "C" void __fastcall OnSettingsResCallback(void* settingsPtr) {
 
     const uintptr_t prev = g_settingsResPtr;
     g_settingsResPtr = settings;
-    ApplySettingsResolutionOverride(settings);
+    const bool applyAllowed=!SettingsResolutionOverrideSuspended()&&NativeFgResizeReady();
+    if (!cvr::ppd::ProcessNativeSizeAtSettingsHook(settings,applyAllowed,cvr::hooks::AdmitNativePpdWrite,settingsPtr))
+        ApplySettingsResolutionOverride(settings);
 
     if (settings != prev || ((g_settingsResHits % 600) == 1)) {
         uint32_t activeWidth = 0;
@@ -113,18 +140,39 @@ bool InstallSettingsResHook() {
     code[pos++] = 0x9D;
 
     code[pos++] = 0x39; code[pos++] = 0x41; code[pos++] = 0x18;
-    code[pos++] = 0x75; code[pos++] = 0x06;
+    // Native width JNE leaves the overwritten region and returns true. It must
+    // not jump to our relocated height CMP with the saved width still in EAX.
+    // CP2077 2.31: game21C58D ->21C5A8, bytes75 19 -> mov al,1; ret.
+    const auto* changedTarget = found + 5 + static_cast<int8_t>(found[4]);
+    if(found[3]!=0x75 || changedTarget<found+replaceLen ||
+       changedTarget[0]!=0xB0 || changedTarget[1]!=0x01 || changedTarget[2]!=0xC3)return false;
+    const auto changedRelative = reinterpret_cast<intptr_t>(changedTarget) -
+                                 reinterpret_cast<intptr_t>(code+pos+6);
+    if(changedRelative<INT32_MIN || changedRelative>INT32_MAX)return false;
+    code[pos++] = 0x0F; code[pos++] = 0x85;
+    const auto changedRel32=static_cast<int32_t>(changedRelative);
+    std::memcpy(code+pos,&changedRel32,sizeof(changedRel32));pos+=4;
     code[pos++] = 0x8B; code[pos++] = 0x81; code[pos++] = 0x88; code[pos++] = 0x00; code[pos++] = 0x00; code[pos++] = 0x00;
     code[pos++] = 0x39; code[pos++] = 0x41; code[pos++] = 0x1C;
 
+    const auto returnRelative = reinterpret_cast<intptr_t>(found+replaceLen) -
+                                reinterpret_cast<intptr_t>(code+pos+5);
+    if(returnRelative<INT32_MIN || returnRelative>INT32_MAX)return false;
     code[pos++] = 0xE9;
-    *reinterpret_cast<int32_t*>(code + pos) = static_cast<int32_t>((found + replaceLen) - (code + pos + 4));
+    const auto returnRel32=static_cast<int32_t>(returnRelative);
+    std::memcpy(code+pos,&returnRel32,sizeof(returnRel32));
     pos += 4;
 
+    // The shared trampoline arena can have been allocated near another hook.
+    // Check THIS forward branch too, before modifying the original code page.
+    const auto siteRelative=reinterpret_cast<intptr_t>(code)-reinterpret_cast<intptr_t>(found+5);
+    if(siteRelative<INT32_MIN || siteRelative>INT32_MAX)return false;
+    const auto siteRel32=static_cast<int32_t>(siteRelative);
     DWORD oldProtect;
-    VirtualProtect(found, replaceLen, PAGE_EXECUTE_READWRITE, &oldProtect);
+    if(!FlushInstructionCache(GetCurrentProcess(),code,pos) ||
+       !VirtualProtect(found, replaceLen, PAGE_EXECUTE_READWRITE, &oldProtect))return false;
     found[0] = 0xE9;
-    *reinterpret_cast<int32_t*>(found + 1) = static_cast<int32_t>(code - (found + 5));
+    std::memcpy(found+1,&siteRel32,sizeof(siteRel32));
     for (int i = 5; i < replaceLen; ++i) found[i] = 0x90;
     VirtualProtect(found, replaceLen, oldProtect, &oldProtect);
     FlushInstructionCache(GetCurrentProcess(), found, replaceLen);

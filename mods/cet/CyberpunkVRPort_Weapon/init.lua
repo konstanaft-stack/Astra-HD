@@ -414,6 +414,7 @@ local CARRY_HOME_ZETA = 0.70
 -- most of a forearm, so the grip took the weapon back from a hand that was merely nearby.
 local CARRY_BACK_DIST = 0.18
 local SLOT_RIGHT      = 'AttachmentSlots.WeaponRight'
+local laserWeaponRightSlot = nil
 -- Ours, so its customOffset can be tuned without moving the cigarette that also lives in WeaponLeft.
 -- Falls back to the stock slot when the tweak has not been loaded yet (it needs a game launch).
 -- The STOCK slot, because what places the weapon is the entry in the player's ItemAttachmentSlots
@@ -612,6 +613,74 @@ local function qrotv(i, j, k, r, x, y, z)
     return x + r*tx + (j*tz - k*ty),
            y + r*ty + (k*tx - i*tz),
            z + r*tz + (i*ty - j*tx)
+end
+-- The firing hook only needs the sight ORIGIN. Its forward is already the live muzzle transform's
+-- +Y axis, which is also the weapon-mounted sight direction used by this mode. Prefer the game's own
+-- scope/iron offset; fall back to the corresponding weapon-rig slot for weapons whose accessor does
+-- not resolve. Every failed frame publishes invalid so a weapon swap cannot reuse the old sight.
+local function publishSightOrigin(wpn)
+    if type(SetVRSightOrigin) ~= 'function' then return end
+    if not wpn then
+        SetVRSightOrigin(0.0, 0.0, 0.0, 0)
+        return
+    end
+
+    local hasScope = false
+    pcall(function() hasScope = wpn:HasScope() == true end)
+
+    local base, rot, off = nil, nil, nil
+    pcall(function() base = wpn:GetWorldPosition() end)
+    pcall(function() rot = wpn:GetWorldOrientation() end)
+    pcall(function()
+        off = hasScope and wpn:GetScopeOffset() or wpn:GetIronSightOffset()
+    end)
+    if base and rot and off then
+        local ox, oy, oz = nil, nil, nil
+        pcall(function() ox, oy, oz = off.x, off.y, off.z end)
+        if type(ox) ~= 'number' then
+            pcall(function() ox, oy, oz = off.X, off.Y, off.Z end)
+        end
+        if type(ox) == 'number' and type(oy) == 'number' and type(oz) == 'number' then
+            local rx, ry, rz = qrotv(rot.i, rot.j, rot.k, rot.r, ox, oy, oz)
+            local x, y, z = base.x + rx, base.y + ry, base.z + rz
+            if x*x + y*y + z*z > 1.0 then
+                SetVRSightOrigin(x, y, z, 1)
+                return
+            end
+        end
+    end
+
+    local names = hasScope and { 'scope_slot', 'pos_ironsight' }
+                               or { 'pos_ironsight', 'scope_slot' }
+    local components = nil
+    pcall(function() components = wpn:GetComponents() end)
+    if components then
+        for i = 1, #components do
+            local component = components[i]
+            local isSlot = false
+            pcall(function()
+                isSlot = string.find(tostring(component:GetClassName()), 'SlotComponent', 1, true) ~= nil
+            end)
+            if isSlot then
+                for _, name in ipairs(names) do
+                    local ok, found, tr = pcall(function()
+                        return component:GetSlotTransform(CName.new(name))
+                    end)
+                    if ok and found and tr then
+                        local wp = nil
+                        pcall(function() wp = WorldPosition.ToVector4(tr.Position) end)
+                        if wp and type(wp.x) == 'number' and type(wp.y) == 'number' and
+                           type(wp.z) == 'number' and wp.x*wp.x + wp.y*wp.y + wp.z*wp.z > 1.0 then
+                            SetVRSightOrigin(wp.x, wp.y, wp.z, 1)
+                            return
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    SetVRSightOrigin(0.0, 0.0, 0.0, 0)
 end
 -- Slerp from identity toward (i,j,k,r) by w -- the way home for the offset's rotation half.
 local function qslerpId(i, j, k, r, w)
@@ -876,7 +945,238 @@ local function carryTick(dt)
     end
 end
 
+-- Trace the weapon bore on CET's game/script thread. Present only consumes the published result;
+-- physics queries never run on the render thread.
+local BARREL_RAY_MAX_M = 1000.0
+local BARREL_RAY_PRESET = 'Sight Blocker'
+local BARREL_LOS_ENDPOINT_OFFSET_M = 0.005
+local BARREL_LOS_GLASS_STEP_M = 0.005
+local BARREL_LOS_MAX_GLASS_HITS = 8
+local BARREL_EYE_MAX_AGE_S = 0.020
+local barrelRaySystem = nil
+local barrelRayCallWarned = false
+local barrelNpcCallWarned = false
+local barrelLosCallWarned = false
+local barrelEyeLastSeq = 0
+local barrelEyeAgeS = math.huge
+local barrelLosLogAt = -1.0
+local barrelRayWasActive = false
+
+local function publishBarrelRayMiss(mainVisible, secondVisible)
+    if type(SetVRBarrelRayHit) == 'function' then
+        SetVRBarrelRayHit(0.0, 0.0, 0.0, 0,
+            mainVisible == false and 0 or 1,
+            secondVisible == false and 0 or 1)
+    end
+end
+
+local function stopBarrelRay()
+    if barrelRayWasActive then
+        publishBarrelRayMiss()
+        barrelRayWasActive = false
+    end
+end
+
+-- Read the two origins as one seqlocked render-side snapshot. Missing/stale eyes only disable
+-- occlusion (fail-open); they never disable the surface hit provider itself.
+local function readBarrelEyes(dt)
+    barrelEyeAgeS = barrelEyeAgeS + math.max(dt or 0.0, 0.0)
+    for _ = 1, 3 do
+        local s0 = math.floor(GetVRSharedSlot(178) or 0.0)
+        if s0 > 0 and s0 % 2 == 0 then
+            local mx, my, mz = GetVRSharedSlot(172), GetVRSharedSlot(173), GetVRSharedSlot(174)
+            local sx, sy, sz = GetVRSharedSlot(175), GetVRSharedSlot(176), GetVRSharedSlot(177)
+            local s1 = math.floor(GetVRSharedSlot(178) or 0.0)
+            if s0 == s1 and s1 % 2 == 0 then
+                if s1 ~= barrelEyeLastSeq then
+                    barrelEyeLastSeq = s1
+                    barrelEyeAgeS = 0.0
+                end
+                local mainLen2 = mx*mx + my*my + mz*mz
+                local secondLen2 = sx*sx + sy*sy + sz*sz
+                local ex, ey, ez = mx - sx, my - sy, mz - sz
+                local separation2 = ex*ex + ey*ey + ez*ez
+                if barrelEyeAgeS <= BARREL_EYE_MAX_AGE_S and mainLen2 > 1.0 and
+                   secondLen2 > 1.0 and separation2 > 0.0001 and separation2 < 0.04 then
+                    return Vector4.new(mx, my, mz, 1.0), Vector4.new(sx, sy, sz, 1.0)
+                end
+                return nil, nil
+            end
+        end
+    end
+    return nil, nil
+end
+
+local function makeBarrelLosEnd(eye, finalHit, fx, fy, fz)
+    if finalHit then
+        local dx, dy, dz = finalHit.x - eye.x, finalHit.y - eye.y, finalHit.z - eye.z
+        local d2 = dx*dx + dy*dy + dz*dz
+        if d2 <= BARREL_LOS_ENDPOINT_OFFSET_M * BARREL_LOS_ENDPOINT_OFFSET_M then return nil end
+        local invD = 1.0 / math.sqrt(d2)
+        return Vector4.new(
+            finalHit.x - dx * invD * BARREL_LOS_ENDPOINT_OFFSET_M,
+            finalHit.y - dy * invD * BARREL_LOS_ENDPOINT_OFFSET_M,
+            finalHit.z - dz * invD * BARREL_LOS_ENDPOINT_OFFSET_M, 1.0)
+    end
+    return Vector4.new(eye.x + fx * BARREL_RAY_MAX_M,
+                       eye.y + fy * BARREL_RAY_MAX_M,
+                       eye.z + fz * BARREL_RAY_MAX_M, 1.0)
+end
+
+local function queryNpcBarrelRay(player, rayStart, rayEnd)
+    if not player or not player.VRFindNpcBarrelRayHit then return nil, nil end
+    local hit = player:VRFindNpcBarrelRayHit(rayStart, rayEnd)
+    if not hit or (hit.w or 0.0) <= 0.5 then return hit, nil end
+    if not player.VRGetNpcBarrelRayEntity then return hit, nil end
+    local idOk, entityKey = pcall(function()
+        local entityId = player:VRGetNpcBarrelRayEntity()
+        if not entityId then return nil end
+        return tostring(entityId.hash)
+    end)
+    if not idOk then return hit, nil end
+    return hit, entityKey
+end
+
+local function barrelDotVisibleFromEye(player, eye, finalHit, finalNpcKey, fx, fy, fz)
+    local rayEnd = makeBarrelLosEnd(eye, finalHit, fx, fy, fz)
+    if not rayEnd then return true, 0.0, 'near' end
+    local dx, dy, dz = rayEnd.x - eye.x, rayEnd.y - eye.y, rayEnd.z - eye.z
+    local rayLengthSq = dx*dx + dy*dy + dz*dz
+    if rayLengthSq <= 0.000001 then return true, 0.0, 'near' end
+    local invRayLength = 1.0 / math.sqrt(rayLengthSq)
+    local dirX, dirY, dirZ = dx * invRayLength, dy * invRayLength, dz * invRayLength
+    local worldStart = eye
+    local glassHits = 0
+    for _ = 1, BARREL_LOS_MAX_GLASS_HITS + 1 do
+        local worldOk, worldSuccess, worldResult = pcall(function()
+            return barrelRaySystem:SyncRaycastByQueryPreset(worldStart, rayEnd, BARREL_RAY_PRESET, false)
+        end)
+        if not worldOk then
+            if not barrelLosCallWarned then
+                barrelLosCallWarned = true
+                logAlways('barrel world LOS failed; visibility remains fail-open: %s', tostring(worldSuccess))
+            end
+            return true, -1.0, 'world-error'
+        end
+        if not (worldSuccess and worldResult and worldResult.position) then break end
+        local p = worldResult.position
+        local materialName = string.lower(tostring(worldResult.material or ''))
+        if not string.find(materialName, 'glass', 1, true) then
+            local bx, by, bz = p.x - eye.x, p.y - eye.y, p.z - eye.z
+            return false, math.sqrt(bx*bx + by*by + bz*bz), 'world'
+        end
+        glassHits = glassHits + 1
+        if glassHits > BARREL_LOS_MAX_GLASS_HITS then break end
+        worldStart = Vector4.new(
+            p.x + dirX * BARREL_LOS_GLASS_STEP_M,
+            p.y + dirY * BARREL_LOS_GLASS_STEP_M,
+            p.z + dirZ * BARREL_LOS_GLASS_STEP_M, 1.0)
+        local rx, ry, rz = rayEnd.x - worldStart.x, rayEnd.y - worldStart.y, rayEnd.z - worldStart.z
+        if rx*dirX + ry*dirY + rz*dirZ <= 0.0 then break end
+    end
+
+    local npcOk, npcResult, npcEntityKey = pcall(function()
+        return queryNpcBarrelRay(player, eye, rayEnd)
+    end)
+    if not npcOk then
+        if not barrelLosCallWarned then
+            barrelLosCallWarned = true
+            logAlways('barrel NPC LOS failed; visibility remains fail-open: %s', tostring(npcResult))
+        end
+        return true, -1.0, 'npc-error'
+    end
+    if npcResult and (npcResult.w or 0.0) > 0.5 then
+        local bx, by, bz = npcResult.x - eye.x, npcResult.y - eye.y, npcResult.z - eye.z
+        local blockM = math.sqrt(bx*bx + by*by + bz*bz)
+        if finalNpcKey and npcEntityKey and npcEntityKey == finalNpcKey then
+            return true, blockM, glassHits > 0 and ('npc-self-glass' .. tostring(glassHits)) or 'npc-self'
+        end
+        return false, blockM, glassHits > 0 and ('npc-glass' .. tostring(glassHits)) or 'npc'
+    end
+    return true, -1.0, glassHits > 0 and ('clear-glass' .. tostring(glassHits)) or 'clear'
+end
+
+local function updateBarrelRay(dt)
+    if type(GetVRSharedSlot) ~= 'function' or type(SetVRBarrelRayHit) ~= 'function' then return end
+    if GetVRSharedSlot(181) < 0.5 then stopBarrelRay(); return end
+    barrelRayWasActive = true
+    if GetVRSharedSlot(27) < 0.5 or GetVRSharedSlot(203) < 0.5 then
+        publishBarrelRayMiss(); return
+    end
+
+    local px, py, pz = GetVRSharedSlot(200), GetVRSharedSlot(201), GetVRSharedSlot(202)
+    local fx, fy, fz = GetVRSharedSlot(24), GetVRSharedSlot(25), GetVRSharedSlot(26)
+    local f2 = fx*fx + fy*fy + fz*fz
+    if px*px + py*py + pz*pz < 1.0 or f2 < 0.25 then publishBarrelRayMiss(); return end
+    local invF = 1.0 / math.sqrt(f2)
+    fx, fy, fz = fx * invF, fy * invF, fz * invF
+    local from = Vector4.new(px, py, pz, 1.0)
+    local to = Vector4.new(px + fx * BARREL_RAY_MAX_M,
+                           py + fy * BARREL_RAY_MAX_M,
+                           pz + fz * BARREL_RAY_MAX_M, 1.0)
+    if barrelRaySystem == nil then barrelRaySystem = Game.GetSpatialQueriesSystem() or false end
+    if not barrelRaySystem then publishBarrelRayMiss(); return end
+
+    local worldHit, worldDistanceSq = nil, nil
+    local success, result = barrelRaySystem:SyncRaycastByQueryPreset(from, to, BARREL_RAY_PRESET, false)
+    if success and result then
+        local p = result.position
+        if p and type(p.x) == 'number' and type(p.y) == 'number' and type(p.z) == 'number' then
+            local dx, dy, dz = p.x - px, p.y - py, p.z - pz
+            worldHit, worldDistanceSq = p, dx*dx + dy*dy + dz*dz
+        end
+    end
+
+    local player = Game.GetPlayer()
+    local npcHit, npcDistanceSq = nil, nil
+    local npcOk, npcResult, npcEntityKey = pcall(function() return queryNpcBarrelRay(player, from, to) end)
+    if npcOk then
+        if npcResult and (npcResult.w or 0.0) > 0.5 and
+           type(npcResult.x) == 'number' and type(npcResult.y) == 'number' and
+           type(npcResult.z) == 'number' then
+            local dx, dy, dz = npcResult.x - px, npcResult.y - py, npcResult.z - pz
+            npcHit, npcDistanceSq = npcResult, dx*dx + dy*dy + dz*dz
+        end
+    elseif not barrelNpcCallWarned then
+        barrelNpcCallWarned = true
+        logAlways('barrel ray: NPC surface query failed; Ray A remains active: %s', tostring(npcResult))
+    end
+
+    local finalHit, finalDistanceSq, finalNpcKey = worldHit, worldDistanceSq, nil
+    if npcHit and (not finalDistanceSq or npcDistanceSq < finalDistanceSq) then
+        finalHit, finalDistanceSq, finalNpcKey = npcHit, npcDistanceSq, npcEntityKey
+    end
+
+    local mainVisible, secondVisible = true, true
+    local mainBlockM, secondBlockM = -1.0, -1.0
+    local mainSource, secondSource = 'no-eyes', 'no-eyes'
+    local mainEye, secondEye = readBarrelEyes(dt)
+    if player and mainEye and secondEye then
+        mainVisible, mainBlockM, mainSource = barrelDotVisibleFromEye(
+            player, mainEye, finalHit, finalNpcKey, fx, fy, fz)
+        secondVisible, secondBlockM, secondSource = barrelDotVisibleFromEye(
+            player, secondEye, finalHit, finalNpcKey, fx, fy, fz)
+    end
+    if vrDebug() then
+        local now = (os and os.clock and os.clock()) or 0.0
+        if now - barrelLosLogAt >= 1.0 then
+            barrelLosLogAt = now
+            logAlways('barrel LOS: eyes=%d hit=%d main=%s/%s block=%.3fm second=%s/%s block=%.3fm',
+                (mainEye and secondEye) and 1 or 0, finalHit and 1 or 0,
+                mainVisible and 'clear' or 'blocked', mainSource, mainBlockM,
+                secondVisible and 'clear' or 'blocked', secondSource, secondBlockM)
+        end
+    end
+    if finalHit then
+        SetVRBarrelRayHit(finalHit.x, finalHit.y, finalHit.z, 1,
+            mainVisible and 1 or 0, secondVisible and 1 or 0)
+        return
+    end
+    publishBarrelRayMiss(mainVisible, secondVisible)
+end
+
 registerForEvent('onInit', function()
+    laserWeaponRightSlot = TweakDBID.new(SLOT_RIGHT)
     logf("weapon-aim init")
 end)
 
@@ -916,6 +1216,30 @@ registerForEvent('onUpdate', function(dt)
         -- immediately. Isolation belongs in the OTHER direction: the muzzle keeps its place and the
         -- newcomer gets its own pcall.
         if wpn then updateMuzzle(wpn) end
+        pcall(function()
+            local ranged = false
+            local ts = pl and Game.GetTransactionSystem()
+            local rightWeapon = ts and laserWeaponRightSlot and
+                ts:GetItemInSlot(pl, laserWeaponRightSlot) or nil
+            if rightWeapon then ranged = rightWeapon:IsRanged() end
+            if type(SetVRLaserRangedWeaponState) == 'function' then
+                SetVRLaserRangedWeaponState(ranged and 1 or 0)
+            end
+        end)
+        local okSight = pcall(function() publishSightOrigin(wpn) end)
+        if not okSight and type(SetVRSightOrigin) == 'function' then
+            SetVRSightOrigin(0.0, 0.0, 0.0, 0)
+        end
+        local okRay, errRay = pcall(function()
+            if wpn then updateBarrelRay(dt) else stopBarrelRay() end
+        end)
+        if not okRay then
+            publishBarrelRayMiss()
+            if not barrelRayCallWarned then
+                barrelRayCallWarned = true
+                logAlways('barrel ray: query failed: %s', tostring(errRay))
+            end
+        end
         if wpn then
             local wid = nil
             pcall(function() wid = tostring(wpn:GetEntityID().hash) end)

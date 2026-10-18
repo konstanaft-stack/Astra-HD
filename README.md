@@ -1,57 +1,51 @@
-# Astra HD
+# Astra HD + VR-центр
 
-This is an unfinished experimental combination, not a finished stable VR port. Astra HD sends the game to the headset; VR-CENTR manages installation contents and profiles. Profiles were created because repeated VR, mod and library tests left mixed, nonworking file combinations. They support repeatable tests and restoring a chosen state without manually deleting several game folders, downloading the game again through Steam or reinstalling after each test. 
+**Экспериментальный Cyberpunk 2077 в VR — выпуск r29 / Center04 от 18 октября 2026 года.** Astra HD выводит игру в шлем; VR-центр устанавливает согласованный комплект, сохраняет отдельные профили и запускает выбранный состав. Текущий центр предназначен для Cyberpunk 2077 на Windows.
 
-No mode is declared finished. Features, controls and architecture may change or disappear following testing; this is not a promised roadmap or complete feature list.
+| Скачать оба комплекта одного выпуска | Назначение |
+|---|---|
+| [**Astra HD r29 — native-base ZIP**](https://github.com/konstanaft-stack/Astra-HD/releases/download/astra-hd-r29-experimental-20261018/Astra-HD-r29-native-base-20261018-experimental.zip) | VR-порт, скрипты, ресурсы редактора, обязательные зависимости и выбранные NVIDIA SR/RR/G **310.9.16.0** |
+| [**VR-центр — Windows x64, Center04 ZIP**](https://github.com/konstanaft-stack/Astra-HD/releases/download/astra-hd-r29-experimental-20261018/VR-CENTR-public-win-x64-20261018-experimental04.zip) | Готовое приложение с runtime, backend-скриптами и управлением профилями |
 
-### Development goal
+[Установка и возврат к Flat](INSTALL.md) · [Проверенное состояние и ограничения](STATUS.md) · [SHA256SUMS](https://github.com/konstanaft-stack/Astra-HD/releases/download/astra-hd-r29-experimental-20261018/SHA256SUMS.txt) · [Страница выпуска](https://github.com/konstanaft-stack/Astra-HD/releases/tag/astra-hd-r29-experimental-20261018)
 
-We want Cyberpunk 2077 to become a complete VR experience: from spatial menus and the character editor to a comfortable, readable HUD and interaction with the game world. The foundation is high-quality stereo, stable FPS and coherent neural rendering with frame generation. The interface should suit headsets and VR controllers. This is our development goal, not a list of finished features.
+GitHub **Source code ZIP** содержит исходники и не заменяет эти два runtime-архива. Игра, личные профили, сохранения и коллекции модов в них не входят.
 
-[![Русский](https://img.shields.io/badge/Русский-2563eb?style=for-the-badge)](README.ru.md)
-[![English](https://img.shields.io/badge/English-2563eb?style=for-the-badge)](README.md)
-[![中文](https://img.shields.io/badge/中文-2563eb?style=for-the-badge)](README.zh-CN.md)
+## Зачем нужны профили
 
-## VR-CENTR + Astra HD: install and use together
+После проверок разных VR-модов и библиотек в папках игры легко смешать несовместимые варианты. Раньше возврат требовал ручной очистки, восстановления через Steam и новой установки модов. Центр сохраняет выбранный состав и отдельное состояние профиля, чтобы переключаться и возвращаться к проверенной основе. Новому чистому профилю нужна **заранее сохранённая чистая игра после первого запуска до меню**.
 
-**No ready combined installation archive is available yet.** [Astra HD Releases](https://github.com/konstanaft-stack/Astra-HD/releases) is the future download location. The automatic Source ZIP contains source code, not an installer; a checkout alone does not restore a working installation.
+Это не готовая универсальная VR-сборка. Возможности и управление прототипа могут меняться; новая коллекция модов или другой ПК требуют собственной проверки.
 
-Once a verified installation archive is published:
+## Что изменилось в r29
 
-1. Install your own Cyberpunk 2077 through Steam. The public package does not include the game, paid third-party ports or personal saves.
-2. Download the ready archive from Releases, extract it, run its included installer and select your game folder.
-3. In VR-CENTR, first preserve a verified clean baseline and create a clean profile. Then choose a mod collection and Astra HD VR port, and apply that composition.
-4. Launch through the center. Switch profiles, ports or libraries only after closing the game; save any current state you want to keep first.
+В обычную установку включён новый native-редактор с двумя согласованными камерами. В диагностике проверены обе картинки и отдельный UI при переходах **кожа → губы → предпросмотр → кожа**. Выбор категории сохраняет ручную высоту, приближение, ракурс и reference головы; проверены свежая поза головы и сброс ручных смещений. r29 установлен в обычный пользовательский профиль.
 
-The shared OptiScaler/NR/MFG package is installed once per game, not separately per profile. Back up personal saves separately. HUD, editor, motion and performance still need headset validation.
+**Комфорт, отсутствие дрожания/мерцания во всех условиях и FPS в физическом шлеме ещё не приняты.** Сохраняются остаточные маски/артефакты UI; ореолы и мерцание чередующегося AER не объявлены исправленными. Ранее подтверждённые пользователем улучшения HUD и зеркала относятся к конкретному Test3, а не ко всем профилям и коллекциям. Подробности — в [STATUS](STATUS.md).
 
+## Что входит в этот выпуск
 
-### Current experiments and development directions
+Native-base содержит VR-порт, editor archive, обязательные framework/скрипты и те же выбранные NVIDIA SR/RR/G 310.9.16.0. **При первом Native Apply центр один раз применяет рекомендованный preset сборки, даже если UserSettings.json уже существует**, когда для этой версии ещё нет сохранённого режима. Это может изменить графические настройки. Далее сохраняется выбранный для версии режим Custom/«рекомендованные»; первичная инициализация не повторяется вместо уже сохранённого выбора.
 
-- **Dual camera:** separate left/right views are the current foundation. FPS, frame generation and stability remain under development; 80 FPS is not verified.
-- **Alternating eyes/AER:** the user subjectively finds the world more natural, freer and more present than with our current dual-camera output; the cause is unknown. This mode is seriously unfinished: large halos previously diminished or disappeared, then returned. That regression remains unresolved.
-- **Stereo character editor:** spatial preview, headset inspection and left grip/stick camera height/zoom are being developed. Centering, UI overlap and FPS defects remain; this is not an accepted, finished Luke-like mode.
+**Optional OptiScaler/NR/MFG не включён. Совместная NR+FG — следующий этап, её готовность и целевой FPS здесь не заявляются.** Включать common-пакет для первого запуска этой native-основы не требуется. Пользовательская локальная установка с собственным common-пакетом — отдельное состояние; она не означает, что такой пакет включён в публичный ZIP.
 
-Contributions investigating a specific defect or branch are welcome through PRs. Include version, GPU, HMD/runtime and reproduction steps. Upstream attribution is preserved.
+## Камера редактора
 
-### Current prototype controls: editor camera
+Удерживайте **левый grip**:
 
-Hold left grip: left stick ↑↓ adjusts height (0.5 m/s), ←→ adjusts distance (0.6 m/s). Grip+left-stick click resets camera height/distance only, not global HMD recentering. Mouse: Shift+wheel height, Ctrl+wheel distance, Ctrl+middle button reset. Headset validation of these axes remains open.
+| Действие | Управление |
+|---|---|
+| Высота | Левый стик ↑↓ |
+| Приближение / удаление | Левый стик ←→ |
+| Ракурс вокруг аватара | Правый стик X |
+| Сброс ручных смещений камеры | Клик левого стика — L3 |
 
-OptiScaler: Insert opens its menu, F12 requests its FG toggle, and \ toggles NR after world load. These are separate from port Own FG. On the current RTX4060 setup, NR310.9.16 still returns createFeatureNotSupported.
+Это привязки активного редактора. Сброс смещений камеры не является системным recenter шлема.
 
-Forks, porting our changes to other forks or bringing Cyberpunk support into a main project, and help with individual defects are welcome. We continue our own development alongside this collaboration; preserve licenses and upstream attribution.
+## Направление разработки и исходники
 
-This update publishes documentation only. A ready download, a complete current-source backup and an installer are not supplied by this commit.
+Хотим получить цельный VR-опыт: пространственные меню, удобный редактор, читаемый HUD, взаимодействие контроллерами и согласованный нейрорендеринг с генерацией кадров. **Это цели разработки, а не перечень завершённых функций.**
 
-## Origins and credits
+Astra HD продолжает открытый [CyberpunkVR Port dariulone](https://github.com/dariulone/cyberpunk-vr-port) и [Tofu Express X / dabinn](https://github.com/dabinn/cyberpunk-vr-port). Исходная история, авторство и лицензии сохраняются. Благодарим авторов CET, RED4ext, ArchiveXL, Codeware, TweakXL, Input Loader, Mod Settings, redscript и Ultimate ASI Loader. Исходники VR-центра находятся в [`vr-center/`](vr-center/).
 
-- [dariulone/cyberpunk-vr-port](https://github.com/dariulone/cyberpunk-vr-port): original project and direct upstream.
-- [dabinn/cyberpunk-vr-port — Tofu Express](https://github.com/dabinn/cyberpunk-vr-port): an important basis for our local development.
-- Other community contributions will be attributed individually when incorporated.
-
-Original history and author notices are preserved. Existing components retain their respective licenses.
-
-Updated: 18 October 2026.
-
-[15 October 2026: stereo editor checkpoint, image and focused code change](STEREO-EDITOR-2026-10-15.md)
+Лицензии отдельных компонентов и third-party notices приложены к архивам. NVIDIA runtimes имеют собственные условия и не перелицензируются под MIT; условия usvfs также сохраняются. Для воспроизводимого сообщения об ошибке укажите выпуск, GPU, шлем/OpenXR runtime, профиль или коллекцию и последовательность действий.

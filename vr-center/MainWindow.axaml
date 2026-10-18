@@ -1,0 +1,11 @@
+<Window xmlns="https://github.com/avaloniaui" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" x:Class="VRPorts.MainWindow" Title="VR-центр" Icon="/Assets/vrports.ico" Width="1080" Height="720" MinWidth="850" MinHeight="650" WindowStartupLocation="CenterScreen" WindowDecorations="None" Background="Transparent" TransparencyLevelHint="Transparent">
+ <Window.Styles>
+  <Style Selector="TextBlock"><Setter Property="Foreground" Value="#F5F5F7"/></Style>
+  <Style Selector="ToolTip"><Setter Property="Background" Value="#FF101A15"/><Setter Property="Foreground" Value="#FFFFFF"/><Setter Property="FontSize" Value="13"/><Setter Property="MaxWidth" Value="360"/><Setter Property="Opacity" Value="1"/></Style>
+  <Style Selector="ToolTip /template/ ContentPresenter#PART_ContentPresenter"><Setter Property="Background" Value="#FF101A15"/><Setter Property="TextBlock.TextWrapping" Value="Wrap"/></Style>
+  <Style Selector="ComboBox"><Setter Property="HorizontalAlignment" Value="Stretch"/><Setter Property="FontSize" Value="12"/><Setter Property="CornerRadius" Value="12"/><Setter Property="Background" Value="#FF101816"/></Style>
+  <Style Selector="Button"><Setter Property="Cursor" Value="Hand"/></Style>
+  <Style Selector="ToggleSwitch"><Setter Property="OnContent" Value=""/><Setter Property="OffContent" Value=""/><Setter Property="Margin" Value="0"/></Style>
+ </Window.Styles>
+ <Grid Name="Host"/>
+</Window>

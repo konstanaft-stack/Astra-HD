@@ -1,4 +1,6 @@
 #include "Utils/DebugGate.hpp"
+#include "Hooks/NativeSettingsAdmission.hpp"
+#include "Hooks/CetLifecycle.hpp"
 #include <windows.h>
 #include "Stereo/VrcamConfig.hpp"   // cname_hash, for the device camera name
 #include <psapi.h>
@@ -15,6 +17,7 @@
 #include "Camera/CameraState.hpp"   // PatchFastPath, PatchFastDisarm
 #include "Overlay/LiveControlsUi.hpp"
 #include "Overlay/LauncherDialog.hpp"
+#include "Overlay/PpdNativeApply.hpp"
 #include "Runtimes/OpenXRManager.hpp"
 #include "Runtimes/RuntimeFovCorrection.hpp"
 #include <RED4ext/RED4ext.hpp>
@@ -315,6 +318,15 @@ extern "C" int GetInputActionsEnabled() {
     return g_liveControls.xrInputActions != 0 ? 1 : 0;
 }
 
+extern "C" int GetChordActivationMethod() {
+    const int value = g_liveControls.xrChordActivation;
+    return (value >= 0 && value <= 2) ? value : 1;
+}
+
+extern "C" int GetExtraChordActionsEnabled() {
+    return g_liveControls.xrExtraChordActions != 0 ? 1 : 0;
+}
+
 extern "C" int GetMonoXQueueWait() {
     return g_liveControls.xrMonoXQueueWait != 0 ? 1 : 0;
 }
@@ -353,17 +365,7 @@ float* GetShotShared();  // shared-mem accessor (defined below)
 // map is open (shared[81], set by redscript bridge SetVRMenuOpen), STOP applying
 // our square-resolution override — let the game use its real 16:9 resolution for
 // the map's UI projection so pins track the background correctly.
-void ApplySettingsResolutionOverride(uintptr_t settingsPtr) {
-    // Both straight from the launcher. The aspect-derived variant that used to sit here is
-    // gone with the DLSS overrides -- nothing may re-derive a size from the runtime's
-    // recommended render target any more; that is what cost 3.4 degrees of vertical field.
-    const UINT forcedWidth = GetForcedWindowWidthValue();
-    const UINT forcedHeight = GetForcedWindowHeightValue();
-
-    if (!settingsPtr || forcedWidth == 0 || forcedHeight == 0) {
-        return;
-    }
-
+bool SettingsResolutionOverrideSuspended() {
     // World map open? Suspend the override (test).
     {
         uint32_t mapFlag = 0;
@@ -378,17 +380,25 @@ void ApplySettingsResolutionOverride(uintptr_t settingsPtr) {
                     mapFlag, mapFlag ? "SUSPEND resolution override (map open)" : "apply square");
             }
         }
-        if (mapFlag != 0u) {
-            return;
-        }
+        return mapFlag != 0u;
     }
+}
+void ApplySettingsResolutionOverride(uintptr_t settingsPtr) {
+    // Both straight from the launcher for the existing author startup path.
+    // Live PPD has a separate owner and never changes the authored VRCAM name.
+    const UINT forcedWidth = GetForcedWindowWidthValue();
+    const UINT forcedHeight = GetForcedWindowHeightValue();
+    if (!settingsPtr || forcedWidth == 0 || forcedHeight == 0 ||
+        SettingsResolutionOverrideSuspended()) return;
 
     // VR Mod tracks the settings struct around CP2077SettingsRes; +0x18/+0x1C are the
     // active dimensions and +0x84/+0x88 are the validator targets used by the game.
-    WriteU32Safe(settingsPtr + 0x18, forcedWidth);
-    WriteU32Safe(settingsPtr + 0x1C, forcedHeight);
-    WriteU32Safe(settingsPtr + 0x84, forcedWidth);
-    WriteU32Safe(settingsPtr + 0x88, forcedHeight);
+    // The same lock as the actual hook dispatcher excludes the background cached
+    // pointer path while a live request owns native dimensions.
+    const auto authorAdmission=cvr::hooks::AdmitAuthorSizeWrite(settingsPtr,forcedWidth,forcedHeight);
+    if(authorAdmission!=cvr::hooks::AuthorSizeAdmission::Denied)
+        cvr::ppd::WriteAuthorNativeSize(settingsPtr,forcedWidth,forcedHeight,
+            authorAdmission==cvr::hooks::AuthorSizeAdmission::PendingOnly);
 }
 
 // Only the SETTINGS override is left. The DLSS one was removed 2026-08-03: it was AER-era,
@@ -450,6 +460,8 @@ extern "C" float GetFovOverscan() {
     return 1.0f;
 }
 volatile int g_menuModeValue = 0;
+std::atomic<int> g_laserRangedWeaponActive{0};
+std::atomic<unsigned long long> g_laserRangedWeaponUpdatedMs{0};
 
 // Overscan factor: render (and submit) a FOV this much wider than the lens, so the
 // compositor's reprojection (ATW) on head turns has rendered pixels beyond the lens

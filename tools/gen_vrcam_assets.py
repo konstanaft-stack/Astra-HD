@@ -20,6 +20,9 @@
 # Usage:
 #   python tools/gen_vrcam_assets.py --dry-run
 #   python tools/gen_vrcam_assets.py
+#   python tools/gen_vrcam_assets.py --project STAGE --catalog STAGE/vrcam.json --selected-resolution 2312x2576
+# Selected-size packages must be built from the original bounded archive. This
+# is offline asset preparation, not live PPD/Adapt or confirmation of Applied PPD.
 
 import argparse
 import io
@@ -101,6 +104,15 @@ STREAMING_DISTANCE = 12500
 # A fixed stamp rather than the wall clock: re-running the generator should produce byte-identical
 # files, so an unchanged resolution never shows up as a diff.
 EXPORTED_AT = "2026-08-01T00:00:00.0000000Z"
+
+# The startup collector at game RVA 0x1C83F4 has 256 transform-attachment slots
+# followed by its count. The captured owner is the "slots" entSlotComponent:
+# each new VRCAM parentTransform creates another entSlotAttachment there.
+# Bound the entire authored entity conservatively instead of guessing which
+# attachments the runtime filter accepts. This is an asset safety policy, not
+# a universal engine component limit or proof about later runtime attachments.
+# Disabled cameras still create startup attachments. Author one selected size.
+MAX_AUTHORED_COMPONENTS = 256
 
 
 def f32(x):
@@ -239,7 +251,8 @@ def make_dtex(w, h):
 
 def parse_launcher_resolutions(path):
     """Every {W, H, L"..."} in every ResolutionPreset array, keyed by the array name."""
-    text = io.open(path, encoding="utf-8", errors="replace").read()
+    with io.open(path, encoding="utf-8", errors="replace") as stream:
+        text = stream.read()
     ladders = {}
     for m in re.finditer(
             r"static\s+const\s+ResolutionPreset\s+(\w+)\s*\[\s*\]\s*=\s*\{(.*?)\}\s*;",
@@ -258,7 +271,8 @@ def component_name(c):
 
 def load_json(path):
     """Returns (data, style) where style carries the byte-level details worth preserving."""
-    raw = io.open(path, "rb").read()
+    with io.open(path, "rb") as stream:
+        raw = stream.read()
     style = {
         "bom": raw.startswith(b"\xef\xbb\xbf"),
         "crlf": raw.count(b"\r\n") > raw.count(b"\n") // 2,
@@ -310,6 +324,9 @@ def verify_ent(path, wanted, prefix="vrcam_"):
     comps, package = root["components"], root["compiledData"]["Data"]
     chunks, cruid = package["Chunks"], package["CruidDict"]
     problems = []
+    if len(comps) > MAX_AUTHORED_COMPONENTS:
+        problems.append("components(%d) exceed conservative startup collector budget %d"
+                        % (len(comps), MAX_AUTHORED_COMPONENTS))
     if len(chunks) != len(comps) + 1:
         problems.append("chunks(%d) != components(%d)+1" % (len(chunks), len(comps)))
     for i, c in enumerate(comps):
@@ -371,7 +388,14 @@ def process_ent(path, wanted, dry_run, prefix="vrcam_"):
                          % (os.path.basename(path), len(chunks), len(comps)))
 
     have = {component_name(c) for c in comps}
-    raw_text = io.open(path, encoding="utf-8-sig").read()
+    missing = {prefix + "%dx%d" % wh for wh in wanted} - have
+    projected = len(comps) + len(missing)
+    if projected > MAX_AUTHORED_COMPONENTS:
+        raise ValueError("%s: projected components(%d) exceed conservative startup collector budget %d; "
+                         "start from the original bounded archive and generate only the selected resolution"
+                         % (os.path.basename(path), projected, MAX_AUTHORED_COMPONENTS))
+    with io.open(path, encoding="utf-8-sig") as stream:
+        raw_text = stream.read()
     handle_ids = [int(x) for x in re.findall(r'"HandleId"\s*:\s*"(\d+)"', raw_text)]
     parent_id, mint = vrcam_parent_handle(chunks, handle_ids)
 
@@ -392,6 +416,7 @@ def process_ent(path, wanted, dry_run, prefix="vrcam_"):
         comps.append(make_component(w, h, cid, {"HandleRefId": parent_id}, prefix))
         cruid[str(len(chunks) - 1)] = str(cid)
         added.append(name)
+        have.add(name)
 
     made_backup = False
     if added and not dry_run:
@@ -476,7 +501,23 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--dry-run", action="store_true", help="report what would change, write nothing")
     ap.add_argument("--project", default=PROJECT, help="WolvenKit project root")
+    ap.add_argument("--catalog", help="output vrcam.json; required with --selected-resolution")
+    ap.add_argument("--selected-resolution", metavar="WIDTHxHEIGHT",
+                    help="preserve the original cameras and author only this additional aligned size")
     args = ap.parse_args()
+
+    selected = None
+    if args.selected_resolution:
+        match = re.fullmatch(r"([0-9]+)x([0-9]+)", args.selected_resolution)
+        if not match or any(int(v) <= 0 or int(v) % 8 for v in match.groups()):
+            ap.error("selected resolution requires positive dimensions aligned to 8, e.g. 2312x2576")
+        selected = tuple(map(int, match.groups()))
+        if not args.catalog:
+            ap.error("--selected-resolution requires an explicit staged --catalog")
+    catalog_path = args.catalog or VRCAM_JSON
+    if selected and not os.path.isfile(catalog_path):
+        ap.error("missing staged catalogue: %s" % catalog_path)
+    cfg, cfg_style = load_json(catalog_path) if os.path.isfile(catalog_path) else (None, None)
 
     global RAW, ARCHIVE
     RAW = os.path.join(args.project, "source", "raw")
@@ -484,8 +525,8 @@ def main():
     if not os.path.isdir(RAW):
         raise SystemExit("no source/raw under %s" % args.project)
 
-    ladders = parse_launcher_resolutions(LAUNCHER)
-    if not ladders:
+    ladders = {} if selected else parse_launcher_resolutions(LAUNCHER)
+    if not selected and not ladders:
         raise SystemExit("parsed no resolution ladders out of %s" % LAUNCHER)
 
     launcher_res = []
@@ -495,7 +536,8 @@ def main():
                 launcher_res.append(wh)
     launcher_res.sort()
 
-    print("launcher ladders: %d, %d unique resolutions" % (len(ladders), len(launcher_res)))
+    print("selected-size offline package: %dx%d" % selected if selected else
+          "launcher ladders: %d, %d unique resolutions" % (len(ladders), len(launcher_res)))
     for name in sorted(ladders):
         print("   %-28s %s" % (name, ", ".join("%dx%d" % r for r in ladders[name])))
     print()
@@ -506,8 +548,21 @@ def main():
     for wh in CRUID_SEED:
         if wh not in wanted:
             wanted.append(wh)
-    ent_paths = [os.path.join(RAW, rel.replace("/", os.sep)) for rel in ENT_FILES]
+    ent_paths = [os.path.join(RAW, rel.replace("/", os.sep)) for rel in ENT_FILES + REPLACER_FILES]
+    if selected:
+        missing = [path for path in ent_paths if not os.path.isfile(path)]
+        if missing:
+            ap.error("missing player/replacer entities; export all eight from the original archive: %s"
+                     % ", ".join(missing))
     existing_named, ids_in_use = scan_existing_cruids(ent_paths)
+    if selected:
+        # Read the actual bounded entities, not a possibly stale broad catalogue.
+        wanted = [selected]
+        for name in existing_named:
+            match = re.fullmatch(r"vrcam_(?:braindance_)?([0-9]+)x([0-9]+)", name)
+            if match:
+                wanted.append(tuple(map(int, match.groups())))
+        wanted = sorted(set(wanted))
     build_cruid_table(wanted, existing_named, ids_in_use)
     wanted.sort()
     fresh = sorted(wh for wh in wanted if "vrcam_%dx%d" % wh not in existing_named)
@@ -516,6 +571,22 @@ def main():
              "%d..%d" % (cruid_for(*fresh[0]) - CRUID_BASE, cruid_for(*fresh[-1]) - CRUID_BASE)
              if fresh else "none"))
     print()
+
+    # Validate every input and its final size before the first write, including
+    # direct calls to process_ent used by staging tools. A later replacer must
+    # not leave earlier entities or the catalogue partially upgraded.
+    for rel in ENT_FILES + REPLACER_FILES:
+        path = os.path.join(RAW, rel.replace("/", os.sep))
+        if not os.path.isfile(path):
+            continue
+        prefix = REPLACER_PREFIX if rel in REPLACER_FILES else "vrcam_"
+        try:
+            problems, _ = verify_ent(path, [], prefix)
+            if problems:
+                raise ValueError("%s: %s" % (os.path.basename(path), "; ".join(problems)))
+            process_ent(path, wanted, True, prefix)
+        except ValueError as exc:
+            ap.error(str(exc))
 
     total_added = 0
     failures = []
@@ -584,16 +655,18 @@ def main():
 
     # The catalogue the launcher reads. Only names listed here are offered, so it has to match what
     # the entities now carry.
-    if os.path.isfile(VRCAM_JSON):
-        cfg, cfg_style = load_json(VRCAM_JSON)
+    if cfg is not None:
         cfg["components"] = ["vrcam_%dx%d" % (w, h) for (w, h) in wanted]
+        if selected:
+            cfg["component"] = "vrcam_%dx%d" % selected
+            cfg["virtualCamera"] = "vrcam_feed_%dx%d" % selected
         if not args.dry_run:
-            save_json(VRCAM_JSON, cfg, cfg_style)
+            save_json(catalog_path, cfg, cfg_style)
         print()
         print("vrcam.json catalogue: %d entries" % len(cfg["components"]))
     else:
         print()
-        print("vrcam.json not found at %s -- catalogue not updated" % VRCAM_JSON)
+        print("vrcam.json not found at %s -- catalogue not updated" % catalog_path)
 
     print()
     if failures:

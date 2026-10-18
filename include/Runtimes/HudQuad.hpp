@@ -20,7 +20,18 @@ struct PoseDebug {
 };
 class Quad {
 public:
+    enum class Mode { Hud, Explicit };
     explicit Quad(Channel value=Channel::Main):channel(value){}
+    explicit Quad(Mode mode):channel(Channel::Main),explicitMode(mode==Mode::Explicit){}
+    ~Quad() { Shutdown(); }
+    Quad(const Quad&)=delete;
+    Quad& operator=(const Quad&)=delete;
+    // Separate instance only: caller supplies a world-space placement and an
+    // immutable producer frame (unique serial per publication), not Latest() or
+    // a second source read lease. Queue must be the session's D3D12 binding queue.
+    const XrCompositionLayerBaseHeader* PrepareExplicit(XrSession session, XrSpace space,
+        ID3D12Device* device, ID3D12CommandQueue* queue, const std::shared_ptr<Frame>& frame,
+        const XrPosef& pose, const XrExtent2Df& size, XrCompositionLayerFlags flags);
     const XrCompositionLayerBaseHeader* Prepare(XrSession session, XrSpace space,
         ID3D12Device* device, ID3D12CommandQueue* queue, bool enabled,
         bool tracked, const XrPosef& head, uint64_t origin,
@@ -31,10 +42,13 @@ public:
     void Shutdown();
 private:
     Channel channel;
-    bool Ensure(XrSession session, ID3D12Device* device, uint32_t width, uint32_t height);
+    bool Ensure(XrSession session, ID3D12Device* device, uint32_t width, uint32_t height,
+        DXGI_FORMAT format=DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
     void RetireCompleted(uint64_t completed);
+    void RetainUnsafe();
     bool UpdateImage(const std::shared_ptr<Frame>& frame, ID3D12CommandQueue* queue, bool pipelined);
     XrSwapchain swapchain = XR_NULL_HANDLE;
+    XrSession swapchainSession = XR_NULL_HANDLE;
     std::vector<XrSwapchainImageD3D12KHR> images;
     struct CopySlot {
         Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
@@ -45,10 +59,13 @@ private:
     std::array<CopySlot,3> copies;
     size_t copyCursor=0;
     Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> submittedQueue;
     uint64_t fenceValue=0, originSerial=0, lastStamp=0;
     uint32_t width=0,height=0;
+    DXGI_FORMAT imageFormat=DXGI_FORMAT_UNKNOWN;
     uint32_t acquiredIndex=0;
     bool acquired=false;
+    bool explicitMode=false;
     bool submissionFailed=false,publishedMasked=false,publishedLootVisible=false;
     uint64_t publishedTick=0;
     HANDLE event=nullptr;

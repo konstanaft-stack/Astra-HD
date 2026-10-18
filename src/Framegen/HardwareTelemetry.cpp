@@ -136,7 +136,7 @@ struct Sampler {
             if(nvml.memory && nvml.memory(nv,&memory)==0) {out.gpuMemoryValid=true;out.gpuMemoryUsed=memory.used;out.gpuMemoryTotal=memory.total;}
             if(nvml.temperature && nvml.temperature(nv,0,&temperature)==0)out.gpuTemperature=temperature;
         }
-        out.sampleMs=NowMs()-start;return out;
+        out.sampledAtMs=NowMs();out.sampleMs=out.sampledAtMs-start;return out;
     }
 };
 class Monitor {
@@ -163,7 +163,12 @@ public:
         if(!thread.joinable() && MetricsEnabled()) {stopping=false;monitorRunning.store(true);thread=std::thread([this]{Run();});}
         wake.notify_all();
     }
-    HardwareStatistics Read() {std::lock_guard lock(mutex);return snapshot;}
+    HardwareStatistics Read() {
+        std::lock_guard lock(mutex);auto result=snapshot;
+        // A stalled sampler must not display an old 100% GPU value as live.
+        ValidateHardwareFreshness(result,NowMs());
+        return result;
+    }
     void Stop() {
         std::lock_guard lifecycleLock(lifecycle);
         {std::lock_guard lock(mutex);stopping=true;wake.notify_all();}

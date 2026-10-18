@@ -1,4 +1,5 @@
 #include "Framegen/Generator.hpp"
+#include "Framegen/FfxColorRead.hpp"
 #include <FidelityFX/host/backends/dx12/ffx_dx12.h>
 #include <FidelityFX/host/ffx_frameinterpolation.h>
 #include <FidelityFX/host/ffx_opticalflow.h>
@@ -142,7 +143,7 @@ struct Eye {
                 ID3D12Resource* color,const Inputs& inputs,const Settings& settings) {
         const auto desc=color->GetDesc();width=uint32_t(desc.Width);height=desc.Height;
         if(desc.Format!=DXGI_FORMAT_R8G8B8A8_TYPELESS && desc.Format!=DXGI_FORMAT_R8G8B8A8_UNORM && desc.Format!=DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) {
-            Status("Framegen requires the current SDR RGBA8 capture format");return false;
+            Status("Генерации нужен текущий формат захвата SDR RGBA8");return false;
         }
         renderWidth=inputs.width;renderHeight=inputs.height;camera=inputs.camera;
         flowWidth=std::max(64u,(width*uint32_t(settings.flowScale)+99)/100);
@@ -151,7 +152,7 @@ struct Eye {
         // Both modes use FidelityFX's depth/MV-aware interpolation. NVIDIA
         // replaces only the optical-flow stage, with the hardware OFA engine.
         scratch.resize(ffxGetScratchMemorySizeDX12(2));
-        if(!Ffx(ffxGetInterfaceDX12(&backend,ffxGetDeviceDX12(device),scratch.data(),scratch.size(),2),"FidelityFX backend"))return false;
+        if(!Ffx(ffxGetInterfaceDX12(&backend,ffxGetDeviceDX12(device),scratch.data(),scratch.size(),2),"Модуль FidelityFX"))return false;
         FfxFrameInterpolationContextDescription config{};config.backendInterface=backend;
         config.maxRenderSize={renderWidth,renderHeight};config.displaySize={width,height};
         config.backBufferFormat=config.previousInterpolationSourceFormat=FFX_SURFACE_FORMAT_R8G8B8A8_UNORM;
@@ -159,10 +160,10 @@ struct Eye {
         if(camera.infinite)config.flags|=FFX_FRAMEINTERPOLATION_ENABLE_DEPTH_INFINITE;
         if(camera.jittered)config.flags|=FFX_FRAMEINTERPOLATION_ENABLE_JITTER_MOTION_VECTORS;
         if(inputs.motionWidth==width && inputs.motionHeight==height)config.flags|=FFX_FRAMEINTERPOLATION_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS;
-        if(!Ffx(ffxFrameInterpolationContextCreate(&fi,&config),"Frame interpolation context"))return false;fiCreated=true;
+        if(!Ffx(ffxFrameInterpolationContextCreate(&fi,&config),"Контекст интерполяции кадров"))return false;fiCreated=true;
         if(!nvidia) {
             FfxOpticalflowContextDescription optics{};optics.backendInterface=backend;optics.resolution={flowWidth,flowHeight};
-            if(!Ffx(ffxOpticalflowContextCreate(&of,&optics),"Optical flow context"))return false;ofCreated=true;
+            if(!Ffx(ffxOpticalflowContextCreate(&of,&optics),"Контекст оптического потока"))return false;ofCreated=true;
         }
         const uint32_t block=nvidia?4u:8u;
         if(!packed[0].Create(device,flowWidth,flowHeight,DXGI_FORMAT_R8G8B8A8_UNORM,L"CVR_FG_PackedA",D3D12_RESOURCE_STATE_COMMON) ||
@@ -196,9 +197,9 @@ struct Eye {
         p.frameID=frameId;p.dilatedDepth=Resource(depth);p.dilatedMotionVectors=Resource(motion);p.reconstructedPrevDepth=Resource(previousDepth);
         std::memcpy(&p.cameraPosition,inputs.camera.position,12);std::memcpy(&p.cameraUp,inputs.camera.up,12);
         std::memcpy(&p.cameraRight,inputs.camera.right,12);std::memcpy(&p.cameraForward,inputs.camera.forward,12);
-        if(!Ffx(ffxFrameInterpolationPrepare(&fi,&p),"Frame interpolation prepare"))return false;
+        if(!Ffx(ffxFrameInterpolationPrepare(&fi,&p),"Подготовка интерполяции кадров"))return false;
         FfxFrameInterpolationDispatchDescription d{};d.commandList=p.commandList;d.displaySize={width,height};d.renderSize=p.renderSize;
-        d.currentBackBuffer=Resource(color,FFX_RESOURCE_STATE_COPY_SRC,DXGI_FORMAT_R8G8B8A8_UNORM);
+        d.currentBackBuffer=Resource(color,CaptureColorFfxState,DXGI_FORMAT_R8G8B8A8_UNORM);
         d.output=Resource(output,FFX_RESOURCE_STATE_COPY_SRC);d.interpolationRect={0,0,int32_t(width),int32_t(height)};
         d.opticalFlowVector=Resource(flow);d.opticalFlowSceneChangeDetection=Resource(scd);d.opticalFlowBufferSize={flow.width,flow.height};
         const float units=nvidia?32.0f:1.0f;
@@ -207,7 +208,7 @@ struct Eye {
         d.viewSpaceToMetersFactor=1;d.frameTimeDelta=p.frameTimeDelta;d.reset=reset;d.frameID=frameId;
         d.backBufferTransferFunction=FFX_BACKBUFFER_TRANSFER_FUNCTION_SRGB;d.minMaxLuminance[0]=0;d.minMaxLuminance[1]=1;
         d.dilatedDepth=p.dilatedDepth;d.dilatedMotionVectors=p.dilatedMotionVectors;d.reconstructedPrevDepth=p.reconstructedPrevDepth;
-        return Ffx(ffxFrameInterpolationDispatch(&fi,&d),"Frame interpolation dispatch");
+        return Ffx(ffxFrameInterpolationDispatch(&fi,&d),"Выполнение интерполяции кадров");
     }
 };
 }
@@ -359,16 +360,18 @@ struct Generator::Impl {
         const bool nvidia=settings.backend==Backend::Nvidia;
         for(unsigned i=0;i<2;++i) {
             auto& eye=*eyes[i];auto& packed=eye.packed[eye.current];
-            Barrier(list,colors[i],kCopy,kRead);packed.To(list,kUav);
+            // Author captures already permit compute/copy/pixel reads. Keep
+            // their shared read mask intact while other queues consume them.
+            packed.To(list,kUav);
             Dispatch(w,list,0,colors[i],DXGI_FORMAT_R8G8B8A8_UNORM,nullptr,nullptr,&packed,nullptr,nullptr,
                 eye.width,eye.height,eye.flowWidth,eye.flowHeight,reset);
-            packed.To(list,D3D12_RESOURCE_STATE_COMMON);Barrier(list,colors[i],kRead,kCopy);
+            packed.To(list,D3D12_RESOURCE_STATE_COMMON);
             if(!nvidia) {
                 FfxOpticalflowDispatchDescription d{};d.commandList=ffxGetCommandListDX12(list);
                 d.color=Resource(packed,FFX_RESOURCE_STATE_COMMON);d.opticalFlowVector=Resource(eye.rawFlow);
                 d.opticalFlowSCD=Resource(eye.scd);d.reset=reset;d.backbufferTransferFunction=FFX_BACKBUFFER_TRANSFER_FUNCTION_SRGB;
                 d.minMaxLuminance={0,1};
-                if(!Ffx(ffxOpticalflowContextDispatch(&eye.of,&d),"Optical flow dispatch")) {failed=true;Submit(list,w);w.finish->Close();return false;}
+                if(!Ffx(ffxOpticalflowContextDispatch(&eye.of,&d),"Вычисление оптического потока")) {failed=true;Submit(list,w);w.finish->Close();return false;}
             }
         }
         const bool packedSubmitted=Submit(list,w);
@@ -377,7 +380,7 @@ struct Generator::Impl {
         const auto packedValue=value;
         if(nvidia && !reset)for(auto& eye:eyes) {
             if(!eye->nv.Run(fence.Get(),packedValue,eye->current) || FAILED(queue->Wait(eye->nv.fence.Get(),eye->nv.value))) {
-                failed=true;Status("NVIDIA optical flow failed");w.finish->Close();return false;
+                failed=true;Status("Сбой NVIDIA Optical Flow");w.finish->Close();return false;
             }
         }
         list=w.finish.Get();
@@ -423,10 +426,10 @@ bool Generator::Generate(ID3D12Device* device,ID3D12CommandQueue* queue,ID3D12Re
     if(!device || !queue || !colors[0] || !colors[1] || !inputs[0] || !inputs[1])return false;
     if(impl && (impl->device.Get()!=device || impl->queue.Get()!=queue || !impl->Compatible(colors,inputs,settings))) {if(!Reset())return false;reset=true;}
     if(impl)impl->RetireTiming();
-    if(impl && impl->failed) {Status("Backend failed; toggle generation off/on or change the backend");return false;}
+    if(impl && impl->failed) {Status("Сбой модуля: выключите и включите генерацию или смените модуль");return false;}
     if(!impl) {
         impl=std::make_unique<Impl>();
-        if(!impl->Create(device,queue,colors,inputs,settings)) {impl->failed=true;Status("Framegen backend initialization failed");return false;}
+        if(!impl->Create(device,queue,colors,inputs,settings)) {impl->failed=true;Status("Не удалось инициализировать модуль генерации");return false;}
         reset=true;
     }
     const auto result=impl->Generate(colors,inputs,frameMs,reset,frameId);

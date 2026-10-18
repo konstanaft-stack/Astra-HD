@@ -18,6 +18,9 @@
 
 #include "Camera/CameraLink.hpp"
 #include "Camera/PoseIdentity.hpp"
+#include "Camera/MainEyeWriteDiagnostics.hpp"
+#include "Camera/MainEyeScenePose.hpp"
+#include "Framegen/Framegen.hpp"
 #include "Camera/PlayerCameraState.hpp"
 #include "Camera/SceneCameraHeading.hpp"
 #include "Camera/CameraState.hpp"
@@ -27,6 +30,7 @@
 #include "Anim/VehiclePosePolicy.hpp"
 #include "Core/Telemetry.hpp"
 #include "Core/VrCoreShared.hpp"
+#include "Utils/SharedSlots.hpp"
 #include "Hooks/Hook.hpp"
 #include "Hooks/RoomscaleMove.hpp"
 #include "Hooks/Trampoline.hpp"
@@ -51,6 +55,7 @@
 
 // MAIN's live ADS magnification, recovered from its own projection by the stereo module.
 extern "C" float CyberpunkVR_MainAdsZoomFactor;
+extern "C" int CyberpunkVR_StereoSubmit;
 
 // ---- ADS: THE WEAPON LAYER AND THE WORLD MAGNIFIED BY DIFFERENT AMOUNTS ------------------------
 //
@@ -302,6 +307,9 @@ void RefreshPlayerCameraState() {
             // the vehicle drives the puppet, body IK fights it and breaks the
             // character/camera position. Arms-only in vehicles.
             OpenXRManager::Get().SetSharedSlot(31, g_isInVehicle ? 1.0f : 0.0f);
+            OpenXRManager::Get().SetSharedSlot(
+                vrshared::kClassicVehicleActive,
+                g_isInVehicle && g_liveControls.xrClassicVehicleControls != 0 ? 1.0f : 0.0f);
             // CUTSCENE SUSPEND, producer half (PR #40 in substance, RTTI instead of CET).
             //
             // The player's own scene tier, read as a property: PlayerPuppet carries
@@ -580,9 +588,56 @@ extern "C" void __fastcall OnLocateCameraCallback(float* rbxPtr, float xmm0_val)
     // layer was labelled with a third sample again. One sample removes all three disagreements
     // at once. See AcquireFrameHeadSample.
     uint64_t cameraPoseSequence{};
-    const bool hasXR = CyberpunkVR_OneSamplePerFrame
-        ? OpenXRManager::Get().AcquireCameraPoseFrame(&xrPose,&xrConsumed,&cameraPoseSequence)
-        : OpenXRManager::Get().GetHeadPose(&xrPose);
+    const auto serializedComponent=cvr::camera::CurrentSerializedCameraComponent();
+    const auto serializedReceipt=serializedComponent ? cvr::camera::CapturePoseAddress(serializedComponent+0xE0) : cvr::camera::PoseReceipt{};
+    const bool sourceStamped=serializedReceipt && bool(serializedReceipt.payload.mainEyeSource);
+    // The existing scene/BD serializer is the real MAIN writer while the FPP
+    // component stands down. This is a scene route, not a benchmark exception.
+    const bool aerSceneRequest=serializedComponent && serializedComponent!=g_camObjMain.load(std::memory_order_acquire) &&
+        g_bdActive.load(std::memory_order_relaxed) && g_bdScenePoseValid.load(std::memory_order_acquire) &&
+        !DeviceCamActive() && cvr::camera::MainEyeSourceRequested();
+    // The scene serializer also owns MAIN in simultaneous stereo. Its legacy
+    // push updated VRCAM without a pose receipt and never labelled MAIN, so
+    // both native image identities disappeared at the FPP -> scene transition.
+    // Use the existing completed scene write, with the ordinary shared XR
+    // sample and fixed MAIN eye; do not manufacture an alternating-eye source.
+    const bool pairedSceneRequest=serializedComponent &&
+        serializedComponent!=g_camObjMain.load(std::memory_order_acquire) &&
+        serializedComponent!=g_camObjVrcam.load(std::memory_order_acquire) &&
+        CyberpunkVR_StereoSubmit && CyberpunkVR_OneSamplePerFrame &&
+        !cvr::framegen::GetSettings().aerV2 && (CyberpunkVR_BdPushTransform & 1) &&
+        CyberpunkVR_BdIpdInLocate && CyberpunkVR_IpdInWorldPos &&
+        g_bdActive.load(std::memory_order_relaxed) && g_bdScenePoseValid.load(std::memory_order_acquire) &&
+        !DeviceCamActive() && !cvr::camera::MainEyeSourceRequested();
+    const bool scenePoseRequest=aerSceneRequest||pairedSceneRequest;
+    const auto aerSceneSource=aerSceneRequest ? cvr::camera::AcquireMainEyeSourceForWrite(OpenXRManager::Get().GetTrackingOriginSerial())
+                                            : std::optional<cvr::framegen::MainEyeSourceReceipt>{};
+    bool sceneOrientationWritten=false,sceneTranslationReady=false,sceneTranslationWritten=false,sceneEyePrepared=false,sceneEyeWritten=false;
+    std::array<float,3> sceneTranslation{};
+    bool sourcePoseRead=false,sourcePoseIdMatch=false;
+    // MAIN serialization reuses the sample that was actually written, even
+    // if the next source frame has already reserved a different pose time.
+    // Never issue another locate for an old serialized receipt.
+    const bool hasXR = aerSceneRequest
+        ? (aerSceneSource && cvr::camera::AcquireMainEyeSourcePose(*aerSceneSource,&xrPose,&xrConsumed,&cameraPoseSequence))
+        : sourceStamped
+        ? ((sourcePoseRead=cvr::camera::ReadMainEyeSourcePose(serializedReceipt.payload.mainEyeSource,&xrPose,&xrConsumed,&cameraPoseSequence)) &&
+           (sourcePoseIdMatch=cameraPoseSequence==serializedReceipt.payload.poseId))
+        : (CyberpunkVR_OneSamplePerFrame
+           ? OpenXRManager::Get().AcquireCameraPoseFrame(&xrPose,&xrConsumed,&cameraPoseSequence)
+           : OpenXRManager::Get().GetHeadPose(&xrPose)) && cvr::camera::ApplyReferenceCameraOptics(xrPose);
+    if(cvr::camera::MainEyeSourceRequested()){
+        using namespace cvr::camera;
+        uint32_t bits{};
+        if(serializedComponent)bits|=LocateComponentPresent;
+        if(serializedComponent && serializedComponent==g_camObjMain.load(std::memory_order_acquire))bits|=LocateComponentIsMain;
+        if(serializedReceipt)bits|=LocateReceiptPresent;
+        if(sourceStamped)bits|=LocateSourceStamped;
+        if(sourcePoseRead)bits|=LocateSourceRead;
+        if(sourcePoseIdMatch)bits|=LocatePoseIdMatch;
+        if(hasXR)bits|=LocateHasXR;
+        RecordMainEyeLocate(bits);
+    }
     const bool composeAtWrite = (CyberpunkVR_CamWriteInPatch && CyberpunkVR_CamComposeAtWrite);
     OpenXRHeadPose takeoverPose{};
     uint64_t takeoverPoseId{};
@@ -601,14 +656,14 @@ extern "C" void __fastcall OnLocateCameraCallback(float* rbxPtr, float xmm0_val)
         // labelled with the sample it came from. Leaving the label to the write site meant the
         // compositor reprojected against a pose the image was never rendered from -- invisible
         // on the flat monitor, which has no compositor, and a rare jerk in the headset.
-        if (!composeAtWrite || BdPushOwnsComposition()) {
+        if (aerSceneRequest || !composeAtWrite || BdPushOwnsComposition()) {
             OpenXRManager::Get().PushRenderHeadPose(xrPose);
         }
 
         uint32_t currentSeq = g_lastLocateSeq + 1;
         if (float* sh = GetShotShared()) {
             // [94] current render eye for CET/Lua, [95] desired half IPD.
-            sh[94] = static_cast<float>(renderEye);
+            sh[94] = static_cast<float>(aerSceneSource ? int(aerSceneSource->physicalEye) : renderEye);
             sh[95] = GetDesiredHalfIpd();
         }
         OpenXRManager::Get().StoreRenderEyePose(0, xrPose, currentSeq);
@@ -884,7 +939,8 @@ extern "C" void __fastcall OnLocateCameraCallback(float* rbxPtr, float xmm0_val)
         // Same rule as the frame label two hundred lines up: whoever composes files the entry.
         if (BdPushOwnsComposition()) {
             const float qr[4] = { camera_qx, camera_qy, camera_qz, camera_qw };
-            cvr::camera::CamWriteQuatPublish(camera_qx, camera_qy, camera_qz, camera_qw, xrPose);
+            cvr::camera::CamWriteQuatPublish(camera_qx, camera_qy, camera_qz, camera_qw, xrPose,
+                scenePoseRequest ? &xrConsumed : nullptr,scenePoseRequest ? cameraPoseSequence : 0);
             cvr::camera::CamWriteRecordPush(qr, xrPose);
         }
         // Skip the HMD orientation write on the shot frame (or always, mode 1) so the game's
@@ -952,7 +1008,7 @@ extern "C" void __fastcall OnLocateCameraCallback(float* rbxPtr, float xmm0_val)
         // it, and MAIN must carry the identical quaternion or the two eyes diverge and reconverge on every
         // head turn. One composition, one head sample, one label.
         const bool bdUseWriteSite =
-            (bdNow ? (CyberpunkVR_BdQuatFromWriteSite != 0) : takeoverNow) &&
+            !scenePoseRequest && (bdNow ? (CyberpunkVR_BdQuatFromWriteSite != 0) : takeoverNow) &&
             cvr::camera::CamWriteQuatRead(bdWritten,&takeoverPose,nullptr,nullptr,&takeoverPoseId) &&
             (bdWritten[0]*bdWritten[0] + bdWritten[1]*bdWritten[1] +
              bdWritten[2]*bdWritten[2] + bdWritten[3]*bdWritten[3]) > 0.9f;
@@ -968,6 +1024,7 @@ extern "C" void __fastcall OnLocateCameraCallback(float* rbxPtr, float xmm0_val)
             quat[1] = camera_qy;
             quat[2] = camera_qz;
             quat[3] = camera_qw;
+            sceneOrientationWritten=(aerSceneSource||pairedSceneRequest) && IsPlausibleUnitQuaternion(quat);
             takeoverLabelKnown=takeoverNow && bdUseWriteSite && takeoverPose.valid &&
                 takeoverPoseId && takeoverPoseId==cameraPoseSequence &&
                 takeoverPose.originSerial==xrPose.originSerial &&
@@ -1076,6 +1133,12 @@ extern "C" void __fastcall OnLocateCameraCallback(float* rbxPtr, float xmm0_val)
         if (g_isInVehicle && CyberpunkVR_VehicleAnchorFromViewYaw && g_viewYawUsedValid) {
             flatYaw = g_viewYawUsedRad;
         }
+        bool sceneBasisKnown=true;
+        if(scenePoseRequest){
+            const float composed[]{camera_qx,camera_qy,camera_qz,camera_qw};
+            const float head[]{xrPose.oriX,xrPose.oriY,xrPose.oriZ,xrPose.oriW};
+            sceneBasisKnown=cvr::camera::CompositionBaseYaw(composed,head,&flatYaw);
+        }
         // (The realign is already out of bodyGameForward at the top of this function, so this matrix
         // is the VIEW's heading -- which is what takes the room position into the world without
         // swinging the play space every time the body comes around.)
@@ -1097,6 +1160,9 @@ extern "C" void __fastcall OnLocateCameraCallback(float* rbxPtr, float xmm0_val)
             {(xrPose.posX-consumed.x)*posScale,(-xrPose.posZ-consumed.y)*posScale,xrPose.posY*posScale},
             anchor.trackingOffset,anchor.modelOffset,anchor.trackingYaw,anchor.modelYaw);
         const float worldDeltaX=delta.x, worldDeltaY=delta.y, worldDeltaZ=delta.z;
+        if(scenePoseRequest && sceneBasisKnown){
+            sceneTranslation={worldDeltaX,worldDeltaY,worldDeltaZ};sceneTranslationReady=true;
+        }
 
         // WorldPosition fixed-point is int32 * (2<<16) = 131072 (17 fractional bits) --
         // CONFIRMED against RED4ext SDK WorldPosition.hpp after the published absolute
@@ -1138,7 +1204,7 @@ extern "C" void __fastcall OnLocateCameraCallback(float* rbxPtr, float xmm0_val)
         // orientation went through the component and was not. Both channels now travel the same
         // route, in PatchCamera, so the weighting applies to them equally. Setting the flag to 0
         // restores the old split without a rebuild.
-        if (!CyberpunkVR_HeadTranslationInPatch) {
+        if (!CyberpunkVR_HeadTranslationInPatch && !scenePoseRequest) {
             posFP[0] += deltaFPx;
             posFP[1] += deltaFPy;
             posFP[2] += deltaFPz;
@@ -1262,7 +1328,7 @@ extern "C" void __fastcall OnLocateCameraCallback(float* rbxPtr, float xmm0_val)
     int32_t ipdShiftFP[3] = {0, 0, 0};
     int32_t bdIpdShiftFP[3] = {0, 0, 0};   // MAIN's half, braindance only; see below
     if (hasXR) {
-        const int renderEye = (g_locateCameraHits % 2);
+        const int renderEye = aerSceneSource ? int(aerSceneSource->physicalEye) : int(g_locateCameraHits % 2);
 
         float right[3] = {};
         //float hmdQuat[4] = { xrPose.oriX, -xrPose.oriZ, xrPose.oriY, xrPose.oriW };
@@ -1302,9 +1368,11 @@ extern "C" void __fastcall OnLocateCameraCallback(float* rbxPtr, float xmm0_val)
             if (CyberpunkVR_BdIpdInLocate && CyberpunkVR_IpdInWorldPos &&
                 g_bdActive.load(std::memory_order_relaxed) &&
                 g_bdScenePoseValid.load(std::memory_order_acquire)) {
-                const float sign = CyberpunkVR_MainIsRightEye ? +1.0f : -1.0f;
+                const float sign = aerSceneSource ? cvr::camera::MainEyeSceneSign(aerSceneSource->physicalEye)
+                                                  : (CyberpunkVR_MainIsRightEye ? +1.0f : -1.0f);
                 for (int i = 0; i < 3; ++i)
                     bdIpdShiftFP[i] = static_cast<int32_t>(right[i] * halfIpd * sign * 131072.0f);
+                sceneEyePrepared=(aerSceneSource||pairedSceneRequest) && std::isfinite(halfIpd) && halfIpd>0;
             }
             if (g_verboseLog && (g_locateCameraHits % 600) == 1) {
                 Log("LocateCamera IPD: eye=%d halfIpd=%.4f right=(%.3f, %.3f, %.3f) shift=%.4f\n",
@@ -1363,12 +1431,31 @@ extern "C" void __fastcall OnLocateCameraCallback(float* rbxPtr, float xmm0_val)
         }
     }
 
+    // The scene owns its real native base position. Apply this receipt's head
+    // displacement after optional scene-base replacement, exactly once, before
+    // the existing eye shift. The inactive FPP component remains untouched.
+    if((aerSceneSource||pairedSceneRequest) && sceneTranslationReady && sceneOrientationWritten){
+        const auto shifted=cvr::camera::AddSceneSourceTranslation({posFP[0],posFP[1],posFP[2]},sceneTranslation);
+        if(shifted){
+            sceneTranslationWritten=true;
+            for(unsigned i=0;i<3;++i)sceneTranslationWritten&=WriteU32Safe(reinterpret_cast<uintptr_t>(posFP+i),uint32_t((*shifted)[i]));
+        }
+    }
+
     int32_t renderedPosFP[3] = { posFP[0], posFP[1], posFP[2] };
 
     // NOW the braindance half goes in -- after the head centre has been taken, so that stays the
     // centre. This buffer is what the engine renders the braindance through; MAIN has no camera
     // component there, which is why its half cannot go where the second eye's does.
-    if (bdIpdShiftFP[0] || bdIpdShiftFP[1] || bdIpdShiftFP[2]) {
+    if ((aerSceneSource||pairedSceneRequest) && sceneEyePrepared) {
+        const auto eye=cvr::camera::AddSceneSourceEye({posFP[0],posFP[1],posFP[2]},
+            {bdIpdShiftFP[0],bdIpdShiftFP[1],bdIpdShiftFP[2]});
+        if(eye){
+            sceneEyeWritten=true;
+            for(unsigned i=0;i<3;++i)sceneEyeWritten&=WriteU32Safe(reinterpret_cast<uintptr_t>(posFP+i),uint32_t((*eye)[i]));
+        }
+        CVR_DIAGNOSTIC(++CyberpunkVR_DebugBdIpdLocate);
+    } else if (bdIpdShiftFP[0] || bdIpdShiftFP[1] || bdIpdShiftFP[2]) {
         for (int i = 0; i < 3; ++i) posFP[i] += bdIpdShiftFP[i];
         CVR_DIAGNOSTIC(++CyberpunkVR_DebugBdIpdLocate);
     }
@@ -1425,7 +1512,7 @@ extern "C" void __fastcall OnLocateCameraCallback(float* rbxPtr, float xmm0_val)
         }
     }
 
-    if (CyberpunkVR_BdPushTransform != 0 && g_headQuatValid &&
+    if (!scenePoseRequest && CyberpunkVR_BdPushTransform != 0 && g_headQuatValid &&
         g_bdActive.load(std::memory_order_relaxed) &&
         g_bdScenePoseValid.load(std::memory_order_acquire)) {
         if (CyberpunkVR_BdPushTransform & 1)
@@ -1466,6 +1553,26 @@ extern "C" void __fastcall OnLocateCameraCallback(float* rbxPtr, float xmm0_val)
     g_lastLocateQuat[1] = quat[1];
     g_lastLocateQuat[2] = quat[2];
     g_lastLocateQuat[3] = quat[3];
+    if(aerSceneSource && cvr::camera::SceneSourceWriteComplete(*aerSceneSource,
+        aerSceneSource->MatchesWrittenPose(xrPose.originSerial,xrPose.locatedTime),
+        sceneOrientationWritten,sceneTranslationWritten,sceneEyeWritten) &&
+        cvr::camera::ValidateMainEyeSourceReceipt(*aerSceneSource)){
+        cvr::camera::PublishCameraSetupPose(reinterpret_cast<uintptr_t>(rbxPtr),serializedComponent,1,
+            cameraPoseSequence,xrPose,true,*aerSceneSource,
+            cvr::camera::MakeAppliedEyeReference(renderedPosFP,posFP,quat,cvr::camera::AppliedEyeRoute::Scene,
+                sceneTranslationWritten && sceneEyeWritten,sceneOrientationWritten));
+    }
+    if(pairedSceneRequest && hasXR && xrPose.valid && cameraPoseSequence &&
+       sceneOrientationWritten && sceneTranslationWritten && sceneEyeWritten &&
+       (CyberpunkVR_BdPushTransform & 1)) {
+        // These labels describe completed writes from this same sample. MAIN
+        // is the serializer's actual buffer; the opposite eye uses its head
+        // centre and is labelled before the engine's RTT notify reads it.
+        cvr::camera::PublishCameraSetupPose(reinterpret_cast<uintptr_t>(rbxPtr),serializedComponent,
+            1,cameraPoseSequence,xrPose,true);
+        BdPushTransformOnce(g_camObjVrcam.load(std::memory_order_relaxed),
+            quat[0],quat[1],quat[2],quat[3],true,renderedPosFP,&xrPose,cameraPoseSequence);
+    }
     ++g_lastLocateSeq;
     {
         cvr::camera::LocatedCameraFrame frame{};

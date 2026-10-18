@@ -8,7 +8,10 @@
 #include <unordered_set>
 
 namespace cvr::render {
-struct DescriptorTarget {uintptr_t resource{};uint32_t width{},height{};};
+struct DescriptorTarget {
+    uintptr_t resource{};uint32_t width{},height{};
+    uint32_t format{},viewDimension{},mip{};bool explicitView{};
+};
 // Metadata only: no COM references and no GPU allocations. CPU descriptors can
 // be recycled, so a replacement publishes resource and dimensions together.
 template<size_t Capacity> class DescriptorCache {

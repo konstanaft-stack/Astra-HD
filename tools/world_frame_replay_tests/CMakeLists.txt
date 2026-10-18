@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.24)
+project(WorldFrameReplayTests LANGUAGES CXX)
+enable_testing()
+find_path(OPENXR_INCLUDE_DIR openxr/openxr.h REQUIRED)
+add_executable(world_frame_replay_tests main.cpp)
+target_include_directories(world_frame_replay_tests PRIVATE ../../include ${OPENXR_INCLUDE_DIR})
+target_compile_features(world_frame_replay_tests PRIVATE cxx_std_20)
+add_test(NAME world_frame_replay COMMAND world_frame_replay_tests)

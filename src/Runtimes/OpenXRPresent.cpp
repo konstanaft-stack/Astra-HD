@@ -1,4 +1,6 @@
+#include "MenuPreview/UiConsumer.hpp"
 #include "Utils/DebugGate.hpp"
+#include "Render/NativeColorSource.hpp"
 // 1 (default) = label each captured frame with the head orientation the camera injection
 // actually used for it, instead of the pose cache as of Present. See the use site.
 extern "C" __declspec(dllexport) int CyberpunkVR_BindPoseToImage = 1;
@@ -469,6 +471,23 @@ void OpenXRManager::OnPresent(IDXGISwapChain* swapChain) {
         resourceDesc = backBuffer->GetDesc();
     }
 
+    const bool nativeSourceRequired=monoEnabled && cvr::render::NativeColorSourceEnabled() && cvr::framegen::GetSettings().aerV2 &&
+        cvr::camera::MainEyeSourceRequested();
+    cvr::render::NativeColorCapture nativeColor;
+    if(nativeSourceRequired && backBuffer){
+        std::lock_guard submissionLock(cvr::camera::ImageSubmissionMutex());
+        nativeColor=cvr::render::AcquireNativeColor(backBuffer);
+    }
+    const bool stereoMenuCapture=cvr::menu_preview::UiStereoRequested()&&((GetMenuRectMode()!=0)||(GetMenuMode()!=0));
+    if(cvr::menu_preview::UiStereoRequested()){
+        cvr::menu_preview::RegisterUiBackBuffer(backBuffer);
+        cvr::menu_preview::Lease current;
+        if(!stereoMenuCapture||!cvr::menu_preview::TryAcquireCurrent(current))ClearMenuUiPair();
+        else (void)CaptureMenuUiPresentedFrame(backBuffer,resourceDesc,s_presentCount);
+    }
+    auto* colorSource=(nativeSourceRequired&&!stereoMenuCapture)?nativeColor.resource.Get():backBuffer;
+    const auto colorDescription=(nativeSourceRequired&&!stereoMenuCapture)?nativeColor.description:resourceDesc;
+
     XrPosef monoCapturedPoses[2]{};
     XrPosef monoCapturedCenters[2]{};
     XrFovf monoCapturedFovs[2]{};
@@ -478,6 +497,7 @@ void OpenXRManager::OnPresent(IDXGISwapChain* swapChain) {
         if (m_views.size() >= 2) {
             float fovWidth = static_cast<float>(desc.BufferDesc.Width);
             float fovHeight = static_cast<float>(desc.BufferDesc.Height);
+            if(nativeColor){fovWidth=float(colorDescription.Width);fovHeight=float(colorDescription.Height);}
             if ((fovWidth <= 1.0f || fovHeight <= 1.0f) && resourceDesc.Width != 0 && resourceDesc.Height != 0) {
                 fovWidth = static_cast<float>(resourceDesc.Width);
                 fovHeight = static_cast<float>(resourceDesc.Height);
@@ -675,9 +695,9 @@ void OpenXRManager::OnPresent(IDXGISwapChain* swapChain) {
         }
     }
     bool monoCaptureOk = false;
-    if (monoEnabled && backBuffer) {
-        monoCaptureOk = CaptureMonoPresentedFrame(backBuffer, resourceDesc, s_presentCount,
-            monoCapturedPoses,monoCapturedFovs,monoCapturedViews,monoCapturedCenters);
+    if (monoEnabled && colorSource) {
+        monoCaptureOk = CaptureMonoPresentedFrame(colorSource, colorDescription, s_presentCount,
+            monoCapturedPoses,monoCapturedFovs,monoCapturedViews,monoCapturedCenters,(!stereoMenuCapture&&nativeColor)?&nativeColor:nullptr);
         if (!monoCaptureOk && (s_presentCount % 300) == 1) {
             Log("OpenXRManager: Mono capture failed. serial=%llu views=(%d,%d)\n",
                 static_cast<unsigned long long>(s_presentCount),
@@ -685,6 +705,10 @@ void OpenXRManager::OnPresent(IDXGISwapChain* swapChain) {
                 monoCapturedViews[1] ? 1 : 0);
         }
     }
+
+    if(nativeSourceRequired && !nativeColor && s_presentCount%300==1)
+        Log("[NATIVE-COLOR-SOURCE] no eligible submitted source for window=%p serial=%llu\n",
+            backBuffer,static_cast<unsigned long long>(s_presentCount));
 
     cvr::hud::Capture(m_d3dDevice,m_d3dQueue);
     cvr::hud::Capture(m_d3dDevice,m_d3dQueue,cvr::hud::Channel::Interaction);

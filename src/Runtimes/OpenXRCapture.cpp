@@ -1,10 +1,25 @@
+#include "Render/RenderProbeScope.hpp"
+#include "MenuPreview/UiCameraCycle.hpp"
+#include "MenuPreview/UiConsumer.hpp"
+#include "Runtimes/EditorSceneCapturePolicy.hpp"
+#include "Runtimes/EditorNativeUiPacketPolicy.hpp"
+namespace cvr::detail {extern cvr::menu_preview::EditorSceneExecute g_orig_ExecuteCommandLists;}
 #include "Utils/DebugGate.hpp"
+#include "Framegen/AerCaptureDiagnostics.hpp"
+#include "Framegen/CapturedHeadPolicy.hpp"
+#include "Framegen/NativeFgPairedSource.hpp"
+#include "Framegen/SourceFrameSystem.hpp"
 #include "Render/CommandResources.hpp"
+#include "Render/NativeColorSource.hpp"
 #include "Render/GpuStageProfile.hpp"
+#include "Framegen/ProducerTrace.hpp"
+#include "Framegen/SubmittedImageProjection.hpp"
+#include "Framegen/OwnSelectionWitness.hpp"
 // openxr_capture.cpp - mono frame + depth capture and submit-resource setup.
 // Split verbatim from openxr_manager.cpp (OpenXRManager methods). Shared module
 // state/helpers via openxr_internal.h (inline).
 #include <atomic>
+#include <chrono>
 extern "C" int CyberpunkVR_BindPoseToImage;
 #include "Runtimes/OpenXRManager.hpp"
 #include "Camera/ImagePoseIdentity.hpp"
@@ -15,6 +30,7 @@ extern "C" int CyberpunkVR_BindPoseToImage;
 #include "Utils/XrMath.hpp"
 #include "Utils/SharedSlots.hpp"
 #include "Runtimes/RuntimeFovCorrection.hpp"
+#include "Stereo/CetOverlayLayer.hpp"
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -27,6 +43,26 @@ extern "C" int CyberpunkVR_BindPoseToImage;
 #include <memory>
 #include <algorithm>
 #include <dxgi1_4.h>
+
+namespace fgtrace=cvr::framegen;
+static int32_t QueryNativeQueueForDiagnostic(void* object,void** result) noexcept {
+    *result=nullptr;
+    using Getter=int32_t(*)(void*,void**);
+    const auto module=GetModuleHandleW(L"sl.interposer.dll");
+    const auto getter=module?reinterpret_cast<Getter>(GetProcAddress(module,"slGetNativeInterface")):nullptr;
+    if(!getter)return -1;
+    __try {return getter(object,result);}
+    __except(EXCEPTION_EXECUTE_HANDLER){*result=nullptr;return -2;}
+}
+static void ApplyProducerCaptureCompletion(fgtrace::ProducerTraceRecord& trace,const fgtrace::CaptureCompletion& completion) {
+    trace.readyFence=uint64_t(reinterpret_cast<uintptr_t>(completion.fence.Get()));trace.readyValue=completion.fenceValue;
+    trace.restingState=uint32_t(completion.colorState);trace.flags|=fgtrace::ResourceStateKnown;
+    if(completion.HasScheduledCopySource())trace.flags|=fgtrace::ProducerFenceScheduled;
+    trace.captureSubmissionQpc=completion.qpc.QuadPart;trace.captureQpcFrequency=completion.qpcFrequency;
+    if(completion.qpc.QuadPart>0 && completion.qpcFrequency>0)trace.flags|=fgtrace::CaptureSubmissionQpcValid;
+    // Publication evidence is not a pose/content clock and never enables
+    // either time-valid bit. The completion point can still be pending on GPU.
+}
 
 // Right eye source, from the stereo module. "Fresh" returns null once the VRCAM view stops
 // updating, which is what makes the fallback to mono automatic.
@@ -47,16 +83,6 @@ extern "C" int CyberpunkVR_VisionFit;           // 1 = pixel-exact rather than s
 extern "C" float CyberpunkVR_VisionOffX;
 extern "C" float CyberpunkVR_VisionOffY;
 extern "C" unsigned long long CyberpunkVR_DebugVisionOverlays;
-// The barrel dot, published by the ImGui overlay (imgui_overlay.cpp) in NDC after its own zoom
-// compensation. Taking the finished number rather than re-projecting keeps the two eyes' dots
-// identical by construction.
-extern "C" float    CyberpunkVR_BarrelDotNdcX;
-extern "C" float    CyberpunkVR_BarrelDotNdcX2;   // the second eye's own value
-extern "C" float    CyberpunkVR_BarrelDotNdcY;
-extern "C" float    CyberpunkVR_BarrelDotRadiusPx;
-extern "C" unsigned long long CyberpunkVR_BarrelDotTick;
-extern "C" int      CyberpunkVR_BarrelDotSecondEye;
-extern "C" unsigned long long CyberpunkVR_DebugBarrelDotDraws;
 extern "C" ID3D12Resource* CyberpunkVR_GetHudBlurTexture();
 extern "C" ID3D12Resource* CyberpunkVR_GetHudExposureBuffer();
 extern "C" ID3D12Resource* CyberpunkVR_GetFrameConstantBuffer();
@@ -89,8 +115,8 @@ extern "C" int CyberpunkVR_StereoSubmit;
 extern "C" __declspec(dllexport) float CyberpunkVR_HudDistanceM = 0.0f;
 
 // Our private right-eye target: the eye swapchain's exact format and size, so the submit can
-// copy it with the same plain CopyResource it uses for MAIN. Kept in COPY_SOURCE between
-// frames -- that is where the blit's own barriers leave it and where the submit wants it.
+// copy it with the same plain CopyResource it uses for MAIN. Both captures keep
+// the shared copy/pixel/compute read mask until the producer obtains a write lease.
 bool OpenXRManager::EnsureVrcamEyeTexture(uint32_t width, uint32_t height, DXGI_FORMAT format) {
     if (!m_d3dDevice || !width || !height || format == DXGI_FORMAT_UNKNOWN) return false;
     if (m_vrcamEyePool[0] && m_vrcamEyeW == width && m_vrcamEyeH == height &&
@@ -118,7 +144,7 @@ bool OpenXRManager::EnsureVrcamEyeTexture(uint32_t width, uint32_t height, DXGI_
     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     for (int i = 0; i < kVrcamEyeSlots; ++i) {
         if (FAILED(m_d3dDevice->CreateCommittedResource(
-                &hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr,
+                &hp, D3D12_HEAP_FLAG_NONE, &d, fgtrace::CaptureColorReadState, nullptr,
                 IID_PPV_ARGS(&m_vrcamEyePool[i])))) {
             for (int k = 0; k <= i; ++k) {
                 if (m_vrcamEyePool[k]) { m_vrcamEyePool[k]->Release(); m_vrcamEyePool[k] = nullptr; }
@@ -183,42 +209,36 @@ bool OpenXRManager::EnsureMonoCaptureResource(const D3D12_RESOURCE_DESC& sourceD
         }
     }
 
+    const auto captureSettings=cvr::framegen::GetSettings();
+    const bool pairedOwned=!captureSettings.aerV2 && captureSettings.enabled && captureSettings.backend==cvr::framegen::Backend::OwnNvidia;
+    const bool separatedUi=cvr::menu_preview::UiStereoRequested()&&cvr::menu_preview::EditorUiSeparationEnabled();
+    const auto desiredPoolCount=std::max(cvr::xr::EditorUiMinimumPool(separatedUi),
+        std::max(pairedOwned?5u:(cvr::menu_preview::UiStereoRequested()?4u:3u),cvr::capture::MainPoolCapacity(captureSettings.aerV2,
+        captureSettings.enabled && captureSettings.backend==cvr::framegen::Backend::OwnNvidia)));
+    m_retiredMainPools.Collect(); // capture owner serializes all producer writes
     {
         std::lock_guard<std::mutex> lock(m_presentMutex);
         if (m_monoPool[0] &&
+            (m_monoPoolCount == desiredPoolCount || ((pairedOwned||separatedUi) && m_monoPoolCount >= desiredPoolCount)) &&
             m_monoCapturedFrame.width == width &&
             m_monoCapturedFrame.height == height &&
             m_monoCapturedFrame.format == format) {
             return true;
         }
 
-        // The pool owns the references now; m_monoCapturedFrame.texture just points at
-        // whichever pool entry currently holds the newest frame.
-        for (int i = 0; i < 3; ++i) {
-            if (m_monoPool[i]) { m_monoPool[i]->Release(); m_monoPool[i] = nullptr; }
-        }
-        m_monoCapturedFrame.texture = nullptr;
-        m_monoCapturedFrame.width = 0;
-        m_monoCapturedFrame.height = 0;
-        m_monoCapturedFrame.format = 0;
-        m_monoCapturedFrame.serial = 0;
-        m_monoCapturedFrame.hasView[0] = false;
-        m_monoCapturedFrame.hasView[1] = false;
+        // Keep the old allocation published while preparing the replacement.
+        // Failure to allocate must not leave a half-built pool in use.
     }
 
+    if(cvr::menu_preview::UiStereoRequested())ClearMenuUiPair(); // resize invalidates publications; consumer leases retire normally
     D3D12_HEAP_PROPERTIES heapProps{};
+    if(!m_retiredMainPools.CanRetire(m_mainPoolProducer))return false;
     heapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
-    ID3D12Resource* created[3] = {};
-    for (int i = 0; i < 3; ++i) {
-        if (FAILED(m_d3dDevice->CreateCommittedResource(
-                &heapProps,
-                D3D12_HEAP_FLAG_NONE,
-                &sourceDesc,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                nullptr,
-                IID_PPV_ARGS(&created[i])))) {
+    ID3D12Resource* created[cvr::capture::MainPoolMaximum] = {};
+    for (uint32_t i = 0; i < desiredPoolCount; ++i) {
+        if (FAILED(fgtrace::CreateMainCaptureColor(m_d3dDevice,heapProps,sourceDesc,&created[i]))) {
             Log("OpenXRManager: Failed to create mono captured texture %d\n", i);
-            for (int k = 0; k < i; ++k) created[k]->Release();
+            for (uint32_t k = 0; k < i; ++k) created[k]->Release();
             return false;
         }
         SetD3DNamef(created[i], L"OpenXR_mono_snapshot_color%d", i);
@@ -226,13 +246,28 @@ bool OpenXRManager::EnsureMonoCaptureResource(const D3D12_RESOURCE_DESC& sourceD
 
     {
         std::lock_guard<std::mutex> lock(m_presentMutex);
-        for (int i = 0; i < 3; ++i) m_monoPool[i] = created[i];
+        // Outstanding readers retain their own COM + pool leases. The pool
+        // relinquishes only its ownership; no reader is forcibly unpinned.
+        if(!m_retiredMainPools.Retire(std::span(m_monoPool).first(m_monoPoolCount),m_mainPoolProducer)) {
+            for(auto* resource:created)if(resource)resource->Release();
+            return false;
+        }
+        for(auto*& resource:m_monoPool) {if(resource)resource->Release();resource=nullptr;}
+        for (uint32_t i = 0; i < desiredPoolCount; ++i) m_monoPool[i] = created[i];
+        m_monoPoolCount=desiredPoolCount;
+        m_mainPoolProducer={};
+        ++m_captureResourceEpoch;
+        std::array<uintptr_t,cvr::capture::MainPoolMaximum> catalogueResources{};
+        for(uint32_t i=0;i<m_monoPoolCount;++i)catalogueResources[i]=reinterpret_cast<uintptr_t>(m_monoPool[i]);
+        m_mainCaptureCatalogue.Reset(m_captureResourceEpoch,std::span(catalogueResources).first(m_monoPoolCount));
         m_monoPoolSlot = 0;
         m_monoCapturedFrame.texture = m_monoPool[0];
         m_monoCapturedFrame.width = width;
         m_monoCapturedFrame.height = height;
         m_monoCapturedFrame.format = format;
         m_monoCapturedFrame.serial = 0;
+        m_monoCapturedFrame.colorCompletion = {};
+        m_monoCapturedFrame.nativeStamp = {};
         m_monoCapturedFrame.hasView[0] = false;
         m_monoCapturedFrame.hasView[1] = false;
     }
@@ -660,6 +695,7 @@ extern "C" __declspec(dllexport) int CyberpunkVR_MonoMenu = 1;
 // PRESENT THREAD, so every millisecond it blocks is a millisecond the game is not presenting -- which
 // would explain both the stale submit AND the 1.1/s present-rate difference at once.
 extern "C" __declspec(dllexport) std::atomic<unsigned long long> CyberpunkVR_DebugCapSkipNoView   = 0;
+extern "C" __declspec(dllexport) cvr::framegen::AerCaptureDiagnostics CyberpunkVR_AerCaptureDebug{};
 extern "C" __declspec(dllexport) std::atomic<unsigned long long> CyberpunkVR_DebugCapSkipNoRes    = 0;
 extern "C" __declspec(dllexport) std::atomic<unsigned long long> CyberpunkVR_DebugCapSkipNoSlot   = 0;
 extern "C" __declspec(dllexport) std::atomic<unsigned long long> CyberpunkVR_DebugCapSkipFence    = 0;
@@ -684,92 +720,602 @@ extern "C" __declspec(dllexport) std::atomic<unsigned long long> CyberpunkVR_Deb
 ID3D12Resource* OpenXRManager::AcquireCapturedVrcamLocked(uint64_t serial,uint32_t maxReuse,
         XrPosef* pose,XrFovf* fov,uint64_t* poseId,bool* reused) {
     int best=-1;
-    uint64_t bestSerial=0;
+    uint64_t bestSerial=0,newestStale=0;
+    const auto traceSelection=[&](fgtrace::ProducerReason reason,uint64_t source,uint64_t sourcePose,bool reserved) {
+        fgtrace::ProducerTraceRecord trace;trace.stage=fgtrace::ProducerStage::VrcamReadSelection;trace.reason=reason;
+        trace.engineView=fgtrace::EngineView::Vrcam;trace.flags=fgtrace::EngineViewKnown;
+        trace.requestedSourceId=serial;if(serial)trace.flags|=fgtrace::RequestedSourceIdKnown;
+        trace.sourceId=source;if(source)trace.flags|=fgtrace::SourceIdKnown;
+        trace.poseId=sourcePose;if(sourcePose)trace.flags|=fgtrace::PoseIdKnown;
+        if(reserved)trace.flags|=fgtrace::ColorReadReserved;
+        if(reason==fgtrace::ProducerReason::VrcamSlotReused)trace.flags|=fgtrace::ColorSlotReused;
+        if(reason==fgtrace::ProducerReason::VrcamSlotTooOld)trace.flags|=fgtrace::ColorSlotStaleRejected;
+        // Only the matching publication owns this completion tuple. An older
+        // reused slot must not borrow the current capture's fence or QPC.
+        if(reserved && source==m_monoCapturedFrame.serial)
+            ApplyProducerCaptureCompletion(trace,m_monoCapturedFrame.colorCompletion);
+        // This accessor selects an engine VRCAM resource. Its caller owns the
+        // output-eye mapping, so LogicalEyeKnown remains false here.
+        fgtrace::RecordProducerTrace(trace);
+    };
     for(int i=0;i<kVrcamEyeSlots;++i) {
         const auto sourceSerial=m_vrcamEyePoolSerial[i];
         auto* source=m_vrcamEyePool[i];
         if(!source || !sourceSerial || sourceSerial>serial || !m_vrcamEyeLabels[i].valid ||
            m_captureLeases.Writing(reinterpret_cast<uintptr_t>(source)))continue;
-        if(sourceSerial!=serial && (!maxReuse || serial-sourceSerial>maxReuse))continue;
+        if(sourceSerial!=serial && (!maxReuse || serial-sourceSerial>maxReuse)) {
+            newestStale=std::max(newestStale,sourceSerial);continue;
+        }
         if(sourceSerial>bestSerial) { best=i;bestSerial=sourceSerial; }
     }
-    if(best<0)return nullptr;
+    if(best<0) {
+        traceSelection(newestStale ? fgtrace::ProducerReason::VrcamSlotTooOld : fgtrace::ProducerReason::VrcamSlotUnavailable,
+            newestStale,0,false);return nullptr;
+    }
     auto* resource=m_vrcamEyePool[best];
-    if(!m_captureLeases.Pin(reinterpret_cast<uintptr_t>(resource)))return nullptr;
+    if(!m_captureLeases.Pin(reinterpret_cast<uintptr_t>(resource))) {
+        traceSelection(fgtrace::ProducerReason::VrcamSlotUnavailable,bestSerial,0,false);return nullptr;
+    }
     resource->AddRef();
     const auto& label=m_vrcamEyeLabels[best];
     *pose=label.pose;*fov=label.fov;*poseId=label.poseId;*reused=bestSerial!=serial;
+    traceSelection(*reused ? fgtrace::ProducerReason::VrcamSlotReused : fgtrace::ProducerReason::VrcamSlotFresh,
+        bestSerial,label.poseId,true);
     return resource;
 }
 
 void OpenXRManager::ReleaseCapturedRead(ID3D12Resource* resource,uint64_t fence) {
     if(!resource)return;
     std::vector<ID3D12Resource*> release;
-    const auto completed=m_fence ? m_fence->GetCompletedValue() : UINT64_MAX;
     {
         std::lock_guard lock(m_presentMutex);
-        m_captureLeases.Unpin(reinterpret_cast<uintptr_t>(resource));
-        if(fence && completed<fence)m_retiredCaptureReads.push_back({resource,fence});
-        else release.push_back(resource);
-        for(auto it=m_retiredCaptureReads.begin();it!=m_retiredCaptureReads.end();) {
-            if(it->fence<=completed) { release.push_back(it->resource);it=m_retiredCaptureReads.erase(it); }
-            else ++it;
+        m_submitFenceRetirement.PollCompleted();
+        const auto completion=m_submitFenceRetirement.ResolveRead(fence);
+        if(!completion.Complete())m_retiredCaptureReads.push_back({resource,completion});
+        else {
+            m_captureLeases.Unpin(reinterpret_cast<uintptr_t>(resource));
+            release.push_back(resource);
         }
+        CollectCapturedReadsLocked(release);
     }
     for(auto* item:release)item->Release();
+    m_mainCaptureAvailable.notify_all();
 }
 
+std::vector<cvr::framegen::Frame> OpenXRManager::CollectReadyMainCaptures(
+    const cvr::framegen::MainEyeSourceReceipt& expectedScope) {
+    using Catalogue=cvr::capture::MainCaptureCatalogue<cvr::framegen::Frame,cvr::capture::MainPoolMaximum>;
+    std::vector<cvr::framegen::Frame> out;
+    if(!expectedScope)return out;
+    out.reserve(cvr::capture::MainPoolMaximum);
+    const auto ready=[&](const Catalogue::Entry& entry) {
+        const auto& key=entry.key;const auto& frame=entry.payload;
+        const auto eye=uint32_t(entry.receipt.physicalEye);
+        if(key.slot>=m_monoPoolCount || key.poolEpoch!=m_captureResourceEpoch ||
+           key.resource!=reinterpret_cast<uintptr_t>(m_monoPool[key.slot]) || eye>1 ||
+           frame.color[eye]!=m_monoPool[key.slot] || frame.color[eye^1] ||
+           frame.nativeStamp.resourceEpoch!=m_captureResourceEpoch ||
+           frame.nativeStamp.eyes[eye].mainEyeSource!=entry.receipt ||
+           frame.identity.serial!=entry.serial || !frame.projection[eye] ||
+           frame.lease || frame.inputs[0] || frame.inputs[1] ||
+           m_captureLeases.Writing(key.resource) || !frame.colorCompletion.HasScheduledCopySource())return false;
+        const auto done=frame.colorCompletion.fence->GetCompletedValue();
+        return done!=UINT64_MAX && done>=frame.colorCompletion.fenceValue;
+    };
+    Catalogue::Keys keys;
+    {std::lock_guard lock(m_presentMutex);keys=m_mainCaptureCatalogue.ReadyKeys(expectedScope,ready);}
+    // Allocate owners outside the publication lock. Their callbacks also take
+    // this lock, so conversion/rejection/destruction must never run inside it.
+    std::array<std::shared_ptr<cvr::framegen::ReadLease>,cvr::capture::MainPoolMaximum> leases;
+    for(size_t i=0;i<keys.size;++i){
+        leases[i]=std::make_shared<cvr::framegen::ReadLease>();leases[i]->owner=this;
+        leases[i]->release=[](void* owner,ID3D12Resource* resource,uint64_t fence){
+            static_cast<OpenXRManager*>(owner)->ReleaseCapturedRead(resource,fence);
+        };
+    }
+    {
+        std::lock_guard lock(m_presentMutex);
+        for(size_t i=0;i<keys.size;++i){
+            const auto* entry=m_mainCaptureCatalogue.Find(keys.keys[i]);
+            if(!entry || !cvr::capture::SameMainCaptureScope(entry->receipt,expectedScope) || !ready(*entry))continue;
+            const auto eye=uint32_t(entry->receipt.physicalEye);
+            if(!m_captureLeases.Pin(entry->key.resource))continue;
+            auto* resource=entry->payload.color[eye];resource->AddRef();
+            leases[i]->resources[eye]=resource;
+            out.push_back(entry->payload);out.back().lease=std::move(leases[i]);
+            // The lease now protects the immutable version. Do not rediscover
+            // the same queued publication on every compositor tick.
+            m_mainCaptureCatalogue.Claim(entry->key);
+        }
+    }
+    // The live source owner can revoke a scope independently of the color
+    // mutex. Recheck after pin; a rejected Frame releases its own lease here.
+    out.erase(std::remove_if(out.begin(),out.end(),[](const auto& frame){
+        const auto eye=frame.color[0]?0u:1u;
+        return !cvr::camera::ValidateMainEyeSourceReceipt(frame.nativeStamp.eyes[eye].mainEyeSource);
+    }),out.end());
+    return out;
+}
+
+void OpenXRManager::CollectCapturedReadsLocked(std::vector<ID3D12Resource*>& release) {
+    for(auto it=m_retiredCaptureReads.begin();it!=m_retiredCaptureReads.end();) {
+        if(it->completion.Complete()) {
+            m_captureLeases.Unpin(reinterpret_cast<uintptr_t>(it->resource));
+            release.push_back(it->resource);it=m_retiredCaptureReads.erase(it);
+        } else ++it;
+    }
+}
+
+bool OpenXRManager::PollSubmitResources(bool requireComplete) {
+    std::vector<ID3D12Resource*> release;bool ready{},becameUnknown{};
+    {
+        std::lock_guard lock(m_presentMutex);
+        const bool wasUnknown=m_submitFenceRetirement.Unknown();
+        m_submitFenceRetirement.PollCompleted();
+        becameUnknown=!wasUnknown && m_submitFenceRetirement.Unknown();
+        ready=!m_submitFenceRetirement.Unknown() &&
+            (!requireComplete || m_submitFenceRetirement.CanRetire(m_fenceValue));
+        CollectCapturedReadsLocked(release);
+    }
+    for(auto* item:release)item->Release();
+    if(becameUnknown)Log("OpenXRManager: app XR fence completion invalid/device removed; disabling submission and retaining resources.\n");
+    return ready;
+}
+
+void OpenXRManager::RecordSubmitExecuted(bool signalSucceeded) {
+    bool becameUnknown{};
+    {
+        std::lock_guard lock(m_presentMutex);
+        const bool wasUnknown=m_submitFenceRetirement.Unknown();
+        m_submitFenceRetirement.Executed(m_fence,m_fenceValue,signalSucceeded);
+        becameUnknown=!wasUnknown && m_submitFenceRetirement.Unknown();
+    }
+    if(becameUnknown)Log("OpenXRManager: app XR Signal completion unknown; disabling further submission and retaining resources for this owner.\n");
+}
+
+bool OpenXRManager::CreateSubmitFence() {
+    std::lock_guard lock(m_presentMutex);
+    if(m_fence || !m_submitFenceRetirement.CanRetire(m_fenceValue))return false;
+    if(FAILED(m_d3dDevice->CreateFence(m_submitFenceRetirement.CompletedThrough(),
+        D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&m_fence)))) {
+        Log("OpenXRManager: Failed to create submit fence\n");return false;
+    }
+    return true;
+}
+
+namespace cvr::menu_preview {void AcknowledgeUiCapture(const UiFrameReceipt&)noexcept;}
+namespace {
+cvr::menu_preview::UiPairScope MenuUiScope(const cvr::menu_preview::Metadata& m,uint64_t pool){return {m.screenEpoch,m.setupID,m.controllerIdentity,m.componentIdentity,m.virtualCameraNameHash,pool};}
+bool MenuEditorUiValid(const cvr::menu_preview::UiFrameReceipt& receipt){
+    if(cvr::menu_preview::EditorUiSeparationEnabled()&&receipt.scope.screen==2&&!receipt.editorUiRequired)return false;
+    if(!receipt.editorUiRequired)return true;
+    const auto& ui=receipt.editorUi;
+    return cvr::menu_preview::EditorUiSeparationEnabled()&&ui&&
+        cvr::xr::EditorUiAttachmentMatches(*ui,receipt)&&cvr::xr::EditorUiSize(ui->renderAspect)&&
+        ui->image&&ui->image->canvas&&ui->image->retainedOwner&&ui->image->serial&&
+        ui->image->producerFence&&ui->image->producerValue&&ui->image->producerValue!=UINT64_MAX&&
+        ui->image->producerFence->GetCompletedValue()!=UINT64_MAX;
+}
+void NoteEditorNativeUiProof(const cvr::menu_preview::UiFrameReceipt* receipt,const cvr::menu_preview::Metadata& common,
+    uint64_t controls,uint64_t origin,uint64_t binding,uint64_t now)noexcept{
+    using namespace cvr::menu_preview;
+    try{static std::mutex mutex;static Metadata previous;static uint64_t previousBinding{},checks{};uint64_t count{};
+        {std::lock_guard lock(mutex);if(!SameEditorApplicationScope(previous,common)||previousBinding!=binding){previous=common;previousBinding=binding;checks=0;}count=++checks;}
+        if(count>4&&count!=128&&count!=1024)return;
+        const auto* app=receipt?receipt->application.get():nullptr;const auto age=[&](uint64_t published){return now&&published&&now>=published?now-published:UINT64_MAX;};
+        const bool sameReceiptScope=receipt&&SameEditorApplicationScope(receipt->scope,common),sameAppScope=app&&SameEditorApplicationScope(app->metadata,common);
+        const bool identity=app&&receipt&&app->frame.nativeFrame==receipt->nativeFrame&&app->frame.sourceSequence==receipt->sourceSequence&&app->localPoseRevision&&app->localPoseRevision==receipt->cameraRevision;
+        const bool projection=app&&receipt&&!std::memcmp(&app->projection.pose,&receipt->projection.pose,sizeof(XrPosef))&&!std::memcmp(&app->projection.fov,&receipt->projection.fov,sizeof(XrFovf));
+        Log("[EditorNativeUiProof] count=%llu commonEpoch=%u commonSetup=%u commonController=%llx commonComponent=%llx commonKey=%llx rawControls=%llu rawOrigin=%llu rawBinding=%llu now=%llu receipt=%llx receiptEpoch=%u receiptSetup=%u receiptController=%llx receiptComponent=%llx receiptKey=%llx receiptEye=%u receiptFrame=%u receiptSource=%llu receiptRevision=%llu receiptPublished=%llu receiptAge=%llu submission=%llu queue=%llx backBuffer=%llx app=%llx appEpoch=%u appSetup=%u appEye=%u appFrame=%u appSource=%llu appRevision=%llu appKey=%llx appBinding=%llu appControls=%llu appOrigin=%llu appPublished=%llu appAge=%llu sameReceiptScope=%u sameAppScope=%u identityMatch=%u projectionMatch=%u; immutable receipt/raw fields only, registration not queried again, unknown age is UINT64_MAX\n",
+            count,common.screenEpoch,common.setupID,common.controllerIdentity,common.componentIdentity,common.virtualCameraNameHash,controls,origin,binding,now,reinterpret_cast<uintptr_t>(receipt),receipt?receipt->scope.screenEpoch:0,receipt?receipt->scope.setupID:0,receipt?receipt->scope.controllerIdentity:0,receipt?receipt->scope.componentIdentity:0,receipt?receipt->scope.virtualCameraNameHash:0,receipt?receipt->eye:0,receipt?receipt->nativeFrame:0,receipt?receipt->sourceSequence:0,receipt?receipt->cameraRevision:0,receipt?receipt->scope.publishedAtMs:0,age(receipt?receipt->scope.publishedAtMs:0),receipt?receipt->uiSubmission:0,receipt?receipt->queue:0,receipt?receipt->backBuffer:0,reinterpret_cast<uintptr_t>(app),app?app->metadata.screenEpoch:0,app?app->metadata.setupID:0,app?app->frame.eye:0,app?app->frame.nativeFrame:0,app?app->frame.sourceSequence:0,app?app->localPoseRevision:0,app?app->source.cameraKey:0,app?app->source.bindingGeneration:0,app?app->editorControlRevision:0,app?app->projection.origin:0,app?app->metadata.publishedAtMs:0,age(app?app->metadata.publishedAtMs:0),unsigned(sameReceiptScope),unsigned(sameAppScope),unsigned(identity),unsigned(projection));
+    }catch(...){}
+}
+}
+struct OpenXRManager::EditorNativeUiSource {
+    std::shared_ptr<const cvr::menu_preview::CameraApplication> application;
+    std::optional<MenuUiSelection> packet;
+    uint64_t presentSerial{};
+};
+bool OpenXRManager::PrepareMenuUiResize(){
+    if(!cvr::menu_preview::UiStereoRequested())return true;
+    ClearMenuUiPair();
+    std::lock_guard captureLock(m_captureMutex);
+    const auto required=m_captureContextFences.AllRequired();
+    if(required==UINT64_MAX)return false;
+    if(required){if(!m_captureFence||m_captureFence->GetCompletedValue()==UINT64_MAX)return false;
+        if(m_captureFence->GetCompletedValue()<required){
+            if(FAILED(m_captureFence->SetEventOnCompletion(required,m_captureFenceEvent))||WaitForSingleObject(m_captureFenceEvent,100)!=WAIT_OBJECT_0||m_captureFence->GetCompletedValue()==UINT64_MAX||m_captureFence->GetCompletedValue()<required)return false;
+        }
+    }
+    for(unsigned slot=0;slot<3;++slot){auto* allocator=m_captureCmdAllocators[slot];auto* list=m_captureCmdLists[slot];
+        if(!allocator&&!list)continue;if(!allocator||!list)return false;
+        if(FAILED(allocator->Reset())||FAILED(list->Reset(allocator,nullptr)))return false;
+        // Own lists are never replayed; actual last Execute fence is proven complete.
+        cvr::gpu::ResetCommandResources(list);
+        if(FAILED(list->Close()))return false;
+    }
+    cvr::gpu::CollectCommandResources();
+    cvr::menu_preview::ClearUiBackBuffers();
+    return true;
+}
+void OpenXRManager::ClearMenuUiPair(){
+    std::array<uintptr_t,2> retired;
+    std::shared_ptr<EditorNativeUiSource> retiredNative;
+    std::shared_ptr<const cvr::menu_preview::UiFrameReceipt> retiredUi;
+    {std::lock_guard lock(m_presentMutex);retired=m_menuUiPair.Clear();for(unsigned e=0;e<2;++e){m_menuUiCompletion[e]={};m_menuUiReceipt[e].reset();m_menuUiRawSceneSerial[e]=0;}
+     retiredNative=std::move(m_editorNativeUiSource);retiredUi=std::move(m_editorNativeUiReceipt);}
+    for(auto resource:retired)if(resource)ReleaseCapturedRead(reinterpret_cast<ID3D12Resource*>(resource),0);
+}
+std::optional<OpenXRManager::MenuUiSelection> OpenXRManager::AcquireEditorNativeMenuUiPair(const cvr::menu_preview::Lease& scope){
+    try {
+    using namespace cvr::menu_preview;
+    const auto raw=AcquireEditorNativeScenePair(scope.metadata);
+    const auto traceGate=[&](unsigned gate,const char* reason,bool source=false,bool receiptKnown=false,bool same=false,bool valid=false,bool proven=false){
+        static std::array<std::atomic<uint32_t>,3> rows{};
+        if(gate>=rows.size())return;
+        const auto row=rows[gate].fetch_add(1,std::memory_order_relaxed);
+        if(row<4||row==128||row==1024||row==8192)Log("[EditorNativeOutput] gate=%u reason=%s epoch=%u setup=%u frame=%u raw=%u source=%u receipt=%u sameApplication=%u uiValid=%u uiProven=%u count=%u; actual output admission observation only\n",
+            gate,reason,scope.metadata.screenEpoch,scope.metadata.setupID,raw?raw->nativeFrame:0,unsigned(bool(raw)),unsigned(source),unsigned(receiptKnown),unsigned(same),unsigned(valid),unsigned(proven),row+1);
+    };
+    if(!raw||raw->origin!=GetTrackingOriginSerial()){traceGate(0,"raw-pair-or-origin");return {};}
+    std::shared_ptr<EditorNativeUiSource> uiSource;std::shared_ptr<const UiFrameReceipt> receipt;uint64_t pool{};
+    {std::lock_guard lock(m_presentMutex);uiSource=m_editorNativeUiSource;receipt=m_editorNativeUiReceipt;pool=m_captureResourceEpoch;}
+    const bool sameApplication=uiSource&&receipt&&uiSource->application==receipt->application;
+    const bool validUi=sameApplication&&MenuEditorUiValid(*receipt);
+    uint64_t proofNow{};const bool provenUi=validUi&&cvr::xr::EditorNativeUiReceiptProven(*receipt,scope.metadata,raw->controlRevision,raw->origin,raw->bindingGeneration,(proofNow=PublicationNowMs()));
+    if(!uiSource||!receipt||!sameApplication||!validUi||!provenUi){
+        NoteEditorNativeUiProof(receipt.get(),scope.metadata,raw->controlRevision,raw->origin,raw->bindingGeneration,proofNow);
+        traceGate(1,"primary-ui",bool(uiSource),bool(receipt),sameApplication,validUi,provenUi);return {};
+    }
+    traceGate(2,"raw-and-primary-ui-admitted",true,true,true,true,true);
+    const auto pairScope=MenuUiScope(scope.metadata,pool);
+    const auto cachePacket=[&](const MenuUiSelection& packet){
+        std::shared_ptr<EditorNativeUiSource> latest;std::shared_ptr<const UiFrameReceipt> latestReceipt;
+        {std::lock_guard lock(m_presentMutex);latest=m_editorNativeUiSource;latestReceipt=m_editorNativeUiReceipt;}
+        if(!latest||!latestReceipt||latest->application!=latestReceipt->application||!MenuEditorUiValid(*latestReceipt)||
+           !cvr::xr::EditorNativeUiReceiptProven(*latestReceipt,scope.metadata,raw->controlRevision,raw->origin,raw->bindingGeneration,PublicationNowMs()))return;
+        auto replacement=std::make_shared<EditorNativeUiSource>(*latest);replacement->packet=packet;replacement->packet->editorUi=latestReceipt->editorUi;
+        std::shared_ptr<EditorNativeUiSource> retired;
+        {std::lock_guard lock(m_presentMutex);if(m_captureResourceEpoch==pool&&m_editorNativeUiSource==latest&&m_editorNativeUiReceipt==latestReceipt){retired=std::move(m_editorNativeUiSource);m_editorNativeUiSource=std::move(replacement);}}
+        // The old packet's ReadLease may lock presentMutex during retirement.
+    };
+    if(uiSource->packet&&uiSource->packet->scope==pairScope&&
+       uiSource->packet->rawSceneSerial[0]==raw->eyes[0]->serial&&uiSource->packet->rawSceneSerial[1]==raw->eyes[1]->serial){
+        auto packet=*uiSource->packet;
+        for(unsigned eye=0;eye<2;++eye)if(!packet.completion[eye].HasScheduledCopySource()||packet.completion[eye].fence->GetCompletedValue()==UINT64_MAX)return {};
+        if(packet.editorUi!=receipt->editorUi){packet.editorUi=receipt->editorUi;packet.sourceSerial=uiSource->presentSerial;cachePacket(packet);}return packet;
+    }
+    // Accepted display A may pin two cells while an unaccepted cache B pins
+    // the other two writable cells. Retire superseded B before reserving C;
+    // clearing only the manager's pointer is insufficient while this function
+    // still holds its old uiSource snapshot.
+    std::shared_ptr<EditorNativeUiSource> retiredSuperseded,refreshedSource;
+    std::shared_ptr<const UiFrameReceipt> refreshedReceipt;
+    {std::lock_guard lock(m_presentMutex);
+     auto replacement=cvr::xr::EditorNativeUiStateWithoutSupersededPacket(m_editorNativeUiSource,raw->eyes[0]->serial,raw->eyes[1]->serial);
+     if(replacement!=m_editorNativeUiSource){retiredSuperseded=std::move(m_editorNativeUiSource);m_editorNativeUiSource=std::move(replacement);}
+     refreshedSource=m_editorNativeUiSource;refreshedReceipt=m_editorNativeUiReceipt;}
+    uiSource.reset();retiredSuperseded.reset(); // ReadLease retirement is outside presentMutex.
+    uiSource=std::move(refreshedSource);receipt=std::move(refreshedReceipt);
+    if(!uiSource||!receipt||uiSource->application!=receipt->application||!MenuEditorUiValid(*receipt)||
+       !cvr::xr::EditorNativeUiReceiptProven(*receipt,scope.metadata,raw->controlRevision,raw->origin,raw->bindingGeneration,PublicationNowMs()))return {};
+    // A concurrent UI/consumer publication may already have materialized C.
+    if(uiSource->packet&&uiSource->packet->scope==pairScope&&
+       uiSource->packet->rawSceneSerial[0]==raw->eyes[0]->serial&&uiSource->packet->rawSceneSerial[1]==raw->eyes[1]->serial){
+        auto packet=*uiSource->packet;
+        for(unsigned eye=0;eye<2;++eye)if(!packet.completion[eye].HasScheduledCopySource()||packet.completion[eye].fence->GetCompletedValue()==UINT64_MAX)return {};
+        if(packet.editorUi!=receipt->editorUi){packet.editorUi=receipt->editorUi;packet.sourceSerial=uiSource->presentSerial;cachePacket(packet);}return packet;
+    }
+    std::unique_lock captureLock(m_captureMutex,std::try_to_lock);if(!captureLock.owns_lock())return {};
+    if(!m_monoPool[0]||!m_captureFence||m_mainPoolProducer.unknown||!cvr::detail::g_orig_ExecuteCommandLists)return {};
+    const auto destination=m_monoPool[0]->GetDesc();
+    if(raw->eyes[0]->pixels.texture->GetDesc().Format!=raw->eyes[1]->pixels.texture->GetDesc().Format)return {};
+    if(!m_editorSceneResample){m_editorSceneResample=std::make_unique<cvr::render::AerReconstructionPass>();
+        if(!m_editorSceneResample->Initialize(m_d3dDevice)){m_editorSceneResample.reset();return {};}}
+    if(!m_editorSceneResample->Prepare(raw->eyes[0]->pixels.texture->GetDesc().Format,destination.Format,cvr::xr::EditorSceneColorRoute(destination.Format)))return {};
+    uintptr_t writeResources[2]{};cvr::capture::WriteRelease releaseWrites(m_captureLeases,m_presentMutex,writeResources);
+    Microsoft::WRL::ComPtr<ID3D12Resource> snapshots[2];
+    {std::lock_guard lock(m_presentMutex);if(m_captureResourceEpoch!=pool)return {};
+     std::array<uintptr_t,cvr::capture::MainPoolMaximum> addresses{};for(unsigned n=0;n<m_monoPoolCount;++n)addresses[n]=uintptr_t(m_monoPool[n]);
+     for(unsigned eye=0;eye<2;++eye){const auto slot=cvr::capture::ReserveMainWrite(std::span(addresses).first(m_monoPoolCount),uintptr_t(m_monoCapturedFrame.texture),m_monoPoolSlot,m_captureLeases);
+        if(!slot)return {};m_monoPoolSlot=*slot;snapshots[eye]=m_monoPool[*slot];writeResources[eye]=uintptr_t(snapshots[eye].Get());}}
+    m_captureAllocatorIndex=(m_captureAllocatorIndex+1)%3;
+    const auto completed=m_captureFence->GetCompletedValue();
+    if(completed==UINT64_MAX||!m_captureContextFences.CanReset(m_captureAllocatorIndex,completed)||m_captureFenceValue>=UINT64_MAX-1)return {};
+    auto* allocator=m_captureCmdAllocators[m_captureAllocatorIndex];auto* list=m_captureCmdLists[m_captureAllocatorIndex];
+    EditorUiPrivateCommandScope privateCommands;
+    if(FAILED(allocator->Reset())||FAILED(list->Reset(allocator,nullptr)))return {};
+    bool closed=false;struct CloseUnsubmitted {ID3D12GraphicsCommandList* list;bool& closed;~CloseUnsubmitted(){if(!closed)list->Close();}} closeUnsubmitted{list,closed};
+    cvr::gpu::ResetCommandResources(list);
+    std::array<cvr::render::AerRecordTicket,2> tickets{};bool executed=false;
+    struct Cancel {cvr::render::AerReconstructionPass* pass;std::array<cvr::render::AerRecordTicket,2>& tickets;bool& executed;
+        ~Cancel(){if(!executed)for(const auto& ticket:tickets)if(ticket)pass->CancelNeverExecuted(ticket);}} cancel{m_editorSceneResample.get(),tickets,executed};
+    const auto value=m_captureFenceValue+1;
+    for(unsigned eye=0;eye<2;++eye){cvr::xr::EditorSceneCaptureSource source{raw->eyes[eye]->pixels.texture.Get(),raw->eyes[eye],raw->eyes[eye]->application->projection};
+        tickets[eye]=cvr::xr::RecordEditorSceneCapture(*m_editorSceneResample,list,source,snapshots[eye].Get(),m_captureFence,value);if(!tickets[eye])return {};}
+    if(!(closed=SUCCEEDED(list->Close())))return {};
+    cvr::framegen::CaptureCompletion completion;
+    {std::lock_guard submission(cvr::camera::ImageSubmissionMutex());
+     for(unsigned eye=0;eye<2;++eye){const auto& image=*raw->eyes[eye];const auto done=image.producerFence->GetCompletedValue();
+        if(!EditorNativeSourceRegistered(scope.metadata,image.application->source)||!FreshPublication(image.publishedAtMs,PublicationNowMs())||
+           !FreshPublication(image.application->metadata.publishedAtMs,PublicationNowMs())||!FreshPublication(scope.metadata.publishedAtMs,PublicationNowMs())||
+           done==UINT64_MAX||done<image.producerValue||FAILED(m_d3dQueue->Wait(image.producerFence.Get(),image.producerValue)))return {};}
+     if(!cvr::xr::EditorNativeUiReceiptProven(*receipt,scope.metadata,raw->controlRevision,raw->origin,raw->bindingGeneration,PublicationNowMs()))return {};
+     ID3D12CommandList* lists[]{list};auto resources=cvr::gpu::PrepareCommandResources(1,lists);
+     cvr::detail::g_orig_ExecuteCommandLists(m_d3dQueue,1,lists);executed=true;
+     ++m_captureFenceValue;const auto signaled=m_d3dQueue->Signal(m_captureFence,value);
+     for(const auto& ticket:tickets)m_editorSceneResample->SubmissionReported(ticket,true,SUCCEEDED(signaled));
+     cvr::gpu::SubmitCommandResources(m_d3dQueue,std::move(resources));m_captureContextFences.Executed(m_captureAllocatorIndex,value,SUCCEEDED(signaled));
+     m_mainPoolProducer.Executed(m_captureFence,value,SUCCEEDED(signaled));if(FAILED(signaled))return {};
+     LARGE_INTEGER now{},frequency{};QueryPerformanceCounter(&now);QueryPerformanceFrequency(&frequency);
+     completion=cvr::framegen::CaptureCompletion::AfterSignal(m_captureFence,value,signaled,now,frequency.QuadPart);}
+    MenuUiSelection packet;packet.scope=pairScope;packet.sourceSerial=uiSource->presentSerial;packet.editorUiRequired=true;packet.editorUi=receipt->editorUi;
+    packet.editorControlRevision=raw->controlRevision;packet.lease=std::make_shared<cvr::framegen::ReadLease>();packet.lease->owner=this;
+    packet.lease->release=[](void* owner,ID3D12Resource* resource,uint64_t fence){static_cast<OpenXRManager*>(owner)->ReleaseCapturedRead(resource,fence);};
+    {std::lock_guard lock(m_presentMutex);if(m_captureResourceEpoch!=pool)return {};
+     for(unsigned eye=0;eye<2;++eye){m_captureLeases.EndWrite(uintptr_t(snapshots[eye].Get()));writeResources[eye]=0;
+        if(!m_captureLeases.Pin(uintptr_t(snapshots[eye].Get())))return {};snapshots[eye]->AddRef();packet.lease->resources[eye]=snapshots[eye].Get();
+        packet.color[eye]=snapshots[eye].Get();packet.completion[eye]=completion;packet.rawSceneSerial[eye]=raw->eyes[eye]->serial;
+        packet.cameraRevision[eye]=raw->eyes[eye]->application->localPoseRevision;packet.projection[eye]=raw->eyes[eye]->application->projection;}}
+    if(!cvr::xr::EditorOrbitViewsMatch(packet.projection[0].orbit,packet.projection[1].orbit,raw->origin,raw->controlRevision))return {};
+    captureLock.unlock();cachePacket(packet);
+    static unsigned rows{};if(rows++<8)Log("[EditorNativeUiPair] frame=%u raw=%llu/%llu uiSubmission=%llu control=%llu generation=%llu; real two-view raw, one actual UI receipt, managed capture lease\n",raw->nativeFrame,packet.rawSceneSerial[0],packet.rawSceneSerial[1],receipt->uiSubmission,raw->controlRevision,raw->bindingGeneration);
+    return packet;
+    }catch(...){return {};}
+}
+std::optional<OpenXRManager::MenuUiSelection> OpenXRManager::AcquireMenuUiPair(){
+    if(!cvr::menu_preview::UiStereoRequested())return {};
+    cvr::menu_preview::Lease scope;if(!cvr::menu_preview::TryAcquireCurrent(scope))return {};
+    if(scope.metadata.screen==2&&cvr::menu_preview::EditorNativeApplicationsConfigured())return AcquireEditorNativeMenuUiPair(scope);
+    // Returning to the original lane must release native cache publisher pins;
+    // a last accepted display keeps its own shared ReadLease until replaced.
+    std::shared_ptr<EditorNativeUiSource> retiredNative;std::shared_ptr<const cvr::menu_preview::UiFrameReceipt> retiredNativeUi;
+    {std::lock_guard lock(m_presentMutex);retiredNative=std::move(m_editorNativeUiSource);retiredNativeUi=std::move(m_editorNativeUiReceipt);}
+    MenuUiSelection selection;selection.lease=std::make_shared<cvr::framegen::ReadLease>();selection.lease->owner=this;
+    selection.lease->release=[](void* owner,ID3D12Resource* resource,uint64_t fence){static_cast<OpenXRManager*>(owner)->ReleaseCapturedRead(resource,fence);};
+    bool accepted=false,pairFound=false;std::optional<cvr::menu_preview::FreshnessSample> probePair;if(cvr::menu_preview::EditorFreshnessEnabled())probePair.emplace();
+    {std::lock_guard lock(m_presentMutex);selection.scope=MenuUiScope(scope.metadata,m_captureResourceEpoch);
+     if(const auto pair=m_menuUiPair.Read(selection.scope)){
+        pairFound=true;if(cvr::menu_preview::EditorFreshnessEnabled()&&probePair){probePair->source=(*pair)[0].sourceSequence;probePair->otherSource=(*pair)[1].sourceSequence;probePair->revision=(*pair)[0].controlRevision;probePair->otherRevision=(*pair)[1].controlRevision;}
+        selection.editorControlRevision=(*pair)[0].controlRevision;
+        accepted=true;for(unsigned eye=0;eye<2;++eye){const auto& completion=m_menuUiCompletion[eye];
+            if(!m_menuUiReceipt[eye]||!m_menuUiReceipt[eye]->cameraRevision||!MenuEditorUiValid(*m_menuUiReceipt[eye])||!completion.HasScheduledCopySource()||completion.fence->GetCompletedValue()==UINT64_MAX){accepted=false;break;}
+            selection.projection[eye]=m_menuUiReceipt[eye]->projection;
+            selection.rawSceneSerial[eye]=m_menuUiRawSceneSerial[eye];
+            if(m_menuUiReceipt[eye]->editorUiRequired&&(!selection.rawSceneSerial[eye]||!selection.editorControlRevision)){accepted=false;break;}
+            if(scope.metadata.screen==2&&(!selection.projection[eye].valid||selection.projection[eye].origin!=GetTrackingOriginSerial())){accepted=false;break;}
+            auto* resource=reinterpret_cast<ID3D12Resource*>((*pair)[eye].resource);
+            selection.sourceSerial=std::max(selection.sourceSerial,(*pair)[eye].serial);
+            if(!m_captureLeases.Pin(uintptr_t(resource))){accepted=false;break;}
+            resource->AddRef();selection.color[eye]=resource;selection.completion[eye]=completion;selection.lease->resources[eye]=resource;selection.cameraRevision[eye]=m_menuUiReceipt[eye]?m_menuUiReceipt[eye]->cameraRevision:0;
+        }
+        if(accepted){
+            const auto& left=*m_menuUiReceipt[0];const auto& right=*m_menuUiReceipt[1];
+            const auto required=cvr::xr::EditorUiPairRequirement(left.editorUiRequired,right.editorUiRequired);
+            selection.editorUiRequired=required.value_or(true);
+            if(!required)accepted=false;
+            else if(!cvr::xr::EditorOrbitViewsMatch(selection.projection[0].orbit,selection.projection[1].orbit,GetTrackingOriginSerial(),selection.editorControlRevision))accepted=false;
+            else if(selection.editorUiRequired)selection.editorUi=
+                left.editorUi->sourceSequence>right.editorUi->sourceSequence?left.editorUi:right.editorUi;
+        }
+     }else if(scope.metadata.screen==2){static unsigned rows{},lastMask=~0u;const auto& cells=m_menuUiPair.Cells();const unsigned mask=(cells[0]?1u:0u)|(cells[1]?2u:0u);if(mask!=lastMask&&rows++<8){lastMask=mask;Log("[MenuPreviewUiPair] read-miss current=%u/%u/%llx/%llx/%llx/%llu left=%u/%u/%llx/%llx/%llx/%llu:%llx right=%u/%u/%llx/%llx/%llx/%llu:%llx\n",selection.scope.epoch,selection.scope.setup,selection.scope.owner,selection.scope.component,selection.scope.camera,selection.scope.pool,cells[0].scope.epoch,cells[0].scope.setup,cells[0].scope.owner,cells[0].scope.component,cells[0].scope.camera,cells[0].scope.pool,cells[0].resource,cells[1].scope.epoch,cells[1].scope.setup,cells[1].scope.owner,cells[1].scope.component,cells[1].scope.camera,cells[1].scope.pool,cells[1].resource);}}
+     }
+    if(scope.metadata.screen==2){static unsigned rows{};static int previous=-1;if(rows<8&&previous!=int(accepted)){++rows;previous=int(accepted);Log("[MenuPreviewUiPair] acquire accepted=%u left=%p right=%p revision=%llu/%llu\n",unsigned(accepted),selection.color[0],selection.color[1],selection.cameraRevision[0],selection.cameraRevision[1]);}}
+    if(cvr::menu_preview::EditorFreshnessEnabled()&&scope.metadata.screen==2&&probePair){
+        probePair->epoch=scope.metadata.screenEpoch;probePair->setup=scope.metadata.setupID;probePair->control=selection.editorControlRevision;probePair->origin=selection.projection[0].origin;probePair->rawLeft=selection.rawSceneSerial[0];probePair->rawRight=selection.rawSceneSerial[1];probePair->flags=unsigned(pairFound)|(unsigned(selection.editorUiRequired)<<1);
+        cvr::menu_preview::NoteEditorFreshness(accepted?cvr::menu_preview::FreshnessEvent::PairAccept:pairFound?cvr::menu_preview::FreshnessEvent::PairAdmissionReject:cvr::menu_preview::FreshnessEvent::PairReadMiss,cvr::menu_preview::FreshnessStage::Pair,*probePair);
+    }
+    if(!accepted)return {};return selection; // rejected lease destructs outside presentMutex
+}
+bool OpenXRManager::CaptureMenuUiPresentedFrame(ID3D12Resource* backBuffer,const D3D12_RESOURCE_DESC& description,uint64_t serial){
+    if(!cvr::menu_preview::UiStereoRequested()||!backBuffer||!m_d3dQueue)return false;
+    const auto receipt=cvr::menu_preview::AcquireUiFrameForCapture(backBuffer,m_d3dQueue);
+    if(!receipt||receipt->eye>1||!receipt->cameraRevision||!MenuEditorUiValid(*receipt))return false;
+    if(receipt->scope.screen==2&&cvr::menu_preview::EditorNativeApplicationsConfigured()){
+        try {
+        const auto& app=receipt->application;
+        if(!app||!receipt->editorUiRequired||!cvr::xr::EditorNativeUiReceiptProven(*receipt,receipt->scope,app->editorControlRevision,
+            app->projection.origin,app->source.bindingGeneration,cvr::menu_preview::PublicationNowMs()))return false;
+        auto next=std::make_shared<EditorNativeUiSource>();next->application=app;next->presentSerial=serial;
+        std::shared_ptr<EditorNativeUiSource> retiredNative;std::shared_ptr<const cvr::menu_preview::UiFrameReceipt> retiredUi;
+        std::array<uintptr_t,2> retired{};
+        std::lock_guard captureLock(m_captureMutex);if(!EnsureMonoCaptureResource(description)||m_mainPoolProducer.unknown)return false;
+        {std::lock_guard submission(cvr::camera::ImageSubmissionMutex());
+         if(!cvr::menu_preview::ValidateUiFrameForCapture(*receipt,backBuffer,m_d3dQueue))return false;
+         std::lock_guard lock(m_presentMutex);cvr::menu_preview::Lease current;
+         if(!cvr::menu_preview::TryAcquireCurrent(current)||!cvr::menu_preview::SameEditorApplicationScope(current.metadata,receipt->scope)||
+            !cvr::menu_preview::EditorNativeSourceRegistered(current.metadata,app->source))return false;
+         if(m_editorNativeUiSource&&m_editorNativeUiSource->application&&
+            m_editorNativeUiSource->application->source==app->source&&
+            cvr::menu_preview::SameEditorApplicationScope(m_editorNativeUiSource->application->metadata,app->metadata)&&
+            m_editorNativeUiSource->application->projection.origin==app->projection.origin)next->packet=m_editorNativeUiSource->packet;
+         retiredNative=std::move(m_editorNativeUiSource);retiredUi=std::move(m_editorNativeUiReceipt);
+         m_editorNativeUiSource=std::move(next);m_editorNativeUiReceipt=receipt;
+         retired=m_menuUiPair.Clear();for(unsigned eye=0;eye<2;++eye){m_menuUiReceipt[eye].reset();m_menuUiCompletion[eye]={};m_menuUiRawSceneSerial[eye]=0;}}
+        for(auto resource:retired)if(resource)ReleaseCapturedRead(reinterpret_cast<ID3D12Resource*>(resource),0);
+        return true; // Only the real primary UI publication; no right BB/UI receipt.
+        }catch(...){return false;}
+    }
+    const bool rawRequired=cvr::menu_preview::EditorUiSeparationEnabled()&&receipt->scope.screen==2&&receipt->editorUiRequired;
+    const auto source=cvr::xr::SelectEditorSceneCapture(rawRequired,backBuffer,*receipt,
+        rawRequired?cvr::menu_preview::AcquireEditorSceneImage(*receipt):nullptr,cvr::menu_preview::PublicationNowMs());
+    if(!source.texture){if(cvr::menu_preview::EditorFreshnessEnabled()&&receipt->scope.screen==2){cvr::menu_preview::FreshnessSample p;p.epoch=receipt->scope.screenEpoch;p.setup=receipt->scope.setupID;p.source=receipt->sourceSequence;p.revision=receipt->cameraRevision;p.nativeFrame=receipt->nativeFrame;p.eye=receipt->eye;cvr::menu_preview::NoteEditorFreshness(cvr::menu_preview::FreshnessEvent::RawUnavailable,cvr::menu_preview::FreshnessStage::Pair,p);}return false;} // Required raw unavailable: preserve the accepted pair and MAIN pool.
+    const auto privateExecute=source.scene?cvr::detail::g_orig_ExecuteCommandLists:nullptr;
+    if(source.scene&&!privateExecute)return false;
+    std::shared_ptr<const cvr::menu_preview::UiFrameReceipt> pairReceipt=receipt;
+    if(source.scene){auto rawReceipt=std::make_shared<cvr::menu_preview::UiFrameReceipt>(*receipt);
+        rawReceipt->projection=source.projection;pairReceipt=std::move(rawReceipt);}
+    std::unique_lock captureLock(m_captureMutex);
+    if(source.scene){
+        if(!m_editorSceneResample){m_editorSceneResample=std::make_unique<cvr::render::AerReconstructionPass>();
+            if(!m_editorSceneResample->Initialize(m_d3dDevice)){m_editorSceneResample.reset();return false;}}
+        if(!m_editorSceneResample->Prepare(source.texture->GetDesc().Format,description.Format,
+            cvr::xr::EditorSceneColorRoute(description.Format)))return false;
+    }
+    if(!EnsureMonoCaptureResource(description)||m_mainPoolProducer.unknown)return false;
+    cvr::menu_preview::UiPairScope scope;
+    {std::lock_guard lock(m_presentMutex);scope=MenuUiScope(receipt->scope,m_captureResourceEpoch);if(m_menuUiPair.HasSource(scope,receipt->eye,receipt->sourceSequence))return false;}
+    uintptr_t writeResources[2]{};cvr::capture::WriteRelease releaseWrites(m_captureLeases,m_presentMutex,writeResources);
+    Microsoft::WRL::ComPtr<ID3D12Resource> snapshot;
+    {std::lock_guard lock(m_presentMutex);std::array<uintptr_t,cvr::capture::MainPoolMaximum> addresses{};
+     for(unsigned i=0;i<m_monoPoolCount;++i)addresses[i]=uintptr_t(m_monoPool[i]);
+     const auto slot=cvr::capture::ReserveMainWrite(std::span(addresses).first(m_monoPoolCount),uintptr_t(m_monoCapturedFrame.texture),m_monoPoolSlot,m_captureLeases);
+     if(!slot)return false;m_monoPoolSlot=*slot;snapshot=m_monoPool[*slot];writeResources[0]=uintptr_t(snapshot.Get());}
+    m_captureAllocatorIndex=(m_captureAllocatorIndex+1)%3;
+    const auto requiredFence=m_captureContextFences.Required(m_captureAllocatorIndex);
+    if(requiredFence==UINT64_MAX||m_captureFence->GetCompletedValue()==UINT64_MAX)return false;
+    if(!m_captureContextFences.CanReset(m_captureAllocatorIndex,m_captureFence->GetCompletedValue())){
+        if(FAILED(m_captureFence->SetEventOnCompletion(requiredFence,m_captureFenceEvent))||WaitForSingleObject(m_captureFenceEvent,100)!=WAIT_OBJECT_0||!m_captureContextFences.CanReset(m_captureAllocatorIndex,m_captureFence->GetCompletedValue()))return false;
+    }
+    auto* allocator=m_captureCmdAllocators[m_captureAllocatorIndex];auto* list=m_captureCmdLists[m_captureAllocatorIndex];
+    std::optional<cvr::menu_preview::EditorUiPrivateCommandScope> privateScope;
+    if(source.scene)privateScope.emplace();
+    if(FAILED(allocator->Reset())||FAILED(list->Reset(allocator,nullptr)))return false;
+    if(source.scene)cvr::gpu::ResetCommandResources(list); // private Reset bypasses the generic hook
+    if(m_captureFenceValue>=UINT64_MAX-1)return false;
+    const auto copyFenceValue=m_captureFenceValue+1;
+    cvr::render::AerRecordTicket rawTicket;bool rawExecuted=false;
+    struct CancelRaw {cvr::render::AerReconstructionPass* pass; cvr::render::AerRecordTicket& ticket;bool& executed;
+        ~CancelRaw(){if(pass&&ticket&&!executed)pass->CancelNeverExecuted(ticket);}} cancelRaw{source.scene?m_editorSceneResample.get():nullptr,rawTicket,rawExecuted};
+    if(source.scene){rawTicket=cvr::xr::RecordEditorSceneCapture(*m_editorSceneResample,list,source,snapshot.Get(),m_captureFence,copyFenceValue);if(!rawTicket)return false;}
+    else {if(!cvr::gpu::KeepCommandResources(list,{backBuffer,snapshot.Get()}))return false;
+     cvr::stereo::probe::Scope internal;
+     D3D12_RESOURCE_BARRIER pre[2]{};pre[0].Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+     pre[0].Transition={backBuffer,D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,D3D12_RESOURCE_STATE_PRESENT,D3D12_RESOURCE_STATE_COPY_SOURCE};pre[1]=fgtrace::MainCaptureWriteBarrier(snapshot.Get());
+     list->ResourceBarrier(2,pre);list->CopyResource(snapshot.Get(),backBuffer);
+     D3D12_RESOURCE_BARRIER post[2]{};post[0]=fgtrace::MainCaptureReadyBarrier(snapshot.Get());post[1]=pre[0];post[1].Transition.StateBefore=D3D12_RESOURCE_STATE_COPY_SOURCE;post[1].Transition.StateAfter=D3D12_RESOURCE_STATE_PRESENT;list->ResourceBarrier(2,post);}
+    if(FAILED(list->Close()))return false;
+    cvr::framegen::CaptureCompletion completion;
+    {std::lock_guard submission(cvr::camera::ImageSubmissionMutex());
+     if(!cvr::menu_preview::ValidateUiFrameForCapture(*receipt,backBuffer,m_d3dQueue))return false;
+     if(source.scene){const auto current=cvr::menu_preview::AcquireEditorSceneImage(*receipt);
+        if(current!=source.scene||!cvr::xr::EditorSceneMatchesReceipt(*source.scene,*receipt,cvr::menu_preview::PublicationNowMs())||
+           source.scene->producerFence->GetCompletedValue()==UINT64_MAX||
+           FAILED(m_d3dQueue->Wait(source.scene->producerFence.Get(),source.scene->producerValue)))return false;}
+     ID3D12CommandList* lists[]{list};
+     auto resources=source.scene?cvr::gpu::PrepareCommandResources(1,lists):cvr::gpu::ResourceSubmission{};
+     if(source.scene)privateExecute(m_d3dQueue,1,lists);else m_d3dQueue->ExecuteCommandLists(1,lists);
+     rawExecuted=bool(source.scene);
+     const auto value=++m_captureFenceValue;const auto signaled=m_d3dQueue->Signal(m_captureFence,value);
+     if(source.scene){m_editorSceneResample->SubmissionReported(rawTicket,true,SUCCEEDED(signaled));cvr::gpu::SubmitCommandResources(m_d3dQueue,std::move(resources));}
+     m_captureContextFences.Executed(m_captureAllocatorIndex,value,SUCCEEDED(signaled));
+     m_mainPoolProducer.Executed(m_captureFence,value,SUCCEEDED(signaled));if(FAILED(signaled))return false;
+     LARGE_INTEGER now{},frequency{};QueryPerformanceCounter(&now);QueryPerformanceFrequency(&frequency);completion=cvr::framegen::CaptureCompletion::AfterSignal(m_captureFence,value,signaled,now,frequency.QuadPart);}
+    std::array<uintptr_t,2> retired{};bool published=false;
+    {std::lock_guard lock(m_presentMutex);cvr::menu_preview::Lease current;
+     if(cvr::menu_preview::TryAcquireCurrent(current)&&MenuUiScope(current.metadata,m_captureResourceEpoch)==scope){
+        m_captureLeases.EndWrite(uintptr_t(snapshot.Get()));writeResources[0]=0;
+        if(m_captureLeases.Pin(uintptr_t(snapshot.Get()))){snapshot->AddRef();
+         retired=m_menuUiPair.Publish({scope,uintptr_t(snapshot.Get()),0,receipt->sourceSequence,receipt->uiSubmission,serial,receipt->eye,receipt->nativeFrame,source.scene?source.scene->application->editorControlRevision:0});
+         published=m_menuUiPair.HasSource(scope,receipt->eye,receipt->sourceSequence);
+         if(published){for(unsigned e=0;e<2;++e)if(retired[e]){m_menuUiReceipt[e].reset();m_menuUiCompletion[e]={};m_menuUiRawSceneSerial[e]=0;}m_menuUiReceipt[receipt->eye]=pairReceipt;m_menuUiCompletion[receipt->eye]=completion;m_menuUiRawSceneSerial[receipt->eye]=source.scene?source.scene->serial:0;}
+         else{m_captureLeases.Unpin(uintptr_t(snapshot.Get()));snapshot->Release();}
+        }
+     }}
+    for(auto resource:retired)if(resource)ReleaseCapturedRead(reinterpret_cast<ID3D12Resource*>(resource),0);
+    captureLock.unlock();
+    if(published){cvr::menu_preview::AcknowledgeUiCapture(*receipt);
+     if(source.scene){static std::atomic<uint64_t> rows{};const auto row=rows.fetch_add(1)+1;if(row<=8||row%180==0){const auto sd=source.texture->GetDesc(),td=snapshot->GetDesc();Log("[MenuPreviewRawScene] published serial=%llu eye=%u epoch=%u setup=%u nativeFrame=%u source=%llu revision=%llu controlRevision=%llu raw=%p size=%llux%u format=%u destination=%p size=%llux%u format=%u producerUI=%llu receiptUI=%llu producerFence=%p/%llu captureFence=%llu; full raw image, independent UI retained\n",source.scene->serial,receipt->eye,receipt->scope.screenEpoch,receipt->scope.setupID,receipt->nativeFrame,receipt->sourceSequence,receipt->cameraRevision,source.scene->application->editorControlRevision,source.texture,sd.Width,sd.Height,unsigned(sd.Format),snapshot.Get(),td.Width,td.Height,unsigned(td.Format),source.scene->producerUiSubmission,receipt->uiSubmission,source.scene->producerFence.Get(),source.scene->producerValue,completion.fenceValue);}}
+     else Log("[MenuPreviewUiPair] published eye=%u epoch=%u setup=%u frame=%u source=%llu uiSubmission=%llu cameraRevision=%llu snapshot=%p fence=%llu; full UI copied on actual game queue\n",receipt->eye,receipt->scope.screenEpoch,receipt->scope.setupID,receipt->nativeFrame,receipt->sourceSequence,receipt->uiSubmission,receipt->cameraRevision,snapshot.Get(),completion.fenceValue);}
+    return published;
+}
 bool OpenXRManager::CaptureMonoPresentedFrame(ID3D12Resource* backBuffer, const D3D12_RESOURCE_DESC& sourceDesc, uint64_t serial,
-    const XrPosef poses[2], const XrFovf fovs[2], const bool hasView[2],const XrPosef headCenters[2]) {
+    const XrPosef poses[2], const XrFovf fovs[2], const bool hasView[2],const XrPosef headCenters[2],
+    const cvr::render::NativeColorCapture* nativeColor) {
+    using CaptureReason=cvr::framegen::AerCaptureReason;
+    cvr::framegen::AerCaptureRecord captureDiagnostic;captureDiagnostic.captureSerial=serial;
+    CyberpunkVR_AerCaptureDebug.Record(CaptureReason::Attempt,captureDiagnostic);
+    const auto captureFailed=[&](CaptureReason reason) {
+        CyberpunkVR_AerCaptureDebug.Record(reason,captureDiagnostic);return false;
+    };
+    uint64_t catalogueAttempt{};
+    {std::lock_guard lock(m_presentMutex);catalogueAttempt=m_mainCaptureCatalogue.Generation();}
     if (!backBuffer || !hasView[0] || !hasView[1]) {
         CVR_DIAGNOSTIC(CyberpunkVR_DebugCapSkipNoView.fetch_add(1, std::memory_order_relaxed));
-        return false;
+        return captureFailed(CaptureReason::NoView);
     }
+    const auto orderedSource=nativeColor?nativeColor->pose.mainEyeSource:cvr::framegen::MainEyeSourceReceipt{};
+    const bool ordered=bool(orderedSource)&&cvr::framegen::GetSettings().aerV2;
+    static_assert(cvr::capture::MainEyeQueueSlots==cvr::framegen::AerRealPresenter::SourceSlotsPerEye);
 
     std::lock_guard<std::mutex> captureLock(m_captureMutex);
     uintptr_t writeResources[2]{};
     cvr::capture::WriteRelease releaseWrites(m_captureLeases,m_presentMutex,writeResources);
     if (!EnsureMonoCaptureResource(sourceDesc)) {
         CVR_DIAGNOSTIC(CyberpunkVR_DebugCapSkipNoRes.fetch_add(1, std::memory_order_relaxed));
-        return false;
+        return captureFailed(CaptureReason::NoResource);
     }
 
-    // Write into the NEXT buffer of the pool, never into the one just published.
-    //
-    // Skipping the capture while the consumer was busy (what stood here before) kept Present
-    // free, but starved the headset: the submit thread holds the snapshot for a good part of
-    // every display frame, so at 55-60 fps the game kept landing in a busy moment and the
-    // HMD stopped receiving new images -- smooth on the monitor, freezing in the headset.
-    // Rotating buffers removes the conflict itself: the producer always has a free one, so
-    // it neither waits nor skips.
+    // Original26.03 has three physical source slots per eye and, by default,
+    // waits for consumer space (App freewheeling is off). Unclaimed publications
+    // and claimed read leases both protect their cells. AER already owns a
+    // separate display-rate submit thread; never wait on it under presentMutex.
     ID3D12Resource* snapshot = nullptr;
-    uint64_t previousSerial = 0;
+    decltype(m_mainCaptureCatalogue)::Key catalogueWrite;
     {
-        std::lock_guard<std::mutex> lock(m_presentMutex);
-        for(uint32_t step=1;step<=3;++step) {
-            const auto slot=(m_monoPoolSlot+step)%3;
-            auto* candidate=m_monoPool[slot];
-            if(candidate==m_monoCapturedFrame.texture)continue;
-            if(m_captureLeases.BeginWrite(reinterpret_cast<uintptr_t>(candidate))) {
-                m_monoPoolSlot=slot;snapshot=candidate;
-                writeResources[0]=reinterpret_cast<uintptr_t>(candidate);break;
-            }
+        std::lock_guard lock(m_presentMutex);
+        m_mainCaptureCatalogue.SetOrderedMode(ordered);
+        if(ordered){m_mainCaptureCatalogue.DiscardOutsideScope(orderedSource);catalogueAttempt=m_mainCaptureCatalogue.Generation();}
+    }
+    for(;;){
+        if(ordered&&(uint32_t(orderedSource.physicalEye)>1||!UseThreadedSubmit()||m_stopFrameThread.load(std::memory_order_acquire)||
+           !m_sessionRunning.load(std::memory_order_acquire)||!m_monoSubmitEnabled.load(std::memory_order_acquire)||
+           !cvr::framegen::GetSettings().aerV2||!cvr::camera::ValidateMainEyeSourceReceipt(orderedSource)||
+           !m_d3dDevice||FAILED(m_d3dDevice->GetDeviceRemovedReason())))break;
+        bool duplicate=false;std::vector<ID3D12Resource*> retired;
+        {
+        std::unique_lock<std::mutex> lock(m_presentMutex);
+        CollectCapturedReadsLocked(retired);
+        captureDiagnostic.rendererEpoch=m_captureResourceEpoch;
+        captureDiagnostic.poolCount=m_monoPoolCount;
+        captureDiagnostic.captureFenceValue=m_captureFenceValue;
+        captureDiagnostic.captureFenceCompleted=m_captureFence?m_captureFence->GetCompletedValue():0;
+        captureDiagnostic.producerUnknown=m_mainPoolProducer.unknown?1:0;
+        std::array<uintptr_t,cvr::capture::MainPoolMaximum> addresses{};
+        for(uint32_t i=0;i<m_monoPoolCount;++i) {
+            addresses[i]=reinterpret_cast<uintptr_t>(m_monoPool[i]);
+            if(m_monoPool[i]==m_monoCapturedFrame.texture)captureDiagnostic.publishedSlot=i;
+            if(m_captureLeases.Readers(addresses[i]))captureDiagnostic.pinnedMask|=uint64_t{1}<<i;
+            if(m_captureLeases.Writing(addresses[i]))captureDiagnostic.writingMask|=uint64_t{1}<<i;
+            if(ordered&&(!cvr::capture::MainEyeQueueSlot(i,uint32_t(orderedSource.physicalEye))||
+               !m_mainCaptureCatalogue.CanOverwrite(i)))addresses[i]=0;
         }
-        previousSerial = m_monoCapturedFrame.serial;
+        duplicate=ordered&&(m_monoPoolCount<2*cvr::capture::MainEyeQueueSlots||m_mainCaptureCatalogue.HasSource(orderedSource));
+        if(!duplicate)if(const auto slot=cvr::capture::ReserveMainWrite(std::span(addresses).first(m_monoPoolCount),
+                reinterpret_cast<uintptr_t>(m_monoCapturedFrame.texture),m_monoPoolSlot,m_captureLeases)) {
+            m_monoPoolSlot=*slot;snapshot=m_monoPool[*slot];
+            catalogueWrite=m_mainCaptureCatalogue.BeginWrite(*slot,catalogueAttempt);
+            captureDiagnostic.writerSlot=*slot;
+            writeResources[0]=reinterpret_cast<uintptr_t>(snapshot);
+        }
         if (snapshot) {
             snapshot->AddRef();
         }
+        if(ordered&&!snapshot&&!duplicate)m_mainCaptureAvailable.wait_for(lock,std::chrono::milliseconds(10));
+        }
+        for(auto* item:retired)item->Release();
+        if(snapshot||!ordered||duplicate)break;
     }
     if (!snapshot) {
+        static const bool historyDiagnostic=[] {char flag[8]{};return GetEnvironmentVariableA("CPVR_FG_HISTORY_DIAG",flag,sizeof(flag))==1&&flag[0]=='1';}();
+        static uint64_t busySamples{};
+        if(historyDiagnostic && (++busySamples<=6||busySamples%180==0))
+            Log("[MAIN-POOL-BUSY] n=%llu capture=%llu slots=%u publishedSlot=%llu pinnedMask=0x%llx writingMask=0x%llx captureFence=%llu completed=%llu producerUnknown=%llu ordered=%u\n",
+                (unsigned long long)busySamples,(unsigned long long)serial,unsigned(captureDiagnostic.poolCount),
+                (unsigned long long)captureDiagnostic.publishedSlot,(unsigned long long)captureDiagnostic.pinnedMask,
+                (unsigned long long)captureDiagnostic.writingMask,(unsigned long long)captureDiagnostic.captureFenceValue,
+                (unsigned long long)captureDiagnostic.captureFenceCompleted,(unsigned long long)captureDiagnostic.producerUnknown,unsigned(ordered));
         CVR_DIAGNOSTIC(CyberpunkVR_DebugCapSkipNoSlot.fetch_add(1, std::memory_order_relaxed));
-        return false;
+        return captureFailed(CaptureReason::NoSlot);
     }
 
     m_captureAllocatorIndex = (m_captureAllocatorIndex + 1) % 3;
     ID3D12CommandAllocator* currentAllocator = m_captureCmdAllocators[m_captureAllocatorIndex];
     
-    if (m_captureFenceValue >= 3 && m_captureFence->GetCompletedValue() < m_captureFenceValue - 2) {
-        m_captureFence->SetEventOnCompletion(m_captureFenceValue - 2, m_captureFenceEvent);
+    const auto requiredFence=m_captureContextFences.Required(m_captureAllocatorIndex);
+    if(requiredFence==UINT64_MAX||m_captureFence->GetCompletedValue()==UINT64_MAX){snapshot->Release();return captureFailed(CaptureReason::FenceTimeout);}
+    if (!m_captureContextFences.CanReset(m_captureAllocatorIndex,m_captureFence->GetCompletedValue())) {
+        if(FAILED(m_captureFence->SetEventOnCompletion(requiredFence,m_captureFenceEvent))){snapshot->Release();return captureFailed(CaptureReason::FenceTimeout);}
         // BOUNDED. This runs on the game's Present thread, so an INFINITE wait turns any
         // GPU hiccup into a hung game. Skipping one capture costs nothing now: the submit
         // side re-sends the frame it already holds, with the pose that belongs to it.
@@ -791,10 +1337,10 @@ bool OpenXRManager::CaptureMonoPresentedFrame(ID3D12Resource* backBuffer, const 
                    prevMax, fenceUs, std::memory_order_relaxed)) {
         }
         }
-        if (fenceRes != WAIT_OBJECT_0) {
+        if (fenceRes != WAIT_OBJECT_0 || !m_captureContextFences.CanReset(m_captureAllocatorIndex,m_captureFence->GetCompletedValue())) {
             CVR_DIAGNOSTIC(CyberpunkVR_DebugCapSkipFence.fetch_add(1, std::memory_order_relaxed));
             snapshot->Release();
-            return false;
+            return captureFailed(CaptureReason::FenceTimeout);
         }
     }
 
@@ -803,9 +1349,16 @@ bool OpenXRManager::CaptureMonoPresentedFrame(ID3D12Resource* backBuffer, const 
     if (FAILED(currentAllocator->Reset()) || FAILED(m_captureCmdList->Reset(currentAllocator, nullptr))) {
         Log("OpenXRManager: Failed to reset mono capture command list\n");
         snapshot->Release();
-        return false;
+        return captureFailed(CaptureReason::ResetFailed);
     }
 
+    // The selected engine source can be retired by a graph/PPD rebuild before
+    // the capture finishes on GPU. Its local selection reference is CPU-only;
+    // use the existing immutable submission owner for this actual copy too.
+    if(nativeColor && !cvr::gpu::KeepCommandResources(m_captureCmdList,{backBuffer,snapshot,nativeColor->lifetime.Get()})) {
+        snapshot->Release();return captureFailed(CaptureReason::NoResource);
+    }
+    const auto sourceState=nativeColor?nativeColor->state:D3D12_RESOURCE_STATE_PRESENT;
     auto gpuProfile = cvr::gpu::profile::Begin(m_captureCmdList);
     {
     cvr::gpu::profile::Scope gpuScope(gpuProfile, cvr::gpu::profile::Stage::CaptureMain);
@@ -814,33 +1367,22 @@ bool OpenXRManager::CaptureMonoPresentedFrame(ID3D12Resource* backBuffer, const 
 
     barriers[barrierCount].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barriers[barrierCount].Transition.pResource = backBuffer;
-    barriers[barrierCount].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    barriers[barrierCount].Transition.StateBefore = sourceState;
     barriers[barrierCount].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     barriers[barrierCount].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     ++barrierCount;
 
-    if (previousSerial != 0) {
-        barriers[barrierCount].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        barriers[barrierCount].Transition.pResource = snapshot;
-        barriers[barrierCount].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        barriers[barrierCount].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-        barriers[barrierCount].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        ++barrierCount;
-    }
+    barriers[barrierCount++]=fgtrace::MainCaptureWriteBarrier(snapshot);
 
     m_captureCmdList->ResourceBarrier(barrierCount, barriers);
     m_captureCmdList->CopyResource(snapshot, backBuffer);
 
     D3D12_RESOURCE_BARRIER afterCopy[2] = {};
-    afterCopy[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    afterCopy[0].Transition.pResource = snapshot;
-    afterCopy[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-    afterCopy[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    afterCopy[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    afterCopy[0]=fgtrace::MainCaptureReadyBarrier(snapshot);
     afterCopy[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     afterCopy[1].Transition.pResource = backBuffer;
     afterCopy[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    afterCopy[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    afterCopy[1].Transition.StateAfter = sourceState;
     afterCopy[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     m_captureCmdList->ResourceBarrier(2, afterCopy);
     }
@@ -878,6 +1420,7 @@ bool OpenXRManager::CaptureMonoPresentedFrame(ID3D12Resource* backBuffer, const 
     // typeless, and a typeless RTV is invalid.
     bool vrcamEyeCaptured = false;
     ID3D12Resource* vrcamCaptureSource=nullptr;
+    D3D12_RESOURCE_DESC vrcamRenderedDesc{};
     const uint32_t eyeW = static_cast<uint32_t>(sourceDesc.Width);
     const uint32_t eyeH = sourceDesc.Height;
     // NOT IN A MENU. The right eye below is VRCAM's view of the WORLD; the menu is not in it,
@@ -891,6 +1434,7 @@ bool OpenXRManager::CaptureMonoPresentedFrame(ID3D12Resource* backBuffer, const 
     if (CyberpunkVR_StereoSubmit && eyeW && eyeH && !(menuOpen && CyberpunkVR_MonoMenu)) {
         ID3D12Resource* vrcamSrc = CyberpunkVR_GetVrcamEyeTextureFresh();
         vrcamCaptureSource=vrcamSrc;
+        if(vrcamSrc)vrcamRenderedDesc=vrcamSrc->GetDesc();
         // THE AGE OF THE SECOND EYE'S CONTENT, which is a different quantity from everything else
         // measured so far and the only one that can be asymmetric between the eyes.
         //
@@ -953,14 +1497,42 @@ bool OpenXRManager::CaptureMonoPresentedFrame(ID3D12Resource* backBuffer, const 
                             }
                         }
                     }
-                    if(!writeResources[1]) { m_captureCmdList->Close();snapshot->Release();return false; }
+                    if(!writeResources[1]) {
+                        static const bool historyDiagnostic=[] {char flag[8]{};return GetEnvironmentVariableA("CPVR_FG_HISTORY_DIAG",flag,sizeof(flag))==1&&flag[0]=='1';}();
+                        static uint64_t busySamples{};
+                        if(historyDiagnostic && (++busySamples<=6||busySamples%180==0)) {
+                            std::array<uint64_t,kVrcamEyeSlots> serials{};
+                            std::array<uint32_t,kVrcamEyeSlots> readers{},writing{};
+                            uint64_t published{};
+                            {
+                                std::lock_guard<std::mutex> lock(m_presentMutex);
+                                published=m_monoCapturedFrame.serial;
+                                for(int slot=0;slot<kVrcamEyeSlots;++slot) {
+                                    const auto resource=reinterpret_cast<uintptr_t>(m_vrcamEyePool[slot]);
+                                    serials[slot]=m_vrcamEyePoolSerial[slot];
+                                    readers[slot]=m_captureLeases.Readers(resource);
+                                    writing[slot]=unsigned(m_captureLeases.Writing(resource));
+                                }
+                            }
+                            char slots[768]{};size_t used=0;
+                            for(int slot=0;slot<kVrcamEyeSlots&&used<sizeof(slots);++slot) {
+                                const int length=std::snprintf(slots+used,sizeof(slots)-used," slot%d=%llu/readers%u/writing%u",
+                                    slot,(unsigned long long)serials[slot],readers[slot],writing[slot]);
+                                if(length<0||size_t(length)>=sizeof(slots)-used)break;
+                                used+=size_t(length);
+                            }
+                            Log("[VRCAM-POOL-BUSY] n=%llu capture=%llu published=%llu slots=%d%s\n",
+                                (unsigned long long)busySamples,(unsigned long long)serial,(unsigned long long)published,kVrcamEyeSlots,slots);
+                        }
+                        m_captureCmdList->Close();snapshot->Release();return captureFailed(CaptureReason::NoSlot);
+                    }
                     ID3D12Resource* const eyeSlotTex = m_vrcamEyePool[m_vrcamEyeSlot];
                     cvr::gpu::profile::Scope gpuScope(gpuProfile, cvr::gpu::profile::Stage::CaptureSecond);
 
                     D3D12_RESOURCE_BARRIER toRt{};
                     toRt.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
                     toRt.Transition.pResource = eyeSlotTex;   // ours
-                    toRt.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                    toRt.Transition.StateBefore = fgtrace::CaptureColorReadState;
                     toRt.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
                     toRt.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
                     m_captureCmdList->ResourceBarrier(1, &toRt);
@@ -1048,27 +1620,16 @@ bool OpenXRManager::CaptureMonoPresentedFrame(ID3D12Resource* backBuffer, const 
                         }
                     }
 
-                    // The barrel dot. Eye 0 gets it from the ImGui overlay on the backbuffer;
-                    // this is the same point, at the same NDC, stamped into eye 1. It is a
-                    // feature (the dot was simply missing on this side) and it is also the
-                    // instrument that settles where the sight's reticle really points: with a
-                    // dot in BOTH eyes the question stops being "does the right eye's reticle
-                    // match the left eye's dot", which no one can judge across a fused pair.
-                    if (vrcamEyeCaptured && CyberpunkVR_BarrelDotSecondEye &&
-                        CyberpunkVR_BarrelDotTick &&
-                        GetTickCount64() - CyberpunkVR_BarrelDotTick < 250) {
-                        if (m_colorBlit->RecordDot(m_captureCmdList, eyeSlotTex,
-                                                   CyberpunkVR_BarrelDotNdcX2,
-                                                   CyberpunkVR_BarrelDotNdcY,
-                                                   CyberpunkVR_BarrelDotRadiusPx,
-                                                   1.0f, 0.045f, 0.045f, 1.0f))
-                            CVR_DIAGNOSTIC(++CyberpunkVR_DebugBarrelDotDraws);
+                    if (vrcamEyeCaptured && CetOverlayRecordIntoTarget(
+                            m_captureCmdList, eyeSlotTex, 0.0f)) {
+                        if (++CyberpunkVR_DebugCetEyeComposites == 1)
+                            Log("[cet-layer] VRCAM eye composite active.\n");
                     }
 
                     // AND THE OVERLAY ITSELF -- the F10 menu and the mouse cursor, which live in
                     // MAIN's backbuffer because that is where ImGui draws, and were therefore absent
-                    // from this eye entirely. Recorded LAST, so the UI sits on top of the HUD, the
-                    // scanner outline and the dot, exactly as it does on the flat screen.
+                    // from this eye entirely. Its dedicated second-eye world list also carries the
+                    // barrel dot, below the UI but above the HUD and scanner outline.
                     //
                     // The distance knob is the same idea as CyberpunkVR_HudDistanceM and defaults to
                     // the same 0: only this eye can move, so the whole disparity goes here, and the
@@ -1102,7 +1663,7 @@ bool OpenXRManager::CaptureMonoPresentedFrame(ID3D12Resource* backBuffer, const 
 
                     D3D12_RESOURCE_BARRIER toSrc = toRt;
                     toSrc.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-                    toSrc.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                    toSrc.Transition.StateAfter = fgtrace::CaptureColorReadState;
                     m_captureCmdList->ResourceBarrier(1, &toSrc);
                 } else {
                     static bool s_blitWarned = false;
@@ -1194,42 +1755,191 @@ bool OpenXRManager::CaptureMonoPresentedFrame(ID3D12Resource* backBuffer, const 
     XrPosef capturedPoses[2]={poses[0],poses[1]};
     uint64_t capturedPoseIds[2]{},capturedImageGenerations[2]{};
     std::shared_ptr<const cvr::framegen::Inputs> capturedInputs[2];
+    std::optional<cvr::framegen::FrameProjectionMetadata> capturedProjections[2];
+    cvr::framegen::CaptureCompletion captureCompletion;
+    std::array<fgtrace::ProducerTraceRecord,2> captureProvenance;
+    fgtrace::NativeFrameStamp nativeStamp;
+    bool publishMainSourceOnly=false;
+    uint32_t publishedMainEye=0;
+    // This is the author's final SDR capture path. Its existing Framegen
+    // generator explicitly declares FFX_BACKBUFFER_TRANSFER_FUNCTION_SRGB.
+    // Keep that pipeline contract separate from the texture's UNORM view.
+    if(sourceDesc.Format==DXGI_FORMAT_R8G8B8A8_UNORM || sourceDesc.Format==DXGI_FORMAT_R8G8B8A8_TYPELESS ||
+       sourceDesc.Format==DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)nativeStamp.transfer=fgtrace::CaptureTransfer::SrgbEncoded;
     {
         // Select labels at the actual queue submission, not when a producer
         // merely recorded commands. The same-queue copy now sits between the
         // labelled writes and any subsequent replacement of the source images.
         std::lock_guard submissionLock(cvr::camera::ImageSubmissionMutex());
         const auto mainImage=cvr::camera::ReadImagePose(backBuffer);
+        if(nativeColor && (!cvr::render::ValidateNativeColor(*nativeColor,m_d3dQueue,mainImage) ||
+           nativeColor->resource.Get()!=backBuffer)) {
+            snapshot->Release();return captureFailed(CaptureReason::MainReceiptRejected);
+        }
         const auto vrcamImage=cvr::camera::ReadImagePose(vrcamCaptureSource);
+        const bool mainSourceRequested=cvr::camera::MainEyeSourceRequested();
+        if(!mainSourceRequested){static uint64_t pairedCaptureTicks{};
+            if(++pairedCaptureTicks<=6||pairedCaptureTicks%240==0)Log("[PAIRED-CAPTURE] serial=%llu main=%d vrcam=%d captured=%d rendered=%llux%u mainSize=%llux%u\n",
+                serial,int(bool(mainImage)),int(bool(vrcamImage)),int(vrcamEyeCaptured),vrcamRenderedDesc.Width,vrcamRenderedDesc.Height,sourceDesc.Width,sourceDesc.Height);}
+        const auto mainSourceReceipt=mainImage ? mainImage.pose.mainEyeSource : cvr::framegen::MainEyeSourceReceipt{};
+        const bool mainSourceValid=mainSourceReceipt && cvr::camera::ValidateMainEyeSourceReceipt(mainSourceReceipt);
+        // Preserve the raw image-label ID even when validation rejects it;
+        // receiptFlags distinguishes that observation from an accepted source.
+        captureDiagnostic.sourceId=mainSourceReceipt.sourceId;
+        captureDiagnostic.receiptFlags=1u|(mainSourceRequested?2u:0u)|(mainSourceReceipt?4u:0u)|(mainSourceValid?8u:0u);
+        const auto mainCaptureMode=cvr::framegen::PlanMainEyeCapture(mainSourceRequested,bool(mainSourceReceipt),mainSourceValid);
+        if(mainCaptureMode==cvr::framegen::MainEyeCaptureMode::Reject) {
+            // Nothing recorded on this capture list has been submitted yet.
+            // WriteRelease returns both reserved slots; no stale epoch's raw
+            // color/matrices/fence are published as a new MAIN source.
+            snapshot->Release();return captureFailed(CaptureReason::MainReceiptRejected);
+        }
+        publishMainSourceOnly=mainCaptureMode==cvr::framegen::MainEyeCaptureMode::Source;
+        if(publishMainSourceOnly)publishedMainEye=static_cast<uint32_t>(mainSourceReceipt.physicalEye);
         const uint32_t vrcamEye=CyberpunkVR_MainIsRightEye ? 0u : 1u;
         for(uint32_t eye=0;eye<2;++eye) {
-            const bool separate=vrcamEyeCaptured && eye==vrcamEye;
+            // A MAIN-only source labels precisely its applied physical eye.
+            // Do not mint a second eye/source from the same MAIN texture, and
+            // do not trust a current global eye swap for an in-flight image.
+            const bool separate=!mainSourceRequested && vrcamEyeCaptured && eye==vrcamEye;
             const auto& source=separate ? vrcamImage : mainImage;
             const uint32_t view=separate ? 2u : 1u;
+            auto& trace=captureProvenance[eye];trace.stage=fgtrace::ProducerStage::ColorPublished;
+            trace.reason=fgtrace::ProducerReason::CapturePoseUnverified;
+            trace.engineView=separate ? fgtrace::EngineView::Vrcam : fgtrace::EngineView::Main;
+            trace.logicalEye=eye;trace.flags=fgtrace::EngineViewKnown|fgtrace::LogicalEyeKnown;
+            trace.sourceId=serial;if(serial)trace.flags|=fgtrace::SourceIdKnown;
+            if(mainSourceRequested && (!mainSourceValid || eye!=static_cast<uint32_t>(mainSourceReceipt.physicalEye)))continue;
+            if(source && source.pose.mainEyeSource &&
+               (!publishMainSourceOnly || !cvr::camera::ValidateMainEyeSourceReceipt(source.pose.mainEyeSource) ||
+                eye!=static_cast<uint32_t>(source.pose.mainEyeSource.physicalEye)))continue;
+            if(source) {
+                trace.poseId=source.pose.poseId;trace.poseWriteId=source.pose.writeId;
+                trace.identityView=source.pose.view;trace.spaceEpoch=source.pose.head.originSerial;
+                trace.nativeFrame=source.pose.renderFrameId;
+                if(trace.poseId)trace.flags|=fgtrace::PoseIdKnown;
+                if(trace.poseWriteId)trace.flags|=fgtrace::PoseWriteIdKnown;
+                if(trace.spaceEpoch)trace.flags|=fgtrace::SpaceEpochKnown;
+                if(source.pose.hasRenderFrameId)trace.flags|=fgtrace::NativeFrameKnown;
+                if(source.pose.head.valid)trace.flags|=fgtrace::HeadPoseValid;
+            }
             if(CyberpunkVR_BindPoseToImage && !ExternalPoseResetPending() && source && source.pose && source.pose.view==view &&
                source.queue==reinterpret_cast<uintptr_t>(m_d3dQueue) &&
                source.pose.head.originSerial==GetTrackingOriginSerial()) {
                 capturedPoses[eye]=cvr::camera::RebaseImageEyePose(headCenters[eye],poses[eye],source.pose.localHead);
                 capturedPoseIds[eye]=source.pose.poseId;
                 capturedImageGenerations[eye]=source.generation;
-                if(cvr::framegen::Enabled() && source.pose.hasRenderFrameId)
+                auto& stamp=nativeStamp.eyes[eye];stamp.sourceSerial=serial;
+                stamp.poseId=source.pose.poseId;stamp.poseWriteId=source.pose.writeId;stamp.spaceEpoch=source.pose.head.originSerial;
+                stamp.engineView=view;stamp.nativeFrame=source.pose.renderFrameId;stamp.nativeFrameKnown=source.pose.hasRenderFrameId;
+                const auto renderedDesc=separate?vrcamRenderedDesc:sourceDesc;
+                stamp.renderedWidth=uint32_t(renderedDesc.Width);stamp.renderedHeight=renderedDesc.Height;
+                stamp.clockGeneration=source.pose.clockGeneration;stamp.cameraApplicationQpc=source.pose.cameraApplicationQpc;
+                stamp.contentTimeNs=source.pose.contentTimeNs;stamp.posePredictionNs=source.pose.posePredictionNs;
+                stamp.mainEyeSource=source.pose.mainEyeSource;
+                stamp.referenceOptics=source.pose.head.referenceOptics;
+                const auto& imageHead=source.pose.localHead;
+                stamp.capturedHead={imageHead.orientation.x,imageHead.orientation.y,
+                    imageHead.orientation.z,imageHead.orientation.w,
+                    imageHead.position.x,imageHead.position.y,imageHead.position.z};
+                stamp.capturedHeadValid=fgtrace::CapturedHeadTrusted(source.pose.externalView,
+                    publishMainSourceOnly&&mainSourceValid,source.pose.mainEyeSource,
+                    source.pose.head.originSerial,source.pose.head.locatedTime);
+                trace.flags|=fgtrace::PoseIdentityValid;trace.reason=fgtrace::ProducerReason::ColorScheduled;
+                const bool guideCaptureRequested=cvr::framegen::CaptureInputsEnabled();
+                if(guideCaptureRequested && source.pose.hasRenderFrameId)
                     capturedInputs[eye]=cvr::framegen::AcquireInputs(view,source.pose.renderFrameId,
                         source.pose.poseId,source.pose.head.originSerial,m_d3dQueue);
+                if(capturedInputs[eye])capturedProjections[eye]=cvr::framegen::SnapshotFrameProjection(*capturedInputs[eye]);
+                else if(source.pose.hasRenderFrameId)capturedProjections[eye]=cvr::framegen::AcquireFrameProjection(
+                    view,source.pose.renderFrameId,source.pose.poseId,source.pose.head.originSerial,m_d3dQueue);
+                if(!capturedProjections[eye]&&source.pose.hasRenderFrameId) {
+                    cvr::framegen::SubmittedProjectionReason projectionReason;
+                    capturedProjections[eye]=cvr::framegen::AcquireSubmittedImageProjection(source,&projectionReason);
+                    if(cvr::framegen::OwnSelectionWitnessEnabled()) {
+                        static std::atomic<uint64_t> calls{},nextLog{};const auto count=++calls;
+                        const auto now=GetTickCount64();auto due=nextLog.load(std::memory_order_relaxed);
+                        if(count<=4||(now>=due&&nextLog.compare_exchange_strong(due,now+1000,std::memory_order_relaxed))) {
+                            const auto& match=capturedProjections[eye];
+                            Log("[OWN-PROJECTION-SOURCE] serial=%llu eye=%u view=%u frame=%u pose=%llu write=%llu origin=%llu clock=%llu imageGeneration=%llu status=%u matched=%u matchedFrame=%u matchedWrite=%llu constantsVersion=%llu\n",
+                                serial,eye,view,source.pose.renderFrameId,source.pose.poseId,source.pose.writeId,
+                                source.pose.head.originSerial,source.pose.clockGeneration,source.generation,unsigned(projectionReason),unsigned(bool(match)),
+                                match?match->frameId:0,match?match->poseWriteId:0,match?uint64_t(match->constants.version):0);
+                        }
+                    }
+                }
+                if(capturedInputs[eye])trace.flags|=fgtrace::GuidesAvailable;
+                else if(guideCaptureRequested)trace.reason=fgtrace::ProducerReason::CaptureGuidesMissing;
+                if(capturedInputs[eye])captureDiagnostic.guidesMask|=uint64_t{1}<<eye;
+                else if(guideCaptureRequested)CyberpunkVR_AerCaptureDebug.Count(CaptureReason::GuidesMissing);
                 CVR_DIAGNOSTIC(CyberpunkVR_PoseIdCaptured[view-1].fetch_add(1,std::memory_order_relaxed));
                 CVR_DIAGNOSTIC(CyberpunkVR_PoseIdLastCapture[eye].store(source.pose.poseId,std::memory_order_relaxed));
                 CVR_DIAGNOSTIC(CyberpunkVR_PoseIdImageGeneration[eye].store(source.generation,std::memory_order_relaxed));
             } else {
+                // A populated source can still fail the final queue/origin/reset
+                // checks. Keep this bounded observation separate from admission:
+                // it must never substitute a current pose for the rendered one.
+                if(source && source.pose) {
+                    static std::atomic<uint64_t> labelledPoseMisses{};
+                    const auto miss=++labelledPoseMisses;
+                    if(miss<=12 || miss%600==0) {
+                        Log("[PAIRED-POSE-MISS] serial=%llu eye=%u bind=%d reset=%d view=%u/%u origin=%llu/%llu queue=%p/%p pose=%llu write=%llu native=%u known=%d\n",
+                            serial,eye,CyberpunkVR_BindPoseToImage,int(ExternalPoseResetPending()),source.pose.view,view,
+                            source.pose.head.originSerial,GetTrackingOriginSerial(),reinterpret_cast<void*>(source.queue),static_cast<void*>(m_d3dQueue),
+                            source.pose.poseId,source.pose.writeId,source.pose.renderFrameId,int(source.pose.hasRenderFrameId));
+                        // The SL API transfers a reference even for an unchanged
+                        // interface. Inspect aliases without changing admission.
+                        void* sourceNative{};void* captureNative{};
+                        const auto sourceResult=QueryNativeQueueForDiagnostic(reinterpret_cast<void*>(source.queue),&sourceNative);
+                        const auto captureResult=QueryNativeQueueForDiagnostic(m_d3dQueue,&captureNative);
+                        Microsoft::WRL::ComPtr<IUnknown> sourceOwner,captureOwner;
+                        if(sourceResult==0&&sourceNative)sourceOwner.Attach(static_cast<IUnknown*>(sourceNative));
+                        if(captureResult==0&&captureNative)captureOwner.Attach(static_cast<IUnknown*>(captureNative));
+                        Log("[PAIRED-QUEUE-IDENTITY] serial=%llu source=%p result=%d native=%p capture=%p result=%d native=%p\n",
+                            serial,reinterpret_cast<void*>(source.queue),sourceResult,sourceNative,
+                            static_cast<void*>(m_d3dQueue),captureResult,captureNative);
+                    }
+                }
                 CVR_DIAGNOSTIC(CyberpunkVR_PoseIdCaptureMiss[view-1].fetch_add(1,std::memory_order_relaxed));
                 CVR_DIAGNOSTIC(CyberpunkVR_PoseIdLastCapture[eye].store(0,std::memory_order_relaxed));
                 CVR_DIAGNOSTIC(CyberpunkVR_PoseIdImageGeneration[eye].store(0,std::memory_order_relaxed));
             }
         }
+        if(publishMainSourceOnly && !nativeStamp.eyes[publishedMainEye].mainEyeSource) {
+            // The ordinary image-pose/queue/origin checks below must have
+            // produced the receipt too; a valid latch alone is insufficient.
+            snapshot->Release();return captureFailed(CaptureReason::NativeStampMissing);
+        }
+        if(publishMainSourceOnly)captureDiagnostic.receiptFlags|=16u;
         m_d3dQueue->ExecuteCommandLists(1,cmdLists);
         ++m_captureFenceValue;
-        if (SUCCEEDED(m_d3dQueue->Signal(m_captureFence,m_captureFenceValue)))
+        const HRESULT captureSignal=m_d3dQueue->Signal(m_captureFence,m_captureFenceValue);
+        m_captureContextFences.Executed(m_captureAllocatorIndex,m_captureFenceValue,SUCCEEDED(captureSignal));
+        m_mainPoolProducer.Executed(m_captureFence,m_captureFenceValue,SUCCEEDED(captureSignal));
+        captureDiagnostic.captureFenceValue=m_captureFenceValue;
+        captureDiagnostic.producerUnknown=m_mainPoolProducer.unknown?1:0;
+        if(FAILED(captureSignal))CyberpunkVR_AerCaptureDebug.Count(CaptureReason::SignalFailed);
+        LARGE_INTEGER captureQpc{};
+        if(SUCCEEDED(captureSignal))QueryPerformanceCounter(&captureQpc);
+        static const int64_t captureQpcFrequency=[] {
+            LARGE_INTEGER frequency{};return QueryPerformanceFrequency(&frequency) ? frequency.QuadPart : int64_t{};
+        }();
+        captureCompletion=cvr::framegen::CaptureCompletion::AfterSignal(
+            m_captureFence,m_captureFenceValue,captureSignal,captureQpc,captureQpcFrequency);
+        if(nativeColor && (serial%300==1 || (mainSourceReceipt.sourceId>=800 && mainSourceReceipt.sourceId<=803)))
+            Log("[NATIVE-COLOR-SOURCE] serial=%llu source=%lld eye=%u native=%p window=%p size=%llux%u state=%u fence=%llu signal=%08X\n",
+                static_cast<unsigned long long>(serial),static_cast<long long>(mainSourceReceipt.sourceId),
+                unsigned(mainSourceReceipt.physicalEye),backBuffer,reinterpret_cast<void*>(nativeColor->window),
+                static_cast<unsigned long long>(sourceDesc.Width),sourceDesc.Height,unsigned(sourceState),
+                static_cast<unsigned long long>(m_captureFenceValue),unsigned(captureSignal));
+        if (SUCCEEDED(captureSignal))
             cvr::gpu::profile::Submitted(gpuProfile, m_d3dQueue, m_captureFence, m_captureFenceValue);
     }
 
+    if(!publishMainSourceOnly&&vrcamEyeCaptured){
+        if(const auto time=SampleCameraApplicationTime(GetTrackingOriginSerial())){
+            nativeStamp.renderPublicationTimeNs=time->xrTime;nativeStamp.publicationClockGeneration=time->clockGeneration;}
+    }
     {
         std::lock_guard<std::mutex> lock(m_presentMutex);
         // Publish the buffer we just filled as the current frame. This is the hand-off:
@@ -1238,6 +1948,9 @@ bool OpenXRManager::CaptureMonoPresentedFrame(ID3D12Resource* backBuffer, const 
         m_monoCapturedFrame.texture = snapshot;
         if (m_monoCapturedFrame.texture == snapshot) {
             m_monoCapturedFrame.serial = serial;
+            m_monoCapturedFrame.colorCompletion = captureCompletion;
+        nativeStamp.resourceEpoch=m_captureResourceEpoch;
+            m_monoCapturedFrame.nativeStamp=nativeStamp;
             m_monoCapturedFrame.captureMs = XrDiagNowMs();
             CVR_DIAGNOSTIC(CyberpunkVR_DebugCapOk.fetch_add(1, std::memory_order_relaxed));
             for (int eye = 0; eye < 2; ++eye) {
@@ -1245,9 +1958,34 @@ bool OpenXRManager::CaptureMonoPresentedFrame(ID3D12Resource* backBuffer, const 
                 m_monoCapturedFrame.poseIds[eye]=capturedPoseIds[eye];
                 m_monoCapturedFrame.imageGenerations[eye]=capturedImageGenerations[eye];
                 m_monoCapturedFrame.framegenInputs[eye]=capturedInputs[eye];
+                m_monoCapturedFrame.projections[eye]=capturedProjections[eye];
                 m_monoCapturedFrame.fovs[eye] = fovs[eye];
-                m_monoCapturedFrame.hasView[eye] = hasView[eye];
+                m_monoCapturedFrame.hasView[eye] = hasView[eye] &&
+                    (!publishMainSourceOnly || static_cast<uint32_t>(eye)==publishedMainEye);
             }
+            // Catalogue entries retain CPU camera/identity metadata, never a
+            // four-slot Inputs Record. Ordered entries reserve their physical
+            // cell until the completed publication transfers to a ReadLease.
+            if(publishMainSourceOnly && captureCompletion.HasScheduledCopySource() &&
+               m_monoSubmitEnabled.load(std::memory_order_relaxed)) {
+                const auto eye=publishedMainEye;
+                cvr::framegen::Frame publication;
+                publication.color[eye]=snapshot;publication.engineView[eye]=1;
+                publication.pose[eye]=capturedPoses[eye];publication.fov[eye]=fovs[eye];
+                publication.identity.serial=serial;
+                publication.identity.origin=nativeStamp.eyes[eye].spaceEpoch;
+                publication.identity.pose[eye]=capturedPoseIds[eye];
+                publication.identity.nativeFrame=nativeStamp.eyes[eye].nativeFrame;
+                publication.identity.capturedMs=m_monoCapturedFrame.captureMs;
+                publication.nativeStamp=nativeStamp;publication.colorCompletion=captureCompletion;
+                publication.projection[eye]=capturedProjections[eye];
+                if(publication.projection[eye])m_mainCaptureCatalogue.Publish(catalogueWrite,nativeStamp.eyes[eye].mainEyeSource,
+                    serial,std::move(publication),capturedImageGenerations[eye]);
+            }
+            // AER reads the immutable projection snapshots above. Full NVIDIA
+            // guides must be reacquired/validated at actual generation input;
+            // keeping this latest alias would unnecessarily pin a guide slot.
+            if(publishMainSourceOnly)for(auto& input:m_monoCapturedFrame.framegenInputs)input.reset();
             SetD3DNamef(m_monoCapturedFrame.texture, L"OpenXR_mono_snapshot_serial%llu",
                 static_cast<unsigned long long>(serial));
             if (depthCaptured) {
@@ -1269,6 +2007,56 @@ bool OpenXRManager::CaptureMonoPresentedFrame(ID3D12Resource* backBuffer, const 
             if(resource)m_captureLeases.EndWrite(resource);
             resource=0;
         }
+        // Both eye labels and write reservations are now committed together.
+        // Emit before releasing the publication lock so a consumer reservation
+        // cannot appear ahead of its source publication in the trace.
+        for(auto& trace:captureProvenance) {
+            ApplyProducerCaptureCompletion(trace,captureCompletion);
+            const auto& stamp=nativeStamp.eyes[trace.logicalEye];
+            trace.contentTimeNs=stamp.contentTimeNs;trace.poseTimeNs=stamp.posePredictionNs;
+            if(stamp.clockGeneration && stamp.contentTimeNs>0)trace.flags|=fgtrace::ContentTimeValid;
+            if(stamp.posePredictionNs>0)trace.flags|=fgtrace::PoseTimeValid;
+            trace.resourceEpoch=nativeStamp.resourceEpoch;
+            if(trace.resourceEpoch)trace.flags|=fgtrace::ResourceEpochKnown;
+            if(!captureCompletion.HasScheduledCopySource())trace.reason=fgtrace::ProducerReason::ColorSignalFailed;
+            fgtrace::RecordProducerTrace(trace);
+        }
+    }
+    if(cvr::framegen::NativeFgStereoRequested()&&!cvr::framegen::GetSettings().aerV2&&!cvr::framegen::CaptureInputsEnabled())
+        cvr::framegen::ClearNativeFgPairedSource();
+    if(cvr::framegen::NativeFgStereoRequested()&&cvr::framegen::CaptureInputsEnabled()&&!cvr::framegen::GetSettings().aerV2&&!m_stopFrameThread.load(std::memory_order_acquire)){
+        const auto scene=cvr::framegen::ReadSourceFrameSystemStatus().scene;
+        auto source=std::make_shared<cvr::framegen::NativeFgPairedSource>();
+        source->gameWorldEpoch=scene.valid&&!scene.paused?scene.worldEpoch:0;
+        source->mainEye=CyberpunkVR_MainIsRightEye?1u:0u;
+        auto& frame=source->frame;frame.nativeStamp=nativeStamp;frame.colorCompletion=captureCompletion;
+        frame.identity.serial=serial;frame.identity.origin=GetTrackingOriginSerial();frame.identity.stereo=true;
+        frame.identity.capturedMs=XrDiagNowMs();frame.identity.nativeFrame=nativeStamp.eyes[0].nativeFrame;
+        frame.identity.inputs=bool(capturedInputs[0])&&bool(capturedInputs[1]);
+        auto lease=std::make_shared<cvr::framegen::ReadLease>();lease->owner=this;
+        lease->release=[](void* owner,ID3D12Resource* resource,uint64_t fence){static_cast<OpenXRManager*>(owner)->ReleaseCapturedRead(resource,fence);};
+        frame.lease=lease;
+        {std::lock_guard lock(m_presentMutex);
+            if(m_monoCapturedFrame.serial==serial&&vrcamEyeCaptured&&m_vrcamEyePoolSerial[m_vrcamEyeSlot]==serial){
+                frame.color[source->mainEye]=snapshot;frame.color[source->mainEye^1]=m_vrcamEyePool[m_vrcamEyeSlot];
+                for(unsigned eye=0;eye<2;++eye)if(frame.color[eye]&&m_captureLeases.Pin(uintptr_t(frame.color[eye]))){
+                    lease->resources[eye]=frame.color[eye];frame.color[eye]->AddRef();}
+            }
+        }
+        for(unsigned eye=0;eye<2;++eye){frame.engineView[eye]=nativeStamp.eyes[eye].engineView;
+            frame.pose[eye]=capturedPoses[eye];frame.fov[eye]=fovs[eye];frame.identity.pose[eye]=capturedPoseIds[eye];frame.inputs[eye]=capturedInputs[eye];
+            frame.projection[eye]=capturedProjections[eye];
+            if(frame.projection[eye]){
+                frame.identity.reset|=frame.projection[eye]->reset;
+                if(frame.color[eye]){const auto d=frame.color[eye]->GetDesc();cvr::framegen::AerRealGeometry geometry;
+                    geometry.width=uint32_t(d.Width);geometry.height=d.Height;
+                    if(cvr::framegen::AerRealPresenter::ResolveCapturedGeometry(frame.projection[eye]->constants,nativeStamp.eyes[eye].referenceOptics,eye,geometry))
+                        frame.fov[eye]=geometry.renderedFov;
+                    else frame.identity.inputs=false;}
+            }
+        }
+        if(cvr::framegen::ValidNativeFgPairedSource(*source))cvr::framegen::PublishNativeFgPairedSource(std::move(source));
+        else cvr::framegen::ClearNativeFgPairedSource();
     }
     if (m_monoPresentEvent) {
         SetEvent(m_monoPresentEvent);
@@ -1277,6 +2065,7 @@ bool OpenXRManager::CaptureMonoPresentedFrame(ID3D12Resource* backBuffer, const 
     if(cvr::framegen::MetricsEnabled())cvr::framegen::OnRealFrame(serial,cvr::framegen::NowMs());
 
     snapshot->Release();
+    CyberpunkVR_AerCaptureDebug.Record(CaptureReason::Published,captureDiagnostic);
     if (g_verboseLog && (serial % 300) == 1) {
         Log("OpenXRManager: Mono frame captured. serial=%llu\n",
             static_cast<unsigned long long>(serial));
@@ -1291,19 +2080,39 @@ bool OpenXRManager::EnsureMonoSubmitResources() {
     if (!m_d3dDevice || !m_d3dQueue || m_session == XR_NULL_HANDLE) {
         return false;
     }
+    // No CPU wait. Pending reads are collected, while an unknown Signal/device
+    // removal stops further recording/execution instead of growing retirement.
+    if(!PollSubmitResources(false))return false;
 
     uint32_t width = 0;
     uint32_t height = 0;
     uint32_t format = 0;
+    cvr::ppd::ReferenceOptics sourceOptics;
+    const bool referenceOutput=cvr::framegen::GetSettings().aerV2 || CyberpunkVR_StereoSubmit;
     {
         std::lock_guard<std::mutex> lock(m_presentMutex);
         width = m_lastPresentedWidth;
         height = m_lastPresentedHeight;
         format = m_lastPresentedFormat;
+        if(referenceOutput&&m_monoCapturedFrame.texture){
+            const auto desc=m_monoCapturedFrame.texture->GetDesc();
+            if(desc.Width==width&&desc.Height==height&&m_monoCapturedFrame.nativeStamp.resourceEpoch==m_captureResourceEpoch)
+                for(const auto& stamp:m_monoCapturedFrame.nativeStamp.eyes)
+                    if(stamp.nativeFrameKnown&&stamp.referenceOptics.valid)sourceOptics=stamp.referenceOptics;
+        }
     }
 
     if (width == 0 || height == 0 || format == 0) {
         return false;
+    }
+    std::array<uint32_t,2> eyeWidths{width,width},eyeHeights{height,height};
+    if(referenceOutput&&sourceOptics.valid){
+        const auto fit=cvr::ppd::CalibrateReferenceOptics(width,height,sourceOptics);
+        for(unsigned eye=0;eye<2;++eye){
+            const auto rect=cvr::ppd::ReferenceEyeCrop(width,height,fit,sourceOptics.applied[eye]);
+            if(rect[2]<=rect[0]||rect[3]<=rect[1])return false;
+            eyeWidths[eye]=uint32_t(rect[2]-rect[0]);eyeHeights[eye]=uint32_t(rect[3]-rect[1]);
+        }
     }
 
     uint32_t runtimeFormatCount = 0;
@@ -1320,10 +2129,13 @@ bool OpenXRManager::EnsureMonoSubmitResources() {
         return false;
     }
 
-    const int64_t selectedFormat = PickMonoSwapchainFormat(
-        runtimeFormats,
-        static_cast<int64_t>(format),
-        IsRuntimeVirtualDesktop());
+    const auto formatSelection = cvr::openxr::PickSwapchainFormat(
+        runtimeFormats, static_cast<DXGI_FORMAT>(format));
+    if (formatSelection.format == DXGI_FORMAT_UNKNOWN) {
+        Log("OpenXRManager: no compatible sRGB or UNORM swapchain format for source=%u\n", format);
+        return false;
+    }
+    const int64_t selectedFormat = static_cast<int64_t>(formatSelection.format);
 
     // Pick a runtime-supported depth format ONLY AFTER the game's scene depth resource
     // has been pinned. This remains intentionally conservative: only the R32-family
@@ -1404,9 +2216,11 @@ bool OpenXRManager::EnsureMonoSubmitResources() {
         (!m_eyeSwapchains.empty() &&
          m_eyeSwapchains[0].depthHandle != XR_NULL_HANDLE &&
          (m_eyeSwapchains.size() < 2 || m_eyeSwapchains[1].depthHandle != XR_NULL_HANDLE));
-    const bool colorResourcesReady = !m_eyeSwapchains.empty() &&
-        m_eyeSwapchains[0].width == static_cast<int32_t>(width) &&
-        m_eyeSwapchains[0].height == static_cast<int32_t>(height) &&
+    const bool eyeSizesMatch=m_eyeSwapchains.size()==2&&
+        m_eyeSwapchains[0].width==int32_t(eyeWidths[0])&&m_eyeSwapchains[0].height==int32_t(eyeHeights[0])&&
+        m_eyeSwapchains[1].width==int32_t(eyeWidths[1])&&m_eyeSwapchains[1].height==int32_t(eyeHeights[1]);
+    const bool colorResourcesReady = eyeSizesMatch &&
+        m_eyeViewFmt.load(std::memory_order_acquire) == static_cast<uint32_t>(selectedFormat) &&
         m_cmdAllocators[0] && m_cmdLists[0] && m_fence && m_fenceEvent;
     if (colorResourcesReady && (!wantDepthSwapchains || haveDepthSwapchains)) {
         return true;
@@ -1453,6 +2267,20 @@ bool OpenXRManager::EnsureMonoSubmitResources() {
         return true;
     }
 
+    // xrDestroySwapchain requires every submitted app graphics command using
+    // its images to have completed. Defer resize without blocking either queue.
+    // The conversion pass also replaces descriptor heaps/PSO on resize.
+    if(!PollSubmitResources(true))return false;
+    m_worldFrameReplay.Invalidate();
+    if (formatSelection.decodeSrgbToLinear) {
+        if (!m_srgbToLinearPass) m_srgbToLinearPass = std::make_unique<SrgbToLinearPass>();
+        if (!m_srgbToLinearPass->EnsureInitialized(m_d3dDevice, formatSelection.format, width, height)) {
+            Log("OpenXRManager: failed to initialize sRGB-to-linear UNORM fallback\n");
+            return false;
+        }
+    }
+    m_decodeSrgbForUnormSwapchain = formatSelection.decodeSrgbToLinear;
+
     for (auto& eye : m_eyeSwapchains) {
         if (eye.handle != XR_NULL_HANDLE) {
             xrDestroySwapchain(eye.handle);
@@ -1474,9 +2302,10 @@ bool OpenXRManager::EnsureMonoSubmitResources() {
         CloseHandle(m_fenceEvent);
         m_fenceEvent = nullptr;
     }
-    if (m_fence) {
-        m_fence->Release();
-        m_fence = nullptr;
+    {
+        std::lock_guard lock(m_presentMutex);
+        if(!m_submitFenceRetirement.RetireFence(m_fenceValue))return false;
+        if (m_fence) {m_fence->Release();m_fence = nullptr;}
     }
     for (int i = 0; i < 3; ++i) {
         if (m_cmdLists[i]) {
@@ -1496,8 +2325,8 @@ bool OpenXRManager::EnsureMonoSubmitResources() {
         swapchainInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
         swapchainInfo.format = selectedFormat;
         swapchainInfo.sampleCount = 1;
-        swapchainInfo.width = static_cast<int32_t>(width);
-        swapchainInfo.height = static_cast<int32_t>(height);
+        swapchainInfo.width = static_cast<int32_t>(eye<2?eyeWidths[eye]:width);
+        swapchainInfo.height = static_cast<int32_t>(eye<2?eyeHeights[eye]:height);
         swapchainInfo.faceCount = 1;
         swapchainInfo.arraySize = 1;
         swapchainInfo.mipCount = 1;
@@ -1550,8 +2379,8 @@ bool OpenXRManager::EnsureMonoSubmitResources() {
             depthInfo.usageFlags = XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
             depthInfo.format = selectedDepthFormat;
             depthInfo.sampleCount = 1;
-            depthInfo.width = static_cast<int32_t>(width);
-            depthInfo.height = static_cast<int32_t>(height);
+            depthInfo.width = m_eyeSwapchains[eye].width;
+            depthInfo.height = m_eyeSwapchains[eye].height;
             depthInfo.faceCount = 1;
             depthInfo.arraySize = 1;
             depthInfo.mipCount = 1;
@@ -1575,7 +2404,9 @@ bool OpenXRManager::EnsureMonoSubmitResources() {
     m_depthSwapchainFormat = selectedDepthFormat;
 
     char formatSummary[512] = {};
-    int summaryPos = sprintf_s(formatSummary, "OpenXRManager: Mono swapchain formats. game=%u selected=%lld runtime:", format, selectedFormat);
+    int summaryPos = sprintf_s(formatSummary,
+        "OpenXRManager: Mono swapchain formats. game=%u selected=%lld srgbDecode=%d runtime:",
+        format, selectedFormat, formatSelection.decodeSrgbToLinear ? 1 : 0);
     if (summaryPos > 0) {
         for (uint32_t i = 0; i < runtimeFormatCount && summaryPos > 0 && summaryPos < static_cast<int>(sizeof(formatSummary) - 32); ++i) {
             summaryPos += sprintf_s(formatSummary + summaryPos, sizeof(formatSummary) - summaryPos, " %lld", runtimeFormats[i]);
@@ -1599,10 +2430,9 @@ bool OpenXRManager::EnsureMonoSubmitResources() {
         m_cmdLists[i]->Close();
     }
 
-    if (FAILED(m_d3dDevice->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_fence)))) {
-        Log("OpenXRManager: Failed to create mono fence\n");
-        return false;
-    }
+    // Old resources were drained above; all three allocators/lists here are new.
+    m_submitAllocatorFences.fill(0);
+    if(!CreateSubmitFence())return false;
     SetD3DName(m_fence, L"OpenXR_submit_fence");
     m_fenceEvent = CreateEventA(nullptr, FALSE, FALSE, nullptr);
     if (!m_fenceEvent) {

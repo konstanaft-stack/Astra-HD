@@ -1,9 +1,11 @@
 #include "Overlay/VrWidgets.hpp"
+#include "Overlay/LiveControlsUi.hpp"
 #include <imgui_internal.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace overlay::widgets {
@@ -157,14 +159,14 @@ void Tabs(const char* id,int& selected,const char* const* labels,int count) {
     }
     ImGui::PopID();ImGui::Spacing();
 }
-void DrawBindings() {
+void DrawBindings(const LiveControlsUiState& state) {
     struct Binding { const char* input;const char* action; };
     auto group=[](const char* title,const Binding* rows,int count) {
         Section(title);
         ImGui::PushStyleVar(ImGuiStyleVar_CellPadding,ImVec2(12,12));
         if(ImGui::BeginTable(title,2,ImGuiTableFlags_SizingStretchProp|ImGuiTableFlags_BordersInnerH)) {
-            ImGui::TableSetupColumn("INPUT",ImGuiTableColumnFlags_WidthStretch,.36f);
-            ImGui::TableSetupColumn("ACTION",ImGuiTableColumnFlags_WidthStretch,.64f);
+            ImGui::TableSetupColumn("ВВОД",ImGuiTableColumnFlags_WidthStretch,.36f);
+            ImGui::TableSetupColumn("ДЕЙСТВИЕ",ImGuiTableColumnFlags_WidthStretch,.64f);
             for(int i=0;i<count;++i) {
                 ImGui::TableNextRow(0,44);ImGui::TableNextColumn();
                 ImGui::PushStyleColor(ImGuiCol_Text,Cyan);ImGui::TextWrapped("%s",rows[i].input);ImGui::PopStyleColor();
@@ -174,62 +176,120 @@ void DrawBindings() {
         }
         ImGui::PopStyleVar();
     };
-    ImGui::TextWrapped("VR shortcuts and default game actions. Button names follow the Touch / Xbox convention; game actions use your controller bindings.");
+    const int configuredMode=std::clamp(state.xrChordActivation,0,2);
+    const bool extras=state.xrExtraChordActions!=0;
+    const int effectiveMode=(configuredMode==2 && !state.xrRightThumbrestAvailable)?0:configuredMode;
+    const char* modifier=effectiveMode==0?"L3":effectiveMode==1?"R3":"ПРАВАЯ ПЛОЩАДКА ДЛЯ ПАЛЬЦА";
+    const char* dpadStick=effectiveMode==0?"ПРАВЫЙ СТИК":"ЛЕВЫЙ СТИК";
+    const char* recenterButton=effectiveMode==0?"A":"X";
+    const char* overlayButton=effectiveMode==0?"B":"Y";
+    char dpadInput[96]{},backInput[96]{},releaseInput[96]{},releaseAction[128]{};
+    char recenterInput[96]{},overlayInput[96]{},cyberwareInput[96]{};
+    std::snprintf(dpadInput,sizeof(dpadInput),"%s + %s",modifier,dpadStick);
+    std::snprintf(backInput,sizeof(backInput),"%s + ЛЕВАЯ КНОПКА МЕНЮ",modifier);
+    std::snprintf(recenterInput,sizeof(recenterInput),"%s + %s",modifier,recenterButton);
+    std::snprintf(overlayInput,sizeof(overlayInput),"%s + %s",modifier,overlayButton);
+    std::snprintf(cyberwareInput,sizeof(cyberwareInput),"%s + ЛЕВАЯ КНОПКА ЗАХВАТА",modifier);
+
+    ImGui::TextWrapped("Сочетания кнопок VR и стандартные игровые действия. Названия кнопок соответствуют Touch / Xbox; игровые действия зависят от ваших назначений кнопок контроллера.");
     static const Binding foot[]{
-        {"LEFT STICK","Move. Hold fully forward for 0.2 seconds to sprint."},
-        {"RIGHT STICK  Left / right","Turn. Uses your snap-turn setting."},
-        {"RIGHT STICK  Full up","Dash / dodge once per push."},
-        {"RIGHT STICK  Full down","Crouch."},
-        {"RIGHT STICK  Press","Rack the weapon / release the slide."},
-        {"A  Right controller","Jump."},
-        {"B  Right controller","With a weapon: release the magazine. Holstered: Back / close."},
-        {"X  Left controller","Interact / reload."},
-        {"Y  Left controller","Switch weapon."},
-        {"RIGHT TRIGGER","Fire."},
-        {"LEFT TRIGGER","Aim / block in melee."},
-        {"RIGHT GRIP  At a holster","Equip or holster the weapon at the reached slot."},
-        {"LEFT GRIP","Grab the magazine during a reload."},
-        {"LEFT GRIP  Near left ear","Toggle the scanner. Squeeze again to close it."},
-        {"L3 + LEFT GRIP  Hold 0.5 seconds","Activate cyberware once. Release both to use again."},
-        {"LEFT MENU BUTTON","Open the game's pause menu."}
+        {"ЛЕВЫЙ СТИК","Движение. Для бега удерживайте стик до упора вперёд 0,2 секунды."},
+        {"ПРАВЫЙ СТИК  Влево / вправо","Поворот с учётом настройки ступенчатого поворота."},
+        {"ПРАВЫЙ СТИК  До упора вверх","Рывок / уклонение один раз за отклонение стика."},
+        {"ПРАВЫЙ СТИК  До упора вниз","Присесть."},
+        {"ПРАВЫЙ СТИК  Нажать","Передёрнуть затвор / снять с затворной задержки."},
+        {"A  Правый контроллер","Прыжок."},
+        {"B  Правый контроллер","С оружием в руке: извлечь магазин. С убранным оружием: назад / закрыть."},
+        {"X  Левый контроллер","Взаимодействие / перезарядка."},
+        {"Y  Левый контроллер","Сменить оружие."},
+        {"ПРАВЫЙ КУРОК","Стрельба."},
+        {"ЛЕВЫЙ КУРОК","Прицелиться / блок в ближнем бою."},
+        {"ПРАВАЯ КНОПКА ЗАХВАТА  У кобуры","Взять или убрать оружие в слот, к которому поднесена рука."},
+        {"ЛЕВАЯ КНОПКА ЗАХВАТА","Взять магазин во время перезарядки."},
+        {"ЛЕВАЯ КНОПКА ЗАХВАТА  У левого уха","Включить сканер. Нажмите ещё раз, чтобы закрыть его."},
+        {"ЛЕВАЯ КНОПКА МЕНЮ","Открыть меню паузы игры."}
     };
-    group("ON FOOT",foot,IM_ARRAYSIZE(foot));
+    Binding footClassic[]{
+        {"ЛЕВЫЙ СТИК",state.xrClassicDisableLsSprint?"Движение. Включение бега отклонением стика до упора вперёд отключено.":"Движение. Для бега удерживайте стик до упора вперёд 0,2 секунды."},
+        {"ПРАВЫЙ СТИК  Влево / вправо","Поворот с учётом настройки ступенчатого поворота."},
+        {"ПРАВЫЙ СТИК  Вверх / вниз",state.xrClassicDisableRsDashCrouch?"Обычный ввод по вертикальной оси правого стика; жесты рывка и приседания отключены.":"Обычный ввод по вертикальной оси правого стика; до упора вверх - рывок / уклонение, до упора вниз - присесть."},
+        {"A / B / X / Y","Обычные назначения лицевых кнопок Xbox."},
+        {"НАЖАТИЕ ЛЕВОГО / ПРАВОГО СТИКА","Обычные назначения L3 / R3 на Xbox."},
+        {"ЛЕВЫЙ / ПРАВЫЙ КУРОК","Обычные назначения LT / RT на Xbox."},
+        {"ЛЕВАЯ / ПРАВАЯ КНОПКА ЗАХВАТА","LB / RB, если эту кнопку захвата не использует текущее взаимодействие в VR."},
+        {"ПРАВАЯ КНОПКА ЗАХВАТА  У кобуры","Взять или убрать оружие, к которому поднесена рука; это нажатие заменяет RB."},
+        {"ЛЕВАЯ КНОПКА ЗАХВАТА  У левого уха","Включить сканер. Нажмите ещё раз, чтобы закрыть его."},
+        {"ЛЕВАЯ КНОПКА МЕНЮ","Открыть меню паузы игры."}
+    };
+    if(state.xrClassicOnFootControls) group("ПЕШКОМ",footClassic,IM_ARRAYSIZE(footClassic));
+    else group("ПЕШКОМ",foot,IM_ARRAYSIZE(foot));
     static const Binding swimming[]{
-        {"BOTH HANDS  Reach, sweep out, pull back","Swim in the direction you look. Movement starts during the pull; gentle strokes swim normally and fast strokes boost."},
-        {"BOTH HANDS  Raise, then push down","Swim upward."},
-        {"LEFT STICK  Back","Cancel gesture propulsion. Stick movement takes priority."}
+        {"ОБЕ РУКИ  Вытянуть, развести, подтянуть","Плыть в направлении взгляда. Движение начинается при подтягивании рук; плавные гребки дают обычную скорость, быстрые - ускорение."},
+        {"ОБЕ РУКИ  Поднять, затем опустить","Плыть вверх."},
+        {"ЛЕВЫЙ СТИК  Назад","Отменить движение гребками. Движение стиком имеет приоритет."}
     };
-    group("SWIMMING",swimming,IM_ARRAYSIZE(swimming));
+    group("ПЛАВАНИЕ",swimming,IM_ARRAYSIZE(swimming));
     static const Binding scanner[]{
-        {"LEFT STICK  Full up / down","Page through quickhacks. Partial movement still walks."},
-        {"X  Left controller","Apply the selected quickhack."},
-        {"RIGHT TRIGGER","Tag the target while scanning."},
-        {"RIGHT STICK  Press","Change scanner tab."},
-        {"LEFT TRIGGER + RIGHT STICK","Adjust scanner zoom."}
+        {"ЛЕВЫЙ СТИК  До упора вверх / вниз","Листать быстрые взломы. Неполное отклонение стика по-прежнему отвечает за ходьбу."},
+        {"X  Левый контроллер","Применить выбранный быстрый взлом."},
+        {"ПРАВЫЙ КУРОК","Отметить цель при сканировании."},
+        {"ПРАВЫЙ СТИК  Нажать","Сменить вкладку сканера."},
+        {"ЛЕВЫЙ КУРОК + ПРАВЫЙ СТИК","Настроить увеличение сканера."}
     };
-    group("SCANNER",scanner,IM_ARRAYSIZE(scanner));
-    static const Binding dpad[]{
-        {"Hold LEFT STICK press + RIGHT STICK","Push the right stick fully up, down, left or right to send that D-pad direction."},
-        {"Release without a direction","Send the normal left-stick press (L3)."}
+    static const Binding scannerClassic[]{
+        {"РУКА У ЛЕВОГО УХА + ЛЕВАЯ КНОПКА ЗАХВАТА","Включить / выключить сканер; пока он включён, LB остаётся нажатой программно."},
+        {"СТИКИ / ЛИЦЕВЫЕ КНОПКИ","Обычные назначения Xbox при включённом сканере."},
+        {"ЛЕВЫЙ / ПРАВЫЙ КУРОК","Обычные назначения LT / RT на Xbox."},
+        {"ЛЕВАЯ / ПРАВАЯ КНОПКА ЗАХВАТА","LB / RB, если эту кнопку захвата не использует текущее взаимодействие в VR."}
     };
-    group("D-PAD SHORTCUT",dpad,IM_ARRAYSIZE(dpad));
+    if(state.xrClassicScannerControls) group("СКАНЕР",scannerClassic,IM_ARRAYSIZE(scannerClassic));
+    else group("СКАНЕР",scanner,IM_ARRAYSIZE(scanner));
+    Binding dpad[3]{
+        {dpadInput,"Удерживая кнопку-модификатор, сначала верните стик в центр, затем отклоните до упора вверх, вниз, влево или вправо, чтобы нажать соответствующее направление крестовины."},
+        {backInput,"Передать Back / Select вместо Start."},
+        {nullptr,nullptr}
+    };
+    int dpadCount=2;
+    if(effectiveMode<2){
+        std::snprintf(releaseInput,sizeof(releaseInput),"Отпустить %s без сочетания",modifier);
+        std::snprintf(releaseAction,sizeof(releaseAction),"Обычное действие нажатия стика %s.",modifier);
+        dpad[dpadCount++]={releaseInput,releaseAction};
+    }
+    group("СОЧЕТАНИЯ КНОПОК",dpad,dpadCount);
+
+    const char* disabled="Недоступно, пока выключены «Дополнительные сочетания».";
+    Binding extra[]{
+        {recenterInput,extras?"Сбросить центр отслеживания VR.":disabled},
+        {overlayInput,extras?"Открыть или закрыть панель настроек VR.":disabled},
+        {cyberwareInput,extras?"Активировать культовый имплант один раз за нажатие кнопки захвата; ограничения игровой ситуации и время восстановления сохраняются.":disabled}
+    };
+    group("ДОПОЛНИТЕЛЬНЫЕ СОЧЕТАНИЯ",extra,IM_ARRAYSIZE(extra));
     static const Binding driving[]{
-        {"Hold X  Left controller","Exit the vehicle."},
-        {"A  Right controller","Confirm a dialogue choice. The normal handbrake action remains available."},
-        {"LEFT / RIGHT TRIGGER","Brake / throttle."},
-        {"GRIP  At the wheel","Grab the wheel or handlebars with that hand. Release to let go."},
-        {"GAME CAMERA","VR follows the camera chosen by the game, including third-person scenes. Driving and seated-camera options are in DRIVING."}
+        {"Удерживать X  Левый контроллер","Выйти из транспорта."},
+        {"A  Правый контроллер","Подтвердить вариант ответа. Обычное действие ручного тормоза остаётся доступным."},
+        {"ЛЕВЫЙ / ПРАВЫЙ КУРОК","Тормоз / газ."},
+        {"КНОПКА ЗАХВАТА  У руля","Взяться этой рукой за руль. Отпустите кнопку, чтобы отпустить руль."},
+        {"ИГРОВАЯ КАМЕРА","VR следует за выбранной игрой камерой, включая сцены от третьего лица. Настройки вождения и камеры сидя находятся в разделе «ВОЖДЕНИЕ»."}
     };
-    group("DRIVING",driving,IM_ARRAYSIZE(driving));
+    Binding drivingClassic[]{
+        {"A / B / X / Y","Обычные назначения лицевых кнопок Xbox в транспорте; без замены A на X и выхода по удержанию X."},
+        {"ЛЕВЫЙ / ПРАВЫЙ СТИК","Обычные назначения стиков Xbox в транспорте."},
+        {"НАЖАТИЕ ЛЕВОГО / ПРАВОГО СТИКА","Обычные назначения L3 / R3 на Xbox."},
+        {"ЛЕВЫЙ / ПРАВЫЙ КУРОК",state.xrClassicSwapTriggersGrips?"LB / RB.":"Обычные назначения LT / RT на Xbox."},
+        {"ЛЕВАЯ / ПРАВАЯ КНОПКА ЗАХВАТА",state.xrClassicSwapTriggersGrips?"Аналоговые LT / RT для тормоза и газа.":"LB / RB."},
+        {"ЗАХВАТ РУЛЯ","Недоступно при классическом управлении транспортом."},
+        {"ИГРОВАЯ КАМЕРА","VR следует за выбранной игрой камерой, включая сцены от третьего лица. Настройки камеры сидя находятся в разделе «ВОЖДЕНИЕ»."}
+    };
+    if(state.xrClassicVehicleControls) group("ВОЖДЕНИЕ",drivingClassic,IM_ARRAYSIZE(drivingClassic));
+    else group("ВОЖДЕНИЕ",driving,IM_ARRAYSIZE(driving));
     static const Binding overlay[]{
-        {"L3 + R3  Hold 1 second","Open or close this overlay."},
-        {"Point + TRIGGER","Select a control."},
-        {"STICK  Up / down","Scroll the pointed panel."},
-        {"GRIP","Drag the panel."},
-        {"GRIP + STICK  Up / down","Move the panel farther away / closer."},
-        {"F10 / INSERT","Toggle the overlay from the keyboard. ESC closes it."}
+        {"Навести + КУРОК","Выбрать элемент."},
+        {"СТИК  Вверх / вниз","Прокрутить панель под указателем."},
+        {"КНОПКА ЗАХВАТА","Перетащить панель."},
+        {"КНОПКА ЗАХВАТА + СТИК  Вверх / вниз","Отдалить / приблизить панель."},
+        {"F10 / INSERT","Открыть / закрыть панель с клавиатуры. ESC закрывает панель."}
     };
-    group("OVERLAY",overlay,IM_ARRAYSIZE(overlay));
-    ImGui::Spacing();ImGui::TextWrapped("Change game actions in Settings > Key Bindings > Controller. VR gesture settings are in CONTROLS and AVATAR.");
+    group("ПАНЕЛЬ",overlay,IM_ARRAYSIZE(overlay));
+    ImGui::Spacing();ImGui::TextWrapped("Назначения игровых действий меняются в «Настройки > Назначение клавиш > Контроллер». Настройки жестов VR находятся в разделах «УПРАВЛЕНИЕ» и «АВАТАР».");
 }
 }

@@ -1,6 +1,9 @@
 #include <MinHook.h>
+#include "MenuPreview/UiConsumer.hpp"
 #include "Hooks/RenderDocBridge.hpp"
+#include "MenuPreview/RenderDocCapture.hpp"
 #include "Hooks/SwapChainInternal.hpp"
+#include "Render/DesktopMirror.hpp"
 #include <thread>
 #include "Hooks/SwapChain.hpp"
 #include "Hooks/Hook.hpp"
@@ -11,9 +14,13 @@
 #include "Render/NativeStereoProbe.hpp"
 #include "Render/StereoGpuProbe.hpp"
 #include "Overlay/ImGuiOverlay.hpp"
+#include "Overlay/PpdNativeApply.hpp"
 #include "Hooks/Ngx.hpp"
 #include "Framegen/Framegen.hpp"
+#include "Framegen/NativeFgReadback.hpp"
+#include "Framegen/NativeFgObservation.hpp"
 #include "Framegen/GpuTimer.hpp"
+#include "Framegen/CpuStageTiming.hpp"
 #include "Camera/ImagePoseIdentity.hpp"
 #include <cstdint>
 #include <cstdio>
@@ -22,6 +29,7 @@
 #include <mutex>
 #include <atomic>
 #include <wrl.h>
+#include <sl_core_types.h>
 
 // Defined in Stereo/CommandListCensus.cpp: hooks the game-facing command-list vtable so the port markers
 // land above a capture layer. Declared here because this is where the game-facing device is in hand.
@@ -45,7 +53,8 @@ extern "C" UINT GetForcedDisplayModeHeight();
 extern "C" UINT GetForcedWindowWidth();
 extern "C" UINT GetForcedWindowHeight();
 extern "C" int GetMenuMode();
-// Nothing in this file may re-derive a size: the swapchain gets the launcher's pick verbatim.
+// Nothing in this file may re-derive a size: use an explicit native request pair,
+// otherwise the launcher's existing pick verbatim.
 // The helper that used to do it is gone entirely -- see HookedResizeBuffers.
 
 
@@ -88,14 +97,60 @@ if (ansiName && ansiName[0] != '\0') {
 return WideToUtf8(wideName, buffer, bufferSize);
 }
 
+void FitRenderSizeInsideBounds(
+        UINT renderWidth, UINT renderHeight, UINT maxWidth, UINT maxHeight,
+        UINT& outWidth, UINT& outHeight) {
+    outWidth = renderWidth;
+    outHeight = renderHeight;
+    if (!renderWidth || !renderHeight || !maxWidth || !maxHeight) return;
+    if (renderWidth <= maxWidth && renderHeight <= maxHeight) return;
+
+    // Keep the desktop client at the render aspect. DXGI_SCALING_STRETCH is used for the
+    // windowed swapchain, so independently clamping width/height would visibly distort the
+    // mirror whenever the VR render target is taller or wider than the monitor.
+    if (static_cast<uint64_t>(renderWidth) * maxHeight >
+        static_cast<uint64_t>(renderHeight) * maxWidth) {
+        outWidth = maxWidth;
+        outHeight = static_cast<UINT>((static_cast<uint64_t>(renderHeight) * maxWidth + renderWidth / 2) / renderWidth);
+    } else {
+        outHeight = maxHeight;
+        outWidth = static_cast<UINT>((static_cast<uint64_t>(renderWidth) * maxHeight + renderHeight / 2) / renderHeight);
+    }
+}
+
 namespace {
 using PresentFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
+extern "C" void CyberpunkVR_ColorPathAuditPoll();
 using EnumOutputsFn = HRESULT(STDMETHODCALLTYPE*)(IDXGIAdapter*, UINT, IDXGIOutput**);
 using GetDisplayModeListFn = HRESULT(STDMETHODCALLTYPE*)(IDXGIOutput*, DXGI_FORMAT, UINT, UINT*, DXGI_MODE_DESC*);
 using GetDisplayModeList1Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGIOutput1*, DXGI_FORMAT, UINT, UINT*, DXGI_MODE_DESC1*);
 using SetFullscreenStateFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, BOOL, IDXGIOutput*);
 using ResizeBuffersFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
 using ResizeBuffers1Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain3*, UINT, UINT, UINT, DXGI_FORMAT, UINT, const UINT*, IUnknown* const*);
+std::atomic<IDXGISwapChain*> g_gameCaptureSwapchain{};
+std::atomic<bool> g_preserveGameFgInput{};
+void UpdateGameColorPolicy(IDXGISwapChain* chain){
+    using Getter=sl::Result(*)(void*,void**);
+    const auto module=GetModuleHandleW(L"sl.interposer.dll");
+    const auto getter=module?reinterpret_cast<Getter>(GetProcAddress(module,"slGetNativeInterface")):nullptr;
+    bool separate=false;
+    Microsoft::WRL::ComPtr<IUnknown> base;
+    Microsoft::WRL::ComPtr<IDXGISwapChain> native;
+    Microsoft::WRL::ComPtr<ID3D12Resource> gameBuffer,displayBuffer;
+    Microsoft::WRL::ComPtr<IUnknown> gameIdentity,displayIdentity;
+    void* pointer{};
+    if(chain&&getter&&getter(chain,&pointer)==sl::Result::eOk&&pointer){
+        base.Attach(static_cast<IUnknown*>(pointer));
+        if(SUCCEEDED(base.As(&native))&&native.Get()!=chain&&
+           SUCCEEDED(chain->GetBuffer(0,IID_PPV_ARGS(&gameBuffer)))&&
+           SUCCEEDED(native->GetBuffer(0,IID_PPV_ARGS(&displayBuffer)))&&
+           SUCCEEDED(gameBuffer.As(&gameIdentity))&&SUCCEEDED(displayBuffer.As(&displayIdentity)))
+            separate=gameIdentity!=displayIdentity;
+    }
+    g_preserveGameFgInput.store(separate,std::memory_order_release);
+    Log("[NATIVE-FG-COLOR-POLICY] chain=%p native=%p gameBuffer=%p displayBuffer=%p preserveInput=%d\n",
+        chain,native.Get(),gameBuffer.Get(),displayBuffer.Get(),int(separate));
+}
 
 
 // [ECL-DIAG] Temporary tearing diagnostic. Hypothesis: the swapchain backbuffer
@@ -130,7 +185,26 @@ static bool IsOurOwnWindow(HWND hwnd) {
     return wcsncmp(cls, L"CyberpunkVR", 11) == 0;
 }
 
+static std::optional<cvr::ppd::NativeSizeRequest> NativeSizeForWindow(HWND window) {
+    const auto request=cvr::ppd::ReadNativeRequestedSize();
+    if(!request || !window || IsOurOwnWindow(window))return {};
+    return request;
+}
+static std::optional<cvr::ppd::NativeSizeRequest> NativeSizeForSwapchain(IDXGISwapChain* swapChain) {
+    const auto request=cvr::ppd::ReadNativeRequestedSize();
+    if(!request || !swapChain)return {};
+    DXGI_SWAP_CHAIN_DESC desc{};
+    if(FAILED(swapChain->GetDesc(&desc)) || !desc.OutputWindow || IsOurOwnWindow(desc.OutputWindow))return {};
+    return request;
+}
+
 HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* swapChain, UINT syncInterval, UINT flags) {
+    // Native FG presents asynchronously through the inner swapchain. Only the
+    // outer game-facing call owns real-source capture and advances the XR loop.
+    if(swapChain!=g_gameCaptureSwapchain.load(std::memory_order_acquire)){
+        auto original=GetOriginalMethod<PresentFn>(*reinterpret_cast<void***>(swapChain),8);
+        return original?original(swapChain,syncInterval,flags):DXGI_ERROR_INVALID_CALL;
+    }
     RememberDredDeviceFromSwapChain(swapChain);
 
     DXGI_SWAP_CHAIN_DESC desc{};
@@ -155,14 +229,18 @@ HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* swapChain, UINT syncInte
         }
     }
 
-    {std::lock_guard submissionLock(cvr::camera::ImageSubmissionMutex());cvr::framegen::FinishGpuFrame();}
-    cvr::framegen::PaceRenderedFrame();
+    namespace cpu=cvr::framegen::cpu_timing;
+    cpu::Scope totalTiming(cpu::Stage::PresentTotal);
+    {cpu::Scope timing(cpu::Stage::PresentFinishGpu);std::lock_guard submissionLock(cvr::camera::ImageSubmissionMutex());cvr::framegen::FinishGpuFrame();}
+    {cpu::Scope timing(cpu::Stage::PresentPace);cvr::framegen::PaceRenderedFrame();}
     cvr::gpu::CollectCommandResources();
     cvr::gpu::profile::Poll();
     cvr::stereo::trace::FrameBoundary();
     cvr::stereo::packets::FrameBoundary();
     cvr::stereo::native_probe::FrameBoundary();
     cvr::stereo::gpu_probe::Poll();
+    CyberpunkVR_ColorPathAuditPoll();
+    cvr::framegen::PollNativeFgReadbacks();
 
     // Bind the overlay to the game's window on first sight.
     //
@@ -216,18 +294,27 @@ HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* swapChain, UINT syncInte
         g_sceneDepthArea.store(0, std::memory_order_relaxed);
     }
 
-    OverlayRender(swapChain);
-    OpenXRManager::Get().OnPresent(swapChain);
+    {cpu::Scope timing(cpu::Stage::PresentOverlay);OverlayRender(swapChain);}
+    {cpu::Scope timing(cpu::Stage::PresentCapture);OpenXRManager::Get().OnPresent(swapChain);
     // Drive one XR frame inline on the Present thread to avoid the old
     // cross-thread submit drift while keeping the rest of the pipeline at HEAD.
     OpenXRManager::Get().PumpInlineFrame();
+    }
     // AFTER the pump, so an inline cycle is complete when its numbers are read and the
     // wait/begin/end totals are allowed to be exactly equal. Once a second; see the definition.
     OpenXRManager::Get().ReportXrFrameRates();
-    OverlayRenderDesktop(swapChain);
+    {cpu::Scope timing(cpu::Stage::PresentOverlay);OverlayRenderDesktop(swapChain);}
+    // OpenXR has already captured the complete MAIN backbuffer. Only now replace the desktop
+    // presentation with a monitor-aspect center crop; the HMD keeps the full vertical image.
+    if (hasDesc && desc.OutputWindow) {
+        cpu::Scope timing(cpu::Stage::PresentMirror);
+        DesktopMirrorRender(swapChain, desc.OutputWindow,g_preserveGameFgInput.load(std::memory_order_acquire));
+    }
     void** vtable = *reinterpret_cast<void***>(swapChain);
     PresentFn originalFn = GetOriginalMethod<PresentFn>(vtable, 8);
-    const HRESULT hr = originalFn ? originalFn(swapChain, syncInterval, flags) : DXGI_ERROR_INVALID_CALL;
+    HRESULT hr;
+    {cpu::Scope timing(cpu::Stage::PresentOriginal);hr=originalFn ? originalFn(swapChain, syncInterval, flags) : DXGI_ERROR_INVALID_CALL;}
+    cvr::framegen::EnsureNativeFgPolicyObservation();
     if (FAILED(hr)) {
         Log("[DRED] Present failure observed. hr=0x%08X removed=%d swapChain=%p\n",
             static_cast<unsigned>(hr),
@@ -273,6 +360,8 @@ HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* swapChain, UINT syncInte
             totalLists ? (100.0 * static_cast<double>(presentLists) / static_cast<double>(totalLists)) : 0.0,
             g_eclDistinctQueues.load(std::memory_order_relaxed));
     }
+    cvr::menu_preview::RenderDocAfterGamePresent(swapChain,hr);
+    totalTiming.Finish();cpu::PresentBoundary();
     return hr;
 }
 
@@ -290,7 +379,8 @@ HRESULT STDMETHODCALLTYPE HookedSetFullscreenState(IDXGISwapChain* swapChain, BO
     return originalFn ? originalFn(swapChain, FALSE, target) : DXGI_ERROR_INVALID_CALL;
 }
 
-// THE LAUNCHER'S SIZE, VERBATIM. Nothing is recomputed here.
+// AN EXPLICIT NATIVE REQUEST, OTHERWISE THE LAUNCHER'S SIZE, VERBATIM.
+// Each callback takes one request snapshot for both dimensions. Nothing is recomputed here.
 //
 // This used to take the width from the launcher and RE-DERIVE the height as
 // launcherWidth / (the runtime's RECOMMENDED render-target aspect), which is not the aspect
@@ -314,8 +404,13 @@ HRESULT STDMETHODCALLTYPE HookedSetFullscreenState(IDXGISwapChain* swapChain, BO
 // Both of the other things that read that aspect -- the DLSS resolution override and the DLSS
 // projection-matrix injection -- were deleted with it, so there is no second path back in.
 HRESULT STDMETHODCALLTYPE HookedResizeBuffers(IDXGISwapChain* swapChain, UINT bufferCount, UINT width, UINT height, DXGI_FORMAT newFormat, UINT flags) {
-    const UINT forcedWidth = GetForcedSwapchainWidth();
-    const UINT forcedHeight = GetForcedSwapchainHeight();
+    if(swapChain!=g_gameCaptureSwapchain.load(std::memory_order_acquire)){
+        auto original=GetOriginalMethod<ResizeBuffersFn>(*reinterpret_cast<void***>(swapChain),13);
+        return original?original(swapChain,bufferCount,width,height,newFormat,flags):DXGI_ERROR_INVALID_CALL;
+    }
+    const auto nativeSize=NativeSizeForSwapchain(swapChain);
+    const UINT forcedWidth = nativeSize ? nativeSize->size.width : GetForcedSwapchainWidth();
+    const UINT forcedHeight = nativeSize ? nativeSize->size.height : GetForcedSwapchainHeight();
 
     const UINT outWidth = forcedWidth != 0 ? forcedWidth : width;
     const UINT outHeight = forcedHeight != 0 ? forcedHeight : height;
@@ -325,18 +420,25 @@ HRESULT STDMETHODCALLTYPE HookedResizeBuffers(IDXGISwapChain* swapChain, UINT bu
 
     void** vtable = *reinterpret_cast<void***>(swapChain);
     ResizeBuffersFn originalFn = GetOriginalMethod<ResizeBuffersFn>(vtable, 13);
+    if(!OpenXRManager::Get().PrepareMenuUiResize())return DXGI_ERROR_WAS_STILL_DRAWING;
     OverlayInvalidateSwapchainResources();
+    DesktopMirrorInvalidate();
     const auto result=originalFn ? originalFn(swapChain,bufferCount,outWidth,outHeight,newFormat,flags) : DXGI_ERROR_INVALID_CALL;
-    if(SUCCEEDED(result))CyberpunkVR_RegisterRtvSwapchain(swapChain);
+    if(SUCCEEDED(result)){CyberpunkVR_RegisterRtvSwapchain(swapChain);UpdateGameColorPolicy(swapChain);}
     return result;
 }
 
-// Same rule as HookedResizeBuffers above, and for the same reasons: the launcher's size, verbatim.
+// Same request-snapshot/author fallback rule as HookedResizeBuffers above.
 // The two must agree -- a swapchain that supports ResizeBuffers1 goes through this one instead, so
 // fixing only the other would leave the bug alive on exactly the runtimes that take this path.
 HRESULT STDMETHODCALLTYPE HookedResizeBuffers1(IDXGISwapChain3* swapChain, UINT bufferCount, UINT width, UINT height, DXGI_FORMAT format, UINT flags, const UINT* creationNodeMask, IUnknown* const* presentQueue) {
-    const UINT forcedWidth = GetForcedSwapchainWidth();
-    const UINT forcedHeight = GetForcedSwapchainHeight();
+    if(swapChain!=g_gameCaptureSwapchain.load(std::memory_order_acquire)){
+        auto original=GetOriginalMethod<ResizeBuffers1Fn>(*reinterpret_cast<void***>(swapChain),39);
+        return original?original(swapChain,bufferCount,width,height,format,flags,creationNodeMask,presentQueue):DXGI_ERROR_INVALID_CALL;
+    }
+    const auto nativeSize=NativeSizeForSwapchain(swapChain);
+    const UINT forcedWidth = nativeSize ? nativeSize->size.width : GetForcedSwapchainWidth();
+    const UINT forcedHeight = nativeSize ? nativeSize->size.height : GetForcedSwapchainHeight();
 
 
     const UINT outWidth = forcedWidth != 0 ? forcedWidth : width;
@@ -347,15 +449,19 @@ HRESULT STDMETHODCALLTYPE HookedResizeBuffers1(IDXGISwapChain3* swapChain, UINT 
 
     void** vtable = *reinterpret_cast<void***>(swapChain);
     ResizeBuffers1Fn originalFn = GetOriginalMethod<ResizeBuffers1Fn>(vtable, 39);
+    if(!OpenXRManager::Get().PrepareMenuUiResize())return DXGI_ERROR_WAS_STILL_DRAWING;
     OverlayInvalidateSwapchainResources();
+    DesktopMirrorInvalidate();
     const auto result=originalFn ? originalFn(swapChain,bufferCount,outWidth,outHeight,format,flags,creationNodeMask,presentQueue) : DXGI_ERROR_INVALID_CALL;
-    if(SUCCEEDED(result))CyberpunkVR_RegisterRtvSwapchain(swapChain);
+    if(SUCCEEDED(result)){CyberpunkVR_RegisterRtvSwapchain(swapChain);UpdateGameColorPolicy(swapChain);}
     return result;
 }
 
 void InstallSwapchainHooks(IDXGISwapChain* swapChain) {
-    CyberpunkVR_RegisterRtvSwapchain(swapChain);
     if (!swapChain) return;
+    g_gameCaptureSwapchain.store(swapChain,std::memory_order_release);
+    CyberpunkVR_RegisterRtvSwapchain(swapChain);
+    UpdateGameColorPolicy(swapChain);
 
     void*** objectVtable = reinterpret_cast<void***>(swapChain);
     if (!objectVtable || !*objectVtable) return;
@@ -430,8 +536,9 @@ HRESULT STDMETHODCALLTYPE DXGIFactoryWrapper::CreateSwapChain(IUnknown* pDevice,
 
     DXGI_SWAP_CHAIN_DESC localDesc{};
     DXGI_SWAP_CHAIN_DESC* swapDesc = pDesc;
-    const UINT forcedWidth = GetForcedDisplayModeWidth();
-    const UINT forcedHeight = GetForcedDisplayModeHeight();
+    const auto nativeSize=NativeSizeForWindow(pDesc ? pDesc->OutputWindow : nullptr);
+    const UINT forcedWidth = nativeSize ? nativeSize->size.width : GetForcedDisplayModeWidth();
+    const UINT forcedHeight = nativeSize ? nativeSize->size.height : GetForcedDisplayModeHeight();
     if (pDesc) {
         localDesc = *pDesc;
         bool changed = false;
@@ -464,6 +571,7 @@ HRESULT STDMETHODCALLTYPE DXGIFactoryWrapper::CreateSwapChain(IUnknown* pDevice,
             RememberDredDevice(d3dDevice);
             OpenXRManager::Get().InitGraphics(d3dDevice, pQueue);
             OverlaySetDeviceAndQueue(d3dDevice, pQueue);
+            DesktopMirrorSetDeviceAndQueue(d3dDevice, pQueue);
             InstallCommandQueueDiagHook(pQueue);
             InstallDepthCaptureHooks(d3dDevice);
             // The device here came from the queue the GAME passed, so it is the game-facing one --
@@ -480,22 +588,27 @@ HRESULT STDMETHODCALLTYPE DXGIFactoryWrapper::CreateSwapChain(IUnknown* pDevice,
     g_gameHwnd = hWnd;
     UINT windowWidth = GetForcedWindowWidth();
     UINT windowHeight = GetForcedWindowHeight();
-    if (windowWidth == forcedWidth) {
+    int windowX = 0;
+    int windowY = 0;
+    bool placeWindow = false;
+    // The desktop window follows its author policy independently of native render size.
+    if (windowWidth == GetForcedDisplayModeWidth()) {
         windowWidth = 0;
     }
     if (windowWidth == 0 && hWnd) {
-        HMONITOR monitor = MonitorFromWindow(hWnd, MONITOR_DEFAULTTOPRIMARY);
-        MONITORINFO mi = { sizeof(MONITORINFO) };
-        if (GetMonitorInfoA(monitor, &mi)) {
-            int monWidth = mi.rcMonitor.right - mi.rcMonitor.left;
-            int monHeight = mi.rcMonitor.bottom - mi.rcMonitor.top;
-            windowWidth = monWidth;
-            windowHeight = monHeight;
+        RECT windowRect{};
+        if (GetDesktopMonitorWindowRect(hWnd, windowRect)) {
+            windowWidth = static_cast<UINT>(windowRect.right - windowRect.left);
+            windowHeight = static_cast<UINT>(windowRect.bottom - windowRect.top);
+            windowX = windowRect.left;
+            windowY = windowRect.top;
+            placeWindow = true;
         }
     }
     if (windowWidth != 0 && windowHeight != 0 && hWnd) {
-        SetWindowPos(hWnd, nullptr, 0, 0, windowWidth, windowHeight, SWP_NOMOVE | SWP_NOZORDER);
-        Log("CreateSwapChain: Capped window size to %ux%u\n", windowWidth, windowHeight);
+        const UINT flags = SWP_NOZORDER | (placeWindow ? 0 : SWP_NOMOVE);
+        SetWindowPos(hWnd, nullptr, windowX, windowY, windowWidth, windowHeight, flags);
+        Log("CreateSwapChain: desktop outer window set to %ux%u\n", windowWidth, windowHeight);
     }
     const HRESULT hr = m_real->CreateSwapChain(pDevice, swapDesc, ppSwapChain);
     if (SUCCEEDED(hr) && ppSwapChain && *ppSwapChain) {
@@ -548,8 +661,11 @@ using FacCreateSwapChainForHwndFn = HRESULT (STDMETHODCALLTYPE*)(
     IDXGIFactory2*, IUnknown*, HWND, const DXGI_SWAP_CHAIN_DESC1*,
     const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGIOutput*, IDXGISwapChain1**);
 
-static FacCreateSwapChainFn        g_origFacCSC = nullptr;
-static FacCreateSwapChainForHwndFn g_origFacCSCFH = nullptr;
+static thread_local unsigned g_factoryCreateDepth{};
+struct FactoryCreateScope {
+    const bool outer=(++g_factoryCreateDepth==1);
+    ~FactoryCreateScope(){--g_factoryCreateDepth;}
+};
 
 // Everything the wrapper did BEFORE handing the call on: one-time early init, then the
 // device/queue wiring taken off the command queue the game is creating the swapchain with.
@@ -574,6 +690,7 @@ static void PluginPreSwapchain(IUnknown* pDevice,HWND hwnd) {
             RememberDredDevice(d3dDevice);
             OpenXRManager::Get().InitGraphics(d3dDevice, pQueue);
             OverlaySetDeviceAndQueue(d3dDevice, pQueue);
+            DesktopMirrorSetDeviceAndQueue(d3dDevice, pQueue);
             InstallCommandQueueDiagHook(pQueue);
             InstallDepthCaptureHooks(d3dDevice);
             // The device here came from the queue the GAME passed, so it is the game-facing one --
@@ -591,26 +708,29 @@ static void PluginPreSwapchain(IUnknown* pDevice,HWND hwnd) {
 static void PluginPostSwapchain(IDXGISwapChain* sc, HWND hwnd) {
     if (!sc || IsOurOwnWindow(hwnd)) return;
 
-    // Cap the WINDOW to the monitor. The swapchain is forced to the VR render size (2560x2560
-    // here), and without this the game sizes its window to match and hangs off the screen --
-    // which is exactly what happened once the proxy stopped doing it. The backbuffer stays at
-    // the forced size; only the window is clamped.
+    // In automatic mode the desktop client follows the current monitor. The backbuffer keeps the
+    // forced VR render size; DesktopMirrorRender applies the monitor-aspect crop before Present.
     if (hwnd) {
         UINT winW = GetForcedWindowWidth();
         UINT winH = GetForcedWindowHeight();
+        int winX = 0;
+        int winY = 0;
+        bool placeWindow = false;
         if (winW == GetForcedDisplayModeWidth()) winW = 0;   // not a real window override
         if (winW == 0) {
-            HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY);
-            MONITORINFO mi = { sizeof(MONITORINFO) };
-            if (GetMonitorInfoA(mon, &mi)) {
-                winW = static_cast<UINT>(mi.rcMonitor.right - mi.rcMonitor.left);
-                winH = static_cast<UINT>(mi.rcMonitor.bottom - mi.rcMonitor.top);
+            RECT windowRect{};
+            if (GetDesktopMonitorWindowRect(hwnd, windowRect)) {
+                winW = static_cast<UINT>(windowRect.right - windowRect.left);
+                winH = static_cast<UINT>(windowRect.bottom - windowRect.top);
+                winX = windowRect.left;
+                winY = windowRect.top;
+                placeWindow = true;
             }
         }
         if (winW && winH) {
-            SetWindowPos(hwnd, nullptr, 0, 0, static_cast<int>(winW), static_cast<int>(winH),
-                         SWP_NOMOVE | SWP_NOZORDER);
-            Log("PluginBootstrap: capped window to %ux%u\n", winW, winH);
+            const UINT flags = SWP_NOZORDER | (placeWindow ? 0 : SWP_NOMOVE);
+            SetWindowPos(hwnd, nullptr, winX, winY, static_cast<int>(winW), static_cast<int>(winH), flags);
+            Log("PluginBootstrap: desktop outer window set to %ux%u\n", winW, winH);
         }
     }
 
@@ -626,12 +746,17 @@ static void PluginPostSwapchain(IDXGISwapChain* sc, HWND hwnd) {
 static HRESULT STDMETHODCALLTYPE Detour_FacCreateSwapChain(
         IDXGIFactory* self, IUnknown* pDevice, DXGI_SWAP_CHAIN_DESC* pDesc,
         IDXGISwapChain** ppSwapChain) {
+    const auto original=GetOriginalMethod<FacCreateSwapChainFn>(*reinterpret_cast<void***>(self),10);
+    if(!original)return DXGI_ERROR_INVALID_CALL;
+    const FactoryCreateScope nesting;
+    if(!nesting.outer)return original(self,pDevice,pDesc,ppSwapChain);
     PluginPreSwapchain(pDevice,pDesc?pDesc->OutputWindow:nullptr);
 
     DXGI_SWAP_CHAIN_DESC local{};
     DXGI_SWAP_CHAIN_DESC* useDesc = pDesc;
-    const UINT fw = GetForcedDisplayModeWidth();
-    const UINT fh = GetForcedDisplayModeHeight();
+    const auto nativeSize=NativeSizeForWindow(pDesc ? pDesc->OutputWindow : nullptr);
+    const UINT fw = nativeSize ? nativeSize->size.width : GetForcedDisplayModeWidth();
+    const UINT fh = nativeSize ? nativeSize->size.height : GetForcedDisplayModeHeight();
     if (pDesc) {
         local = *pDesc;
         bool changed = false;
@@ -645,7 +770,7 @@ static HRESULT STDMETHODCALLTYPE Detour_FacCreateSwapChain(
         if (!local.Windowed) { local.Windowed = TRUE; changed = true; }
         if (changed) useDesc = &local;
     }
-    const HRESULT hr = g_origFacCSC(self, pDevice, useDesc, ppSwapChain);
+    const HRESULT hr = original(self, pDevice, useDesc, ppSwapChain);
     if (SUCCEEDED(hr) && ppSwapChain && *ppSwapChain) {
         PluginPostSwapchain(*ppSwapChain, useDesc ? useDesc->OutputWindow : nullptr);
     }
@@ -656,17 +781,22 @@ static HRESULT STDMETHODCALLTYPE Detour_FacCreateSwapChainForHwnd(
         IDXGIFactory2* self, IUnknown* pDevice, HWND hWnd, const DXGI_SWAP_CHAIN_DESC1* pDesc,
         const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* pFsDesc, IDXGIOutput* pRestrict,
         IDXGISwapChain1** ppSwapChain) {
+    const auto original=GetOriginalMethod<FacCreateSwapChainForHwndFn>(*reinterpret_cast<void***>(self),15);
+    if(!original)return DXGI_ERROR_INVALID_CALL;
+    const FactoryCreateScope nesting;
+    if(!nesting.outer)return original(self,pDevice,hWnd,pDesc,pFsDesc,pRestrict,ppSwapChain);
     // Our own mirror/dummy windows go straight through: they must stay outside every path
     // built around the game's single swapchain.
     if (IsOurOwnWindow(hWnd)) {
-        return g_origFacCSCFH(self, pDevice, hWnd, pDesc, pFsDesc, pRestrict, ppSwapChain);
+        return original(self, pDevice, hWnd, pDesc, pFsDesc, pRestrict, ppSwapChain);
     }
     PluginPreSwapchain(pDevice,hWnd);
 
     DXGI_SWAP_CHAIN_DESC1 local{};
     const DXGI_SWAP_CHAIN_DESC1* useDesc = pDesc;
-    const UINT fw = GetForcedSwapchainWidth();
-    const UINT fh = GetForcedSwapchainHeight();
+    const auto nativeSize=NativeSizeForWindow(hWnd);
+    const UINT fw = nativeSize ? nativeSize->size.width : GetForcedSwapchainWidth();
+    const UINT fh = nativeSize ? nativeSize->size.height : GetForcedSwapchainHeight();
     if (pDesc && fw && fh) {
         local = *pDesc;
         local.Width = fw;
@@ -675,7 +805,7 @@ static HRESULT STDMETHODCALLTYPE Detour_FacCreateSwapChainForHwnd(
         Log("CreateSwapChainForHwnd override: %ux%u -> %ux%u\n",
             pDesc->Width, pDesc->Height, fw, fh);
     }
-    const HRESULT hr = g_origFacCSCFH(self, pDevice, hWnd, useDesc, pFsDesc, pRestrict, ppSwapChain);
+    const HRESULT hr = original(self, pDevice, hWnd, useDesc, pFsDesc, pRestrict, ppSwapChain);
     if (SUCCEEDED(hr) && ppSwapChain && *ppSwapChain) {
         PluginPostSwapchain(*ppSwapChain, hWnd);
     }
@@ -693,18 +823,25 @@ static HRESULT STDMETHODCALLTYPE Detour_FacCreateSwapChainForHwnd(
 // -- we hook the factory EXPORTS, let the game make the call it was going to make anyway, and
 // patch the vtable of what comes back. The table is shared, so one patch covers every factory.
 static bool HookFactoryVtable(void* factoryObj) {
-    static std::atomic<bool> s_patched{false};
     if (!factoryObj) return false;
     IDXGIFactory2* f2 = nullptr;
     if (FAILED(static_cast<IUnknown*>(factoryObj)->QueryInterface(IID_PPV_ARGS(&f2))) || !f2) {
         return false;
     }
-    bool expected = false;
-    if (!s_patched.compare_exchange_strong(expected, true)) { f2->Release(); return true; }
+    char fgTrace[8]{};
+    if(GetEnvironmentVariableA("CPVR_NATIVE_FG_DIAG",fgTrace,sizeof(fgTrace))==1&&fgTrace[0]=='1'){
+        void** table=*reinterpret_cast<void***>(f2);
+        void* method=table[15];
+        const auto original=GetOriginalMethod<FacCreateSwapChainForHwndFn>(table,15);
+        if(original)method=reinterpret_cast<void*>(original);
+        HMODULE module{};char path[MAX_PATH]{};
+        if(GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCSTR>(method),&module))GetModuleFileNameA(module,path,MAX_PATH);
+        Log("[NATIVE-FG-FACTORY] object=%p f2=%p table=%p alreadyPatched=%d cscfh=%p module=%s\n",
+            factoryObj,f2,table,int(original!=nullptr),method,path);
+    }
     void** vt = *reinterpret_cast<void***>(f2);
     // IDXGIFactory::CreateSwapChain = 10, IDXGIFactory2::CreateSwapChainForHwnd = 15
-    g_origFacCSC   = reinterpret_cast<FacCreateSwapChainFn>(vt[10]);
-    g_origFacCSCFH = reinterpret_cast<FacCreateSwapChainForHwndFn>(vt[15]);
     const bool a = PatchVtableMethod(vt, 10, reinterpret_cast<void*>(&Detour_FacCreateSwapChain));
     const bool b = PatchVtableMethod(vt, 15, reinterpret_cast<void*>(&Detour_FacCreateSwapChainForHwnd));
     Log("PluginBootstrap: factory vtable hooked csc=%d cscfh=%d fac=%p\n", (int)a, (int)b, factoryObj);
@@ -877,8 +1014,12 @@ extern "C" __declspec(dllexport) void CyberpunkVRPort_PluginBootstrap() {
     // Both the real DXGI and Streamline's interposer: with frame generation the game talks to
     // the interposer's exports, not dxgi's, and the swapchain it gets back is a Streamline
     // proxy whose vtable lives there.
-    HookFactoryExportsIn(L"dxgi.dll");
+    // Each export has one trampoline slot. Prefer the outer, game-facing
+    // Streamline factory: FG redirects GetBuffer to offscreen game targets.
+    // Hooking DXGI first fills those slots and silently skips Streamline,
+    // leaving the capture attached to the pacer's physical output buffers.
     HookFactoryExportsIn(L"sl.interposer.dll");
+    HookFactoryExportsIn(L"dxgi.dll"); // fallback for exports without Streamline
 }
 
 HRESULT STDMETHODCALLTYPE DXGIFactoryWrapper::CreateSoftwareAdapter(HMODULE Module, IDXGIAdapter** ppAdapter) { return m_real->CreateSoftwareAdapter(Module, ppAdapter); }
@@ -900,8 +1041,9 @@ HRESULT STDMETHODCALLTYPE DXGIFactoryWrapper::CreateSwapChainForHwnd(IUnknown* p
 
     DXGI_SWAP_CHAIN_DESC1 localDesc{};
     const DXGI_SWAP_CHAIN_DESC1* swapDesc = pDesc;
-    const UINT forcedWidth = GetForcedDisplayModeWidth();
-    const UINT forcedHeight = GetForcedDisplayModeHeight();
+    const auto nativeSize=NativeSizeForWindow(hWnd);
+    const UINT forcedWidth = nativeSize ? nativeSize->size.width : GetForcedDisplayModeWidth();
+    const UINT forcedHeight = nativeSize ? nativeSize->size.height : GetForcedDisplayModeHeight();
     if (pDesc && forcedWidth != 0 && forcedHeight != 0) {
         localDesc = *pDesc;
         localDesc.Width = forcedWidth;
@@ -926,22 +1068,27 @@ HRESULT STDMETHODCALLTYPE DXGIFactoryWrapper::CreateSwapChainForHwnd(IUnknown* p
 
     UINT windowWidth = GetForcedWindowWidth();
     UINT windowHeight = GetForcedWindowHeight();
-    if (windowWidth == forcedWidth) {
+    int windowX = 0;
+    int windowY = 0;
+    bool placeWindow = false;
+    // The desktop window follows its author policy independently of native render size.
+    if (windowWidth == GetForcedDisplayModeWidth()) {
         windowWidth = 0; // If they are the same as swapchain, user wants auto-cap
     }
     if (windowWidth == 0 && hWnd) {
-        HMONITOR monitor = MonitorFromWindow(hWnd, MONITOR_DEFAULTTOPRIMARY);
-        MONITORINFO mi = { sizeof(MONITORINFO) };
-        if (GetMonitorInfoA(monitor, &mi)) {
-            int monWidth = mi.rcMonitor.right - mi.rcMonitor.left;
-            int monHeight = mi.rcMonitor.bottom - mi.rcMonitor.top;
-            windowWidth = monWidth;
-            windowHeight = monHeight;
+        RECT windowRect{};
+        if (GetDesktopMonitorWindowRect(hWnd, windowRect)) {
+            windowWidth = static_cast<UINT>(windowRect.right - windowRect.left);
+            windowHeight = static_cast<UINT>(windowRect.bottom - windowRect.top);
+            windowX = windowRect.left;
+            windowY = windowRect.top;
+            placeWindow = true;
         }
     }
     if (windowWidth != 0 && windowHeight != 0 && hWnd) {
-        SetWindowPos(hWnd, nullptr, 0, 0, windowWidth, windowHeight, SWP_NOMOVE | SWP_NOZORDER);
-        Log("CreateSwapChainForHwnd: Capped window size to %ux%u\n", windowWidth, windowHeight);
+        const UINT flags = SWP_NOZORDER | (placeWindow ? 0 : SWP_NOMOVE);
+        SetWindowPos(hWnd, nullptr, windowX, windowY, windowWidth, windowHeight, flags);
+        Log("CreateSwapChainForHwnd: desktop outer window set to %ux%u\n", windowWidth, windowHeight);
     }
 
     ID3D12CommandQueue* pQueue = nullptr;
@@ -951,6 +1098,7 @@ HRESULT STDMETHODCALLTYPE DXGIFactoryWrapper::CreateSwapChainForHwnd(IUnknown* p
             RememberDredDevice(d3dDevice);
             OpenXRManager::Get().InitGraphics(d3dDevice, pQueue);
             OverlaySetDeviceAndQueue(d3dDevice, pQueue);
+            DesktopMirrorSetDeviceAndQueue(d3dDevice, pQueue);
             InstallCommandQueueDiagHook(pQueue);
             InstallDepthCaptureHooks(d3dDevice);
             // The device here came from the queue the GAME passed, so it is the game-facing one --

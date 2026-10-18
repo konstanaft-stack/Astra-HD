@@ -68,7 +68,12 @@ struct LiveControlsUiState {
     // 0..3 enum (0=Game, 1=HMD, 2=LeftHand, 3=RightHand). The overlay edits the
     // latter and the proxy mirrors it back into the legacy field.
     int xrMovementSource;
-    int xrMovementSpeedMode = 0;
+    // Laser dot projection mode and appearance.
+    int xrLaserDotMode;
+    float xrLaserDotRadiusMm;
+    int xrLaserDotScaleWithDistance;
+    int xrHideLaserDotAds;
+    int xrMovementSpeedMode = 1;
     float xrLeftStickDeadzone = .15f;
     float xrRightStickDeadzone = .15f;
     float xrMaxInputThreshold = .90f;
@@ -76,6 +81,16 @@ struct LiveControlsUiState {
     // OpenXR binding or XInput entry-point patch can't keep CP2077 from booting.
     int xrXInputInstall;
     int xrInputActions;
+    int xrChordActivation = 1;
+    int xrExtraChordActions = 1;
+    int xrRightThumbrestAvailable = 0; // runtime status only; never persisted
+    // Classic controller routing. Parent toggles preserve child values while off.
+    int xrClassicOnFootControls;
+    int xrClassicDisableLsSprint;
+    int xrClassicDisableRsDashCrouch;
+    int xrClassicVehicleControls;
+    int xrClassicSwapTriggersGrips;
+    int xrClassicScannerControls;
     // Mono submit safety flags. Defaults 0 keep CP2077 mono mode from hanging on
     // the menu (see cybervrport-controller-bindings memory for the trace).
     int xrMonoXQueueWait;
@@ -163,4 +178,7 @@ extern "C" void GetAdsCameraTelemetryUiState(AdsCameraTelemetryUiState* outState
 
 extern "C" void GetLiveControlsUiState(LiveControlsUiState* outState);
 extern "C" void SetLiveControlsUiState(const LiveControlsUiState* state, int persistToFile);
+extern "C" void PersistLiveControlsNow();
+extern "C" int GetLiveVerboseLogSetting();
+extern "C" void SetLiveVerboseLogSetting(int enabled);
 extern "C" void RequestLiveControlsRecenter();

@@ -1,6 +1,22 @@
+#include "Runtimes/CaptureContextFences.hpp"
+#include "MenuPreview/UiConsumer.hpp"
+#include "MenuPreview/UiPairPolicy.hpp"
+#include "MenuPreview/EditorUiSurface.hpp"
+#include "Runtimes/EditorUiLayerPolicy.hpp"
 #pragma once
+namespace cvr::render {struct NativeColorCapture;}
 #include "Runtimes/SteamFrameInput.hpp"
 #include "Framegen/Presenter.hpp"
+#include "Framegen/AerRealPresenter.hpp"
+#include "Framegen/NativeGenerationBridge.hpp"
+#include "Framegen/AsyncRetirement.hpp"
+#include "Framegen/NativeFgPresenter.hpp"
+#include "Framegen/PairedDisplayHistory.hpp"
+#include "Runtimes/WorldFrameReplay.hpp"
+#include "Framegen/CaptureCompletion.hpp"
+#include "Framegen/FrameProjectionMetadata.hpp"
+#include "Framegen/SourceClock.hpp"
+#include "Framegen/MainEyePoseDiagnostics.hpp"
 #include "Framegen/StatsOverlay.hpp"
 #include "Overlay/VrPanel.hpp"
 
@@ -18,6 +34,7 @@
 
 #include "Render/DepthResolve.hpp"
 #include "Render/SharpenPass.hpp"
+#include "Render/SrgbToLinearPass.hpp"
 #include "Render/ColorBlit.hpp"
 #include "Runtimes/HudQuad.hpp"
 #include "Runtimes/RoomscaleMovement.hpp"
@@ -25,6 +42,10 @@
 #include "Runtimes/HandPublication.hpp"
 #include "Runtimes/FrameAim.hpp"
 #include "Runtimes/CaptureBufferLeases.hpp"
+#include "Runtimes/CapturePoolPolicy.hpp"
+#include "Runtimes/CapturePoolRetirement.hpp"
+#include "Runtimes/MainCaptureCatalogue.hpp"
+#include "Runtimes/SubmitFenceRetirement.hpp"
 #include "Anim/BodyBend.hpp"
 #include "Runtimes/TrackedBodyYaw.hpp"
 #include "Hooks/SwimmingInput.hpp"
@@ -32,6 +53,7 @@
 
 struct IDXGISwapChain;
 
+#include "Overlay/ReferenceOptics.hpp"
 struct OpenXRHeadPose {
     float posX;
     float posY;
@@ -44,6 +66,10 @@ struct OpenXRHeadPose {
     // Recenter/reference-space generation of this exact sample.
     uint64_t originSerial{};
     cvr::body::BendSample bodyBend{};
+    // Exact xrLocateSpace aim that produced this head sample; zero when the
+    // fallback/synced/cycle source did not provide a coherent matching time.
+    XrTime locatedTime{};
+    cvr::ppd::ReferenceOptics referenceOptics{};
 };
 
 // Aggregated VR-controller snapshot, queried each frame from the XInput hook
@@ -134,9 +160,14 @@ public:
                            XrTime* frameTime = nullptr);
     uint64_t GetTrackingOriginSerial() const { return m_trackingOriginSerial.load(std::memory_order_acquire); }
     bool ResolveRenderedPose(const OpenXRHeadPose& pose,XrPosef* out) const;
+    bool IsRightThumbrestAvailable() const { return m_rightThumbrestAvailable.load(std::memory_order_relaxed); }
     // Fresh xrLocateSpace at a given display time -- see the definition for why the camera write
     // must not read the cached atomics above.
-    bool LocateHeadPoseAt(XrTime displayTime, OpenXRHeadPose* out);
+    // Exact source queries never substitute a cycle/cached pose and acquire
+    // the existing XR lifetime lock nonblocking before touching handles.
+    bool LocateHeadPoseAt(XrTime displayTime, OpenXRHeadPose* out,bool requireExactTime=false,
+                         cvr::framegen::HeadPoseQueryDiagnostics* diagnostics=nullptr);
+    std::optional<cvr::framegen::CameraApplicationTime> SampleCameraApplicationTime(uint64_t origin) const;
     void RequestRecenter();
     void BeginExternalPoseReset();
     void EndExternalPoseReset();
@@ -144,6 +175,7 @@ public:
         return m_externalPoseReset.Pending();
     }
     void OnPresent(IDXGISwapChain* swapChain);
+    bool PrepareMenuUiResize(); // opt-in: release only GPU-completed own capture recordings
     // Run one XR frame inline on the Present thread instead of a dedicated
     // frame thread.
     void PumpInlineFrame();
@@ -151,6 +183,11 @@ public:
     // game's own beat whichever thread owns the loop. See the definition in openxr_frameloop.cpp.
     void ReportXrFrameRates();
     void SetMonoSubmitEnabled(bool enabled);
+    // Mode-owner connection, serialized on the SAME XR owner as frame select
+    // and submission. Defaults remain author-owned until an explicit binding.
+    bool SetNativeGenerationBridge(std::shared_ptr<cvr::framegen::NativeGenerationBridge> bridge) {
+        return m_framegen.SetNativeBridge(std::move(bridge));
+    }
     // True when the dedicated submit thread (NOT the Present thread) should own the
     // XR frame loop. SteamVR's xrWaitFrame / compositor pacing stalls the game's Present
     // thread when the loop is driven inline (freezes/lags); a dedicated thread decouples
@@ -178,7 +215,9 @@ public:
     bool UseThreadedSubmit() const {
         // Mono submit off means there is no loop to own either way.
         if (!m_monoSubmitEnabled.load(std::memory_order_relaxed)) return false;
-        if(cvr::framegen::Enabled())return true; // interpolation needs display-rate submission
+        // Producer/consumer ownership is independent of optional depth/MV
+        // copies. Projection-only stereo must retain the same display loop.
+        if(cvr::framegen::CaptureProjectionEnabled())return true;
         const int mode = CyberpunkVR_ThreadedMonoSubmit;
         if (mode == 0) return false;   // forced inline
         if (mode > 0) return true;     // forced threaded
@@ -846,6 +885,7 @@ public:
     void MaybeLogRuntimeFovDetails(const XrFovf& left, const XrFovf& right, float runtimeHfovDeg, float runtimeVfovDeg, float runtimeIpdMeters);
     bool GetCurrentEyeCenterOffset(int eye, XrVector3f* out);
     bool GetCurrentEyeFov(int eye, XrFovf* out);
+    bool GetCurrentEyeFovs(XrFovf (&out)[2]);
     
     bool GetRecommendedRenderTargetSize(uint32_t* width, uint32_t* height) const;
 
@@ -872,6 +912,7 @@ private:
     void PollEvents();
     bool BeginSession();
     void EndSession();
+    void RefreshRightThumbrestAvailability();
     bool EnsureMonoSubmitResources();
     bool EnsureMonoCaptureResource(const D3D12_RESOURCE_DESC& sourceDesc);
     bool EnsureDepthSnapshot(ID3D12Resource* gameDepth);
@@ -895,14 +936,43 @@ private:
     // writer queue is unknown or the previous resolve is still in flight.
     bool CaptureMonoDepthOnWriterQueue(uint64_t serial);
     bool CaptureMonoPresentedFrame(ID3D12Resource* backBuffer, const D3D12_RESOURCE_DESC& sourceDesc, uint64_t serial,
-        const XrPosef poses[2], const XrFovf fovs[2], const bool hasView[2],const XrPosef headCenters[2]);
+        const XrPosef poses[2], const XrFovf fovs[2], const bool hasView[2],const XrPosef headCenters[2],
+        const cvr::render::NativeColorCapture* nativeColor=nullptr);
 
+    struct MenuUiSelection {
+        ID3D12Resource* color[2]{};
+        cvr::framegen::CaptureCompletion completion[2];
+        std::shared_ptr<cvr::framegen::ReadLease> lease;
+        cvr::menu_preview::UiPairScope scope;
+        uint64_t sourceSerial{};
+        uint64_t cameraRevision[2]{};
+        cvr::menu_preview::PreviewProjection projection[2];
+        bool editorUiRequired=false;
+        std::shared_ptr<const cvr::menu_preview::EditorUiPublication> editorUi;
+        uint64_t rawSceneSerial[2]{};
+        uint64_t editorControlRevision{};
+    };
+    bool CaptureMenuUiPresentedFrame(ID3D12Resource*,const D3D12_RESOURCE_DESC&,uint64_t);
+    std::optional<MenuUiSelection> AcquireMenuUiPair();
+    std::optional<MenuUiSelection> AcquireEditorNativeMenuUiPair(const cvr::menu_preview::Lease&);
+    void ClearMenuUiPair();
+    cvr::menu_preview::UiPairPolicy m_menuUiPair; // metadata only; presentMutex
+    cvr::framegen::CaptureCompletion m_menuUiCompletion[2];
+    std::shared_ptr<const cvr::menu_preview::UiFrameReceipt> m_menuUiReceipt[2];
+    uint64_t m_menuUiRawSceneSerial[2]{}; // same presentMutex/pair generation
+    struct EditorNativeUiSource;
+    std::shared_ptr<const cvr::menu_preview::UiFrameReceipt> m_editorNativeUiReceipt;
+    std::shared_ptr<EditorNativeUiSource> m_editorNativeUiSource;
     OpenXRManager() = default;
     ~OpenXRManager() = default;
 
     std::mutex m_initMutex;
     bool m_initialized = false;
+    bool m_ownerModulePinned=false;
     XrInstance m_instance = XR_NULL_HANDLE;
+    cvr::framegen::SourceClock m_sourceClock;
+    PFN_xrConvertWin32PerformanceCounterToTimeKHR m_sourceTimeConverter{};
+    void RefreshSourceClock(); // XR owner only; never called by camera/renderer hooks.
     XrSystemId m_systemId = XR_NULL_SYSTEM_ID;
     // The runtime's name for the headset. It was being logged and thrown away; the per-headset FOV
     // default needs it, and it is the only thing that distinguishes one panel from another at runtime.
@@ -922,6 +992,10 @@ private:
     XrAction m_primaryButtonAction = XR_NULL_HANDLE;     // Bool, per hand (X / A)
     XrAction m_secondaryButtonAction = XR_NULL_HANDLE;   // Bool, per hand (Y / B)
     XrAction m_menuButtonAction = XR_NULL_HANDLE;        // Bool, global menu/start action
+    XrAction m_rightThumbrestAction = XR_NULL_HANDLE;    // Bool, Oculus Touch right thumbrest touch
+    XrPath m_oculusTouchProfilePath = XR_NULL_PATH;
+    std::atomic<bool> m_rightThumbrestProfileKnown{false};
+    std::atomic<bool> m_rightThumbrestAvailable{false};
     cvr::input::SteamFrameActions m_steamFrameActions{};
     XrPath m_handPaths[2] = { XR_NULL_PATH, XR_NULL_PATH };
     XrSpace m_handSpaces[2] = { XR_NULL_HANDLE, XR_NULL_HANDLE };
@@ -1014,13 +1088,20 @@ private:
     ID3D12CommandQueue* m_d3dQueue = nullptr;
     ID3D12CommandAllocator* m_cmdAllocators[3] = {};
     uint32_t m_cmdAllocatorIndex = 0;
+    // Actual submitted fence for each allocator. The ring advances even on
+    // skipped frames, so a global last-fence-minus-two is not a reuse proof.
+    std::array<uint64_t,3> m_submitAllocatorFences{};
     ID3D12GraphicsCommandList* m_cmdLists[3] = {};
     ID3D12Fence* m_fence = nullptr;
     HANDLE m_fenceEvent = nullptr;
     UINT64 m_fenceValue = 0;
+    // m_presentMutex protects completion publication, fence replacement and
+    // worker-thread ReadLease retirement. Unknown Signal stops this XR owner.
+    cvr::capture::SubmitFenceRetirement m_submitFenceRetirement;
     std::mutex m_captureMutex;
     ID3D12CommandAllocator* m_captureCmdAllocators[3] = {};
     uint32_t m_captureAllocatorIndex = 0;
+    cvr::capture::CaptureContextFences m_captureContextFences;
     ID3D12GraphicsCommandList* m_captureCmdLists[3] = {};
     ID3D12Fence* m_captureFence = nullptr;
     HANDLE m_captureFenceEvent = nullptr;
@@ -1059,6 +1140,12 @@ private:
         bool hasView[2]{};
         uint64_t poseIds[2]{},imageGenerations[2]{};
         std::shared_ptr<const cvr::framegen::Inputs> framegenInputs[2];
+        std::optional<cvr::framegen::FrameProjectionMetadata> projections[2];
+        // Published under m_presentMutex with this serial and its color label.
+        // Copy the tuple while pinning the matching capture; it owns the fence,
+        // not the color pool. It does not describe an older reused VRCAM slot.
+        cvr::framegen::CaptureCompletion colorCompletion;
+        cvr::framegen::NativeFrameStamp nativeStamp;
         // WHEN this image and its poses were captured, on the QPC clock XrDiagNowMs uses.
         //
         // The one thing the frame accounting could not see. Every other counter says how MANY frames
@@ -1071,7 +1158,38 @@ private:
     };
     std::vector<EyeSwapchain> m_eyeSwapchains;
     CapturedMonoFrame m_monoCapturedFrame;
+    uint64_t m_captureResourceEpoch{};
+    cvr::capture::MainCaptureCatalogue<cvr::framegen::Frame,cvr::capture::MainPoolMaximum> m_mainCaptureCatalogue; // m_presentMutex
+    std::condition_variable m_mainCaptureAvailable;
+    // Claim completed FIFO publications into real leases (at most the active
+    // pool). Convert/StepReady outside m_presentMutex; later eligible images
+    // remain owned by the bounded presenter queue.
+    // Returned Frames already own their ReadLease before GPU recording.
+    std::vector<cvr::framegen::Frame> CollectReadyMainCaptures(const cvr::framegen::MainEyeSourceReceipt& expectedScope);
+    // One existing NVIDIA worker. Reverse destruction drops presenter/bridge
+    // owners before this worker; normal shutdown explicitly stops it first.
+    std::unique_ptr<cpvr::GenerationWorker> m_ownGeneration;
+    std::shared_ptr<cvr::framegen::NativeGenerationBridge> m_ownGenerationBridge;
+    cvr::framegen::AsyncRetirement m_ownRetirement;
+    bool m_ownGenerationConnected=false;
+    bool m_ownGenerationStopping=false;
+    std::optional<cpvr::GenerationPolicy> m_ownGenerationPolicy;
+    uint64_t m_ownAerSourceGeneration{},m_ownAerModeGeneration{};
+    bool UpdateOwnedGeneration(const cvr::framegen::Settings&);
     cvr::framegen::Presenter m_framegen;
+    cvr::framegen::AerRealPresenter m_aerRealPresenter;
+    cvr::framegen::NativeFgPresenter m_gameFgPresenter;
+    cvr::framegen::PairedDisplayHistory m_pairedDisplayHistory;
+    cvr::xr::WorldFrameReplay m_worldFrameReplay;
+    std::atomic<uint64_t> m_worldReplaySessionRun{0};
+    std::unique_ptr<cvr::render::AerReconstructionPass> m_aerReconstruction;
+    std::unique_ptr<cvr::render::AerReconstructionPass> m_editorSceneResample; // captureMutex only
+    int64_t m_aerCompositorFrame=-1;
+    uint64_t m_aerOutputSerial{},m_aerOutputGeneration{};
+    std::array<int64_t,2> m_aerOutputSources{-1,-1};
+    int m_aerLastConvertedCode=-1,m_aerLastAdmissionCode=-1;
+    int64_t m_aerLastCaptureSource=-1;
+    uint64_t m_aerLastCaptureSerial{},m_aerLastSourceGeneration{},m_aerLastCalibrationRevision{};
     cvr::framegen::StatsOverlay m_framegenOverlay;
     // [DEPTH] Game scene-depth snapshot for the XR depth layer (parallel to color).
     ID3D12Resource* m_depthSnapshot = nullptr;
@@ -1083,12 +1201,19 @@ private:
     // the capture (which starves the headset of new frames while the game itself runs fine
     // -- smooth on the monitor, freezing in the HMD). With three, the producer always writes
     // a buffer nobody is reading and neither side ever waits.
-    ID3D12Resource* m_monoPool[3] = {};
+    ID3D12Resource* m_monoPool[cvr::capture::MainPoolMaximum] = {};
+    uint32_t m_monoPoolCount=0;
+    cvr::capture::PoolProducerUse m_mainPoolProducer;
+    cvr::capture::MainPoolRetirement m_retiredMainPools;
     uint32_t        m_monoPoolSlot = 0;
     cvr::capture::BufferLeases m_captureLeases; // m_presentMutex
-    struct RetiredCaptureRead { ID3D12Resource* resource;uint64_t fence; };
+    struct RetiredCaptureRead { ID3D12Resource* resource;cvr::capture::SubmitReadCompletion completion; };
     std::vector<RetiredCaptureRead> m_retiredCaptureReads;
     void ReleaseCapturedRead(ID3D12Resource* resource,uint64_t fence);
+    void CollectCapturedReadsLocked(std::vector<ID3D12Resource*>& release);
+    bool PollSubmitResources(bool requireComplete);
+    void RecordSubmitExecuted(bool signalSucceeded);
+    bool CreateSubmitFence();
     ID3D12Resource* AcquireCapturedVrcamLocked(uint64_t serial,uint32_t maxReuse,
         XrPosef* pose,XrFovf* fov,uint64_t* poseId,bool* reused);
 
@@ -1136,7 +1261,7 @@ private:
     //   underneath had already been replaced. A serial is not a version of the pixels.
     //
     // Per-slot serials, so the submit takes the slot belonging to ITS frame rather than the newest one.
-    static constexpr int kVrcamEyeSlots = 3;
+    static constexpr int kVrcamEyeSlots = 5;
     ID3D12Resource* m_vrcamEyePool[kVrcamEyeSlots] = {};
     uint64_t        m_vrcamEyePoolSerial[kVrcamEyeSlots] = {};
     struct CapturedEyeLabel { XrPosef pose{};XrFovf fov{};uint64_t poseId{},imageGeneration{};bool valid{}; };
@@ -1233,6 +1358,8 @@ private:
     // image is written to the swapchain when xr_sharpness > 0.
     std::unique_ptr<SharpenPass> m_sharpenPass;
     bool m_sharpenReady = false;
+    std::unique_ptr<SrgbToLinearPass> m_srgbToLinearPass;
+    bool m_decodeSrgbForUnormSwapchain = false;
 
     // Reuse-last-frame path: persistent "last good" eye images + their pose/fov.
     // On a stale tick we re-present these with the stashed pose so the runtime
@@ -1349,6 +1476,13 @@ private:
     //   Quad path: shared HUD follow policy, including a delayed catch-up after a turn.
     //   Projection path: m_menuEyePoses[] latched, re-latched (snap) past the threshold.
     cvr::hud::Quad m_hudQuad;
+    cvr::hud::Quad m_editorUiQuad{cvr::hud::Quad::Mode::Explicit};
+    cvr::xr::EditorUiAnchor m_editorUiAnchor; // XR thread only; category-independent
+    std::optional<MenuUiSelection> m_editorUiDisplay; // last xrEndFrame-accepted packet; same ReadLease
+    uint64_t m_editorUiDisplayOrigin=0;
+    uint64_t m_editorUiPreparedSerial=0;
+    XrSwapchain m_editorUiDisplaySwapchain=XR_NULL_HANDLE;
+    uint32_t m_editorUiLifecycleEpoch=0;
     cvr::hud::Quad m_interactionQuad{cvr::hud::Channel::Interaction};
     cvr::hud::Quad m_basiliskQuad{cvr::hud::Channel::Basilisk};
     cvr::hud::Quad m_surveillanceQuad{cvr::hud::Channel::Surveillance};

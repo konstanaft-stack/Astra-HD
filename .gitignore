@@ -6,6 +6,9 @@
 /.vs/
 /.vscode/
 /out/
+/audit/
+/native/nvidia_backend/out/
+/native/nvidia_backend/snapshot/include/
 *.suo
 *.user
 *.log

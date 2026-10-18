@@ -110,7 +110,8 @@ void InitRuntimePaths() {
     // the binding/entry-point patch keeps the game from reaching its main menu.
     g_liveControls.xrXInputInstall = 1;
     g_liveControls.xrInputActions = 1;
-    g_liveControls.xrMovementSpeedMode=0;
+    // Preserve the Tofu default when an existing ini has no movement-speed key.
+    g_liveControls.xrMovementSpeedMode=1;
     g_liveControls.xrLeftStickDeadzone=.15f;
     g_liveControls.xrRightStickDeadzone=.15f;
     g_liveControls.xrMaxInputThreshold=.90f;
@@ -153,6 +154,7 @@ void EnsureLiveControlFileExists() {
     fprintf(file, "xr_threaded_submit=-1\n");
     fprintf(file, "xr_force_fov=0\n");
     fprintf(file, "xr_menu_rect=0\n");
+    fprintf(file, "xr_menu_stereo=0\n");
     fprintf(file, "xr_menu_fov=65.0\n");
     fprintf(file, "xr_menu_follow_deg=60.0\n");
     fprintf(file, "xr_3dof_movement=0\n");
@@ -200,7 +202,11 @@ void EnsureLiveControlFileExists() {
     fprintf(file, "xr_snap_turn=0\n");
     fprintf(file, "xr_snap_turn_angle_deg=30\n");
     fprintf(file, "xr_movement_source=0\n");
-    fprintf(file,"xr_movement_speed_mode=0\nxr_left_stick_deadzone=0.15\nxr_right_stick_deadzone=0.15\nxr_max_input_threshold=0.90\n");
+    fprintf(file, "xr_laser_dot_mode=2\n");
+    fprintf(file, "xr_laser_dot_radius_mm=30\n");
+    fprintf(file, "xr_laser_dot_scale_with_distance=1\n");
+    fprintf(file, "xr_hide_laser_dot_ads=0\n");
+    fprintf(file,"xr_movement_speed_mode=1\nxr_left_stick_deadzone=0.15\nxr_right_stick_deadzone=0.15\nxr_max_input_threshold=0.90\n");
     // Default ON for the gameplay-input pipeline: both flags are required for the
     // VR controller to reach CP2077 as an XInput pad (otherwise the game detects no
     // controller and shows keyboard glyphs). Set either to 0 in vrport.ini if a
@@ -208,9 +214,37 @@ void EnsureLiveControlFileExists() {
     // from reaching its main menu.
     fprintf(file, "xr_xinput_install=1\n");
     fprintf(file, "xr_input_actions=1\n");
+    fprintf(file, "xr_chord_activation=1\n");
+    fprintf(file, "xr_extra_chord_actions=1\n");
+    fprintf(file, "xr_classic_on_foot_controls=0\n");
+    fprintf(file, "xr_classic_disable_ls_sprint=0\n");
+    fprintf(file, "xr_classic_disable_rs_dash_crouch=0\n");
+    fprintf(file, "xr_classic_vehicle_controls=0\n");
+    fprintf(file, "xr_classic_swap_triggers_grips=0\n");
+    fprintf(file, "xr_classic_scanner_controls=0\n");
     fprintf(file, "xr_mono_xqueue_wait=0\n");
     fprintf(file, "xr_snap_turn_pulse_ms=30\n");
     fprintf(file, "xr_mono_depth_capture=1\n");
+    fprintf(file, "xr_debug_hand_overlay=0\n");
+    fprintf(file, "xr_debug_hand_proxy=0\n");
+    fprintf(file, "xr_debug_hand_axes=0\n");
+    fprintf(file, "xr_debug_hand_scale=1.00\n");
+    fprintf(file, "xr_verbose_log=-1\n");
+    fprintf(file, "xr_decoupled_head_aim=0\n");
+    fprintf(file, "xr_laser_dot_enable=1\n");
+    fprintf(file, "xr_stereo_submit=1\n");
+    fprintf(file, "xr_stereo_eye_max_age_ms=250\n");
+    fprintf(file, "xr_force_vrcam_cam=1\n");
+    fprintf(file, "xr_vrcam_enabled=1\n");
+    fprintf(file, "xr_mirror_output=0\n");
+    fprintf(file, "xr_ads_telemetry=0\n");
+    fprintf(file, "xr_ads_telemetry_x=0.57\n");
+    fprintf(file, "xr_ads_telemetry_y=0.30\n");
+    fprintf(file, "xr_stereo_log=1\n");
+    fprintf(file, "xr_stable_copy=1\n");
+    fprintf(file, "xr_stable_from_tonemap=0\n");
+    fprintf(file, "xr_prof_enable=0\n");
+    fprintf(file, "xr_vr_hand_tracking=1\n");
     fclose(file);
 }
 

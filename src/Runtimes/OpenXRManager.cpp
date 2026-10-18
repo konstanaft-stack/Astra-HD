@@ -1,8 +1,13 @@
 #include "Utils/DebugGate.hpp"
+#include <sl_core_types.h>
+#include "Framegen/AerModeOwner.hpp"
+#include "Framegen/NativeFgPairedSource.hpp"
 #include "Core/LiveControls.hpp"
 #include "Runtimes/HybridBodyYaw.hpp"
 #include "Anim/WheelGrab.hpp"   // the wheel-grab blends, for the hand smoothing below
 #include "Runtimes/OpenXRManager.hpp"
+#include "MenuPreview/EditorSceneImage.hpp"
+#include "Render/NativeObjectIdentity.hpp"
 #include "Hooks/RoomscaleMove.hpp"
 #include "Camera/CameraLink.hpp"
 #include "Runtimes/SimulatorRecenter.hpp"
@@ -483,7 +488,7 @@ void OpenXRManager::MaybeLogRuntimeFovDetails(const XrFovf& left, const XrFovf& 
 
 // [ExtrapolatePose / RotateVector moved to openxr_math.h (inline)]
 
-// [ContainsSwapchainFormat / PickMonoSwapchainFormat moved to openxr_internal.h (inline)]
+// Swapchain color-format selection lives in OpenXRSwapchainFormat.hpp.
 
 // [ApplyForcedProjectionFov moved to openxr_internal.h (inline)]
 
@@ -573,8 +578,21 @@ DWORD OpenXRManager::SubmitThreadMain() {
 }
 
 OpenXRManager& OpenXRManager::Get() {
-    static OpenXRManager instance;
-    return instance;
+    // One process-lifetime owner. Failed/unknown GPU shutdown may deliberately
+    // retain pooled leases; automatic static destruction would destroy the
+    // lease map before those callbacks, or destroy a still-running XR owner.
+    // Normal Shutdown still releases verified-complete resources explicitly.
+    static OpenXRManager* instance=[] {
+        auto* value=new OpenXRManager;
+        HMODULE module{};
+        value->m_ownerModulePinned=GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_PIN,
+            reinterpret_cast<LPCWSTR>(&OpenXRManager::Get),&module)!=FALSE;
+        if(!value->m_ownerModulePinned) {
+            Log("OpenXRManager: cannot pin the owner module (error=%lu).\n",GetLastError());
+        }
+        return value;
+    }();
+    return *instance;
 }
 
 // [recenter / auto-calibration / calibration-file methods (RotateBaseYaw ... LoadCalibrationFromFile) moved to openxr_calibration.cpp]
@@ -588,7 +606,11 @@ void OpenXRManager::SetMonoSubmitEnabled(bool enabled) {
         ResetEvent(m_monoPresentEvent);
     }
     std::lock_guard<std::mutex> lock(m_presentMutex);
+    m_mainCaptureCatalogue.Clear();
+    m_mainCaptureAvailable.notify_all();
     m_monoCapturedFrame.serial = 0;
+    m_monoCapturedFrame.colorCompletion = {};
+    m_monoCapturedFrame.nativeStamp = {};
     m_monoCapturedFrame.hasView[0] = false;
     m_monoCapturedFrame.hasView[1] = false;
     m_depthSnapshotSerial = 0;
@@ -597,6 +619,7 @@ void OpenXRManager::SetMonoSubmitEnabled(bool enabled) {
 // [mono capture + submit-resource methods (EnsureMonoCaptureResource ... EnsureMonoSubmitResources) moved to openxr_capture.cpp]
 
 bool OpenXRManager::Init() {
+    if(!m_ownerModulePinned)return false;
     std::lock_guard<std::mutex> initLock(m_initMutex);
     if (m_initialized) return true;
 
@@ -607,7 +630,8 @@ bool OpenXRManager::Init() {
     std::vector<const char*> extensions = {
         XR_KHR_D3D12_ENABLE_EXTENSION_NAME
     };
-    bool steamFrameEnabled=false;
+    bool steamFrameEnabled=false,sourceTimeEnabled=false;
+    m_sourceClock.Invalidate();m_sourceTimeConverter=nullptr;
 
     // Optional depth submission and native Steam Frame controller bindings.
     {
@@ -623,6 +647,9 @@ bool OpenXRManager::Init() {
                 } else if(strcmp(p.extensionName,cvr::input::SteamFrameExtension)==0) {
                     steamFrameEnabled=true;
                     extensions.push_back(cvr::input::SteamFrameExtension);
+                } else if(strcmp(p.extensionName,XR_KHR_WIN32_CONVERT_PERFORMANCE_COUNTER_TIME_EXTENSION_NAME)==0) {
+                    sourceTimeEnabled=true;
+                    extensions.push_back(XR_KHR_WIN32_CONVERT_PERFORMANCE_COUNTER_TIME_EXTENSION_NAME);
                 }
             }
         }
@@ -643,6 +670,11 @@ bool OpenXRManager::Init() {
     }
 
     XrInstanceProperties instanceProps{XR_TYPE_INSTANCE_PROPERTIES};
+    if(sourceTimeEnabled) {
+        PFN_xrVoidFunction converter{};
+        if(XR_SUCCEEDED(xrGetInstanceProcAddr(m_instance,"xrConvertWin32PerformanceCounterToTimeKHR",&converter)))
+            m_sourceTimeConverter=reinterpret_cast<PFN_xrConvertWin32PerformanceCounterToTimeKHR>(converter);
+    }
     if (XR_SUCCEEDED(xrGetInstanceProperties(m_instance, &instanceProps))) {
         Log("OpenXRManager: OpenXR runtime name=\"%s\" kind=%s version=%u.%u.%u\n",
             instanceProps.runtimeName,
@@ -746,6 +778,8 @@ bool OpenXRManager::Init() {
             makeAction(m_primaryButtonAction,   XR_ACTION_TYPE_BOOLEAN_INPUT,  "primary_button",   "Primary Button (A/X)", true);
             makeAction(m_secondaryButtonAction, XR_ACTION_TYPE_BOOLEAN_INPUT,  "secondary_button", "Secondary Button (B/Y)", true);
             makeAction(m_menuButtonAction,      XR_ACTION_TYPE_BOOLEAN_INPUT,  "menu",             "Menu Button",          false);
+            makeAction(m_rightThumbrestAction,  XR_ACTION_TYPE_BOOLEAN_INPUT,  "right_thumbrest",  "Right Thumbrest",      false);
+            xrStringToPath(m_instance, "/interaction_profiles/oculus/touch_controller", &m_oculusTouchProfilePath);
             if(steamFrameEnabled)m_steamFrameActions.Create(makeAction);
         }
         Log("OpenXRManager[Input]: gameplay action set %s (xr_input_actions=%d)\n",
@@ -841,6 +875,7 @@ bool OpenXRManager::Init() {
             { m_secondaryButtonAction, "/user/hand/left/input/y/click" },
             { m_secondaryButtonAction, "/user/hand/right/input/b/click" },
             { m_menuButtonAction,      "/user/hand/left/input/menu/click" },
+            { m_rightThumbrestAction,  "/user/hand/right/input/thumbrest/touch" },
         });
 
         // -- Valve Index: A/B on both hands, system as menu --
@@ -919,7 +954,46 @@ bool OpenXRManager::GetRecommendedRenderTargetSize(uint32_t* width, uint32_t* he
 }
 
 bool OpenXRManager::InitGraphics(ID3D12Device* device, ID3D12CommandQueue* queue) {
+    if(!m_ownerModulePinned)return false;
     if (!m_initialized || m_session != XR_NULL_HANDLE) return false;
+
+    // The game-facing FG swapchain uses SL proxy interfaces. ImagePose records
+    // ExecuteCommandLists on the underlying queue; XR must bind that same native
+    // device/queue rather than compare the proxy address to a different address.
+    // Keep the transferred references alive until the session takes its own.
+    Microsoft::WRL::ComPtr<ID3D12Device> nativeDevice;
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> nativeQueue;
+    using NativeGetter=sl::Result(*)(void*,void**);
+    const auto interposer=GetModuleHandleW(L"sl.interposer.dll");
+    const auto getNative=interposer?reinterpret_cast<NativeGetter>(GetProcAddress(interposer,"slGetNativeInterface")):nullptr;
+    const auto resolveNative=[&](IUnknown* original,REFIID iid,void** out){
+        if(!getNative||!original)return false;
+        void* value{};
+        if(getNative(original,&value)!=sl::Result::eOk||!value)return false;
+        Microsoft::WRL::ComPtr<IUnknown> native;native.Attach(static_cast<IUnknown*>(value));
+        return SUCCEEDED(native->QueryInterface(iid,out));
+    };
+    if(resolveNative(device,IID_PPV_ARGS(&nativeDevice))&&resolveNative(queue,IID_PPV_ARGS(&nativeQueue))){
+        Log("OpenXRManager: native graphics identity device=%p -> %p queue=%p -> %p\n",device,nativeDevice.Get(),queue,nativeQueue.Get());
+        device=nativeDevice.Get();queue=nativeQueue.Get();
+    }
+
+    // ReShade is not a Streamline proxy. Resolve the identities published by
+    // our native creation hooks through its forwarded D3D12 private data.
+    // Keep both owned results alive until m_d3dDevice/m_d3dQueue take references.
+    auto registeredDevice=cvr::gpu::ResolveNativeObject<ID3D12Device>(device);
+    auto registeredQueue=cvr::gpu::ResolveNativeObject<ID3D12CommandQueue>(queue);
+    Microsoft::WRL::ComPtr<ID3D12Device> queueDevice;
+    Microsoft::WRL::ComPtr<IUnknown> deviceIdentity,queueDeviceIdentity;
+    if(registeredDevice&&registeredQueue&&
+       SUCCEEDED(registeredQueue->GetDevice(IID_PPV_ARGS(&queueDevice)))&&
+       SUCCEEDED(registeredDevice.As(&deviceIdentity))&&SUCCEEDED(queueDevice.As(&queueDeviceIdentity))&&
+       deviceIdentity.Get()==queueDeviceIdentity.Get()){
+        Log("OpenXRManager: registered graphics identity device=%p -> %p queue=%p -> %p\n",device,registeredDevice.Get(),queue,registeredQueue.Get());
+        device=registeredDevice.Get();queue=registeredQueue.Get();
+    }else{
+        Log("OpenXRManager: registered graphics identity unavailable or device mismatch; retaining original binding\n");
+    }
 
     Log("OpenXRManager: Initializing D3D12 Graphics Binding...\n");
 
@@ -1048,7 +1122,9 @@ bool OpenXRManager::BeginSession() {
         return false;
     }
 
-    m_sessionRunning.store(true, std::memory_order_relaxed);
+    m_sourceClock.Invalidate();
+    m_worldReplaySessionRun.fetch_add(1, std::memory_order_acq_rel);
+    m_sessionRunning.store(true, std::memory_order_release);
     NotifySubmitThread();   // in case threaded submit was wanted before the session started
     Log("OpenXRManager: Session begun.\n");
     return true;
@@ -1057,7 +1133,11 @@ bool OpenXRManager::BeginSession() {
 void OpenXRManager::EndSession() {
     if (m_session == XR_NULL_HANDLE || !m_sessionRunning.load(std::memory_order_relaxed)) return;
     xrEndSession(m_session);
-    m_sessionRunning.store(false, std::memory_order_relaxed);
+    m_sourceClock.Invalidate();
+    m_sessionRunning.store(false, std::memory_order_release);
+    m_worldReplaySessionRun.fetch_add(1, std::memory_order_acq_rel);
+    m_rightThumbrestProfileKnown.store(false, std::memory_order_relaxed);
+    m_rightThumbrestAvailable.store(false, std::memory_order_relaxed);
     Log("OpenXRManager: Session ended.\n");
 }
 
@@ -1076,8 +1156,12 @@ void OpenXRManager::PollEvents() {
             } else if (m_sessionState == XR_SESSION_STATE_STOPPING) {
                 EndSession();
             } else if (m_sessionState == XR_SESSION_STATE_EXITING || m_sessionState == XR_SESSION_STATE_LOSS_PENDING) {
+                m_sourceClock.Invalidate();
                 m_stopFrameThread.store(true, std::memory_order_relaxed);
             }
+        } else if (event.type == XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED) {
+            m_rightThumbrestProfileKnown.store(false, std::memory_order_relaxed);
+            RefreshRightThumbrestAvailability();
         } else if (event.type == XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING) {
             // Native OpenXR recenter (user held the home / system button, or used the runtime menu) —
             // the runtime is about to remap "forward" of its tracking space at changed->changeTime.
@@ -1094,8 +1178,43 @@ void OpenXRManager::PollEvents() {
     }
 }
 
+void OpenXRManager::RefreshRightThumbrestAvailability() {
+    if (m_session == XR_NULL_HANDLE || m_handPaths[1] == XR_NULL_PATH
+        || m_oculusTouchProfilePath == XR_NULL_PATH) {
+        return;
+    }
+
+    XrInteractionProfileState profile{XR_TYPE_INTERACTION_PROFILE_STATE};
+    if (XR_SUCCEEDED(xrGetCurrentInteractionProfile(m_session, m_handPaths[1], &profile))
+        && profile.interactionProfile != XR_NULL_PATH) {
+        m_rightThumbrestAvailable.store(
+            profile.interactionProfile == m_oculusTouchProfilePath,
+            std::memory_order_relaxed);
+        m_rightThumbrestProfileKnown.store(true, std::memory_order_relaxed);
+    }
+}
+
 // [PumpInlineFrame() moved to openxr_frameloop.cpp]
 
+void OpenXRManager::RefreshSourceClock() {
+    const auto generation=m_sourceClock.Generation();
+    if(!m_sourceTimeConverter || !m_instance || m_stopFrameThread.load(std::memory_order_acquire) ||
+       !m_sessionRunning.load(std::memory_order_acquire)) {
+        m_sourceClock.Invalidate();return;
+    }
+    LARGE_INTEGER counter{},frequency{};XrTime now{};
+    if(!QueryPerformanceCounter(&counter) || !QueryPerformanceFrequency(&frequency) ||
+       XR_FAILED(m_sourceTimeConverter(m_instance,&counter,&now)) || now<=0) {
+        m_sourceClock.Invalidate();return;
+    }
+    m_sourceClock.Publish({counter.QuadPart,now,frequency.QuadPart,true},GetTrackingOriginSerial(),generation);
+}
+std::optional<cvr::framegen::CameraApplicationTime> OpenXRManager::SampleCameraApplicationTime(uint64_t origin) const {
+    if(m_stopFrameThread.load(std::memory_order_acquire) || !m_sessionRunning.load(std::memory_order_acquire) ||
+       ExternalPoseResetPending() || origin!=GetTrackingOriginSerial())return {};
+    LARGE_INTEGER counter{};if(!QueryPerformanceCounter(&counter))return {};
+    return m_sourceClock.AtCameraApplication(counter.QuadPart,origin);
+}
 bool OpenXRManager::ResolveRenderedPose(const OpenXRHeadPose& pose,XrPosef* out) const {
     if(!out || !pose.valid || ExternalPoseResetPending())return false;
     std::lock_guard lock(const_cast<std::mutex&>(m_renderPoseMutex));
@@ -1234,12 +1353,22 @@ bool OpenXRManager::GetBodyTrackingFrame(cvr::body::TrackingFrame* out) const {
 }
 
 XrPosef OpenXRManager::ComputeMenuQuadPose(bool headPoseLocated, const XrPosef& headPose, XrTime displayTime) {
+    static bool lastLocated=false;
+    static unsigned diagnosticCount=0;
+    const bool report=diagnosticCount<64&&(!m_menuFollow.valid||headPoseLocated!=lastLocated);
+    const bool anchoredBefore=m_menuFollow.valid;
+    const float yawBefore=m_menuFollow.yaw;
+    lastLocated=headPoseLocated;
     // Head tracking dropped this frame: hold the last pose (don't jump to the base pose
     // -- that snapped the panel sideways / to the floor origin on brief tracking gaps).
     if (!headPoseLocated) {
         m_menuFollow.ResetDelay();
         m_menuClock.Reset();
-        if (m_menuFollow.valid) return m_menuQuadPose;
+        if (m_menuFollow.valid) {
+            if(report){++diagnosticCount;Log("[MENU-QUAD] tracked=0 hold=1 origin=%llu yaw=%.6f pos=%.4f/%.4f/%.4f\n",
+                GetTrackingOriginSerial(),yawBefore,m_menuQuadPose.position.x,m_menuQuadPose.position.y,m_menuQuadPose.position.z);}
+            return m_menuQuadPose;
+        }
     }
 
     // Reference head pose (live head, or the recenter base only for the FIRST anchor).
@@ -1267,6 +1396,9 @@ XrPosef OpenXRManager::ComputeMenuQuadPose(bool headPoseLocated, const XrPosef& 
     pose.position.y = ref.position.y + rotatedFwd.y;
     pose.position.z = ref.position.z + rotatedFwd.z;
     m_menuQuadPose = pose;
+    if(report){++diagnosticCount;Log("[MENU-QUAD] tracked=%d anchoredBefore=%d origin=%llu yawBefore=%.6f headYaw=%.6f quadYaw=%.6f head=%.4f/%.4f/%.4f quad=%.4f/%.4f/%.4f fov=%.3f\n",
+        int(headPoseLocated),int(anchoredBefore),GetTrackingOriginSerial(),yawBefore,headYaw,yaw,
+        ref.position.x,ref.position.y,ref.position.z,pose.position.x,pose.position.y,pose.position.z,GetMenuFov());}
     return pose;
 }
 
@@ -1296,37 +1428,50 @@ bool OpenXRManager::GetControllerState(VRControllerState* out) const {
 // Cheap and legal off the render thread: xrLocateSpace is a query, it does not block on the
 // compositor, and OpenXR requires it to be callable concurrently. It runs once per present
 // interval (the composition is already gated by a compare-exchange), not once per camera.
-bool OpenXRManager::LocateHeadPoseAt(XrTime displayTime, OpenXRHeadPose* out) {
-    if (!out || !m_session || m_viewSpace == XR_NULL_HANDLE || m_localSpace == XR_NULL_HANDLE) {
-        return false;
+bool OpenXRManager::LocateHeadPoseAt(XrTime displayTime, OpenXRHeadPose* out,bool requireExactTime,
+                                   cvr::framegen::HeadPoseQueryDiagnostics* diagnostics) {
+    using QueryCode=cvr::framegen::HeadPoseQueryCode;
+    if(diagnostics)*diagnostics={};
+    const auto failed=[&](QueryCode code){if(diagnostics)diagnostics->code=code;return false;};
+    if(out)out->locatedTime=0;
+    std::unique_lock sourceLifetime(m_initMutex,std::defer_lock);
+    if(requireExactTime) {
+        if(out)out->valid=false;
+        if(!sourceLifetime.try_lock() || m_stopFrameThread.load(std::memory_order_acquire))return failed(QueryCode::LifetimeBusyOrStopping);
     }
-    if (displayTime <= 0 || !m_sessionRunning.load(std::memory_order_relaxed)) return false;
+    if (!out || !m_session || m_viewSpace == XR_NULL_HANDLE || m_localSpace == XR_NULL_HANDLE) {
+        return failed(QueryCode::InvalidSession);
+    }
+    if (displayTime <= 0 || !m_sessionRunning.load(std::memory_order_relaxed)) return failed(QueryCode::InvalidTimeOrSession);
     const auto externalReset = m_externalPoseReset.Serial();
-    if (ExternalPoseResetPending()) return GetHeadPose(out);
+    if (ExternalPoseResetPending()) return requireExactTime ? failed(QueryCode::ResetBeforeQuery) : GetHeadPose(out);
 
     XrSpaceLocation loc{XR_TYPE_SPACE_LOCATION};
-    if (CyberpunkVR_PoseFromCycle) {
+    const bool cyclePose=!requireExactTime && CyberpunkVR_PoseFromCycle!=0;
+    if (cyclePose) {
         // FIXED PHASE: no locate of our own. The pose below was located once by the XR cycle,
         // immediately after xrWaitFrame, so `aim - now` is the same distance every frame.
         XrPosef cyc{};
         if (!GetCycleHeadPoseLocal(&cyc)) return false;
         loc.pose = cyc;
     } else {
-        if (XR_FAILED(xrLocateSpace(m_viewSpace, m_localSpace, displayTime, &loc))) return false;
+        const XrResult result=xrLocateSpace(m_viewSpace, m_localSpace, displayTime, &loc);
+        if(diagnostics){diagnostics->xrResult=int32_t(result);diagnostics->locationFlags=loc.locationFlags;}
+        if (XR_FAILED(result)) return failed(QueryCode::LocateSpaceFailed);
         constexpr XrSpaceLocationFlags wanted =
             XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
-        if ((loc.locationFlags & wanted) != wanted) return false;
+        if ((loc.locationFlags & wanted) != wanted) return failed(QueryCode::InvalidLocationFlags);
     }
 
     std::unique_lock externalResetLock(m_externalResetMutex);
     if (!m_externalPoseReset.Ready(externalReset) || ExternalPoseResetPending())
-        return GetHeadPose(out);
+        return requireExactTime ? failed(QueryCode::ResetAfterQuery) : GetHeadPose(out);
     // Same recenter transform the frame loop applies, so this pose is interchangeable with
     // GetHeadPose()'s: relOri = conj(base.ori) * raw, relPos = conj(base.ori) * (raw - base.pos).
     XrPosef base{};
     {
         std::lock_guard<std::mutex> lock(m_renderPoseMutex);
-        if (!m_basePoseSet) return false;
+        if (!m_basePoseSet) return failed(QueryCode::BasePoseMissing);
         base = m_basePose;
         out->originSerial = m_trackingOriginSerial.load(std::memory_order_acquire);
     }
@@ -1477,19 +1622,24 @@ bool OpenXRManager::LocateHeadPoseAt(XrTime displayTime, OpenXRHeadPose* out) {
             s_ori = NlerpQuat(s_ori, relOri, angT);
         }
         out->valid = true;
+        out->locatedTime=cyclePose ? 0 : displayTime;
         out->posX = s_pos.x;  out->posY = s_pos.y;  out->posZ = s_pos.z;
         out->oriX = s_ori.x;  out->oriY = s_ori.y;  out->oriZ = s_ori.z;  out->oriW = s_ori.w;
+        if(diagnostics)diagnostics->code=QueryCode::Success;
         return true;
     }
 
     out->valid = true;
+    out->locatedTime=cyclePose ? 0 : displayTime;
     out->posX = relPos.x;  out->posY = relPos.y;  out->posZ = relPos.z;
     out->oriX = relOri.x;  out->oriY = relOri.y;  out->oriZ = relOri.z;  out->oriW = relOri.w;
+    if(diagnostics)diagnostics->code=QueryCode::Success;
     return true;
 }
 
 bool OpenXRManager::GetHeadPose(OpenXRHeadPose* out) const {
     if (!out) return false;
+    out->locatedTime=0;
     out->originSerial = m_trackingOriginSerial.load(std::memory_order_acquire);
 
     const bool useSyncedPose = GetSyncSequential() != 0 && m_syncedPoseValid.load(std::memory_order_relaxed);
@@ -1601,6 +1751,14 @@ bool OpenXRManager::GetCurrentEyeFov(int eye, XrFovf* out) {
         m_syncedPoseValid.load(std::memory_order_relaxed);
     if (!useSyncedViews && static_cast<size_t>(eye) >= m_views.size()) return false;
     *out = useSyncedViews ? m_syncedEyeFovs[eye] : m_views[eye].fov;
+    return true;
+}
+
+bool OpenXRManager::GetCurrentEyeFovs(XrFovf (&out)[2]) {
+    std::lock_guard<std::mutex> viewLock(m_viewMutex);
+    const bool synced=(GetSyncSequential()!=0)&&m_syncedPoseValid.load(std::memory_order_relaxed);
+    if(!synced&&m_views.size()<2)return false;
+    for(unsigned i=0;i<2;++i)out[i]=synced?m_syncedEyeFovs[i]:m_views[i].fov;
     return true;
 }
 
@@ -2137,7 +2295,9 @@ void OpenXRManager::FlushHandsToShared(const OpenXRHeadPose* frameHead, XrTime f
 
 
 void OpenXRManager::Shutdown() {
+    cvr::framegen::UpdateAerModeRuntime({});
     RemoveSimulatorRecenterHook();
+    m_sourceClock.Invalidate();
     std::lock_guard<std::mutex> initLock(m_initMutex);
     m_stopFrameThread.store(true, std::memory_order_relaxed);
     m_depthStageCaptureAllowed.store(false, std::memory_order_release);
@@ -2158,11 +2318,60 @@ void OpenXRManager::Shutdown() {
         if (waitResult != WAIT_OBJECT_0) {
             Log("OpenXRManager: WARNING submit thread did not stop during shutdown (wait=%lu).\n",
                 waitResult);
+            // Its live frame still owns XR objects and command lists. Keep
+            // the handle/resources for a later retry; closing the handle is
+            // not proof that the thread stopped.
+            return;
         }
         CloseHandle(m_frameThread);
         m_frameThread = nullptr;
     }
+    ClearMenuUiPair(); // publisher leases only; stopped XR readers retire by their submit fence
+    cvr::menu_preview::ClearUiBackBuffers(); // swapchain teardown only; release registered source owners
 
+
+    cvr::framegen::StopAerModeOwner();
+    if(!PollSubmitResources(true)) {
+        Log("OpenXRManager: app XR GPU work still pending/unknown; retaining swapchains and submission resources.\n");
+        return;
+    }
+    {
+        std::lock_guard captureLock(m_captureMutex);
+        cvr::framegen::ClearNativeFgPairedSource();
+        m_retiredMainPools.Collect();
+        if(!m_mainPoolProducer.Complete() || m_retiredMainPools.Pending()) {
+            Log("OpenXRManager: MAIN producer writes still pending/unknown; retaining pools and XR resources.\n");
+            return;
+        }
+        if(m_editorSceneResample){m_editorSceneResample->Collect();
+            if(!m_editorSceneResample->TryShutdown()){Log("OpenXRManager: raw editor scene copy still pending/unknown; retaining capture pass.\n");return;}
+            m_editorSceneResample.reset();}
+    }
+    m_aerRealPresenter.Reset();
+    if(m_aerReconstruction) {
+        m_aerReconstruction->Collect();
+        if(!m_aerReconstruction->TryShutdown()) {
+            // Outstanding/unknown GPU work owns the XR images. Do not turn a
+            // stopped CPU frame thread into a false GPU-completion proof.
+            Log("OpenXRManager: AER GPU reads still pending; retaining XR objects for shutdown retry.\n");
+            return;
+        }
+        m_aerReconstruction.reset();
+    }
+    m_aerCompositorFrame=-1;
+    if(m_ownGenerationBridge) {
+        m_ownGenerationBridge->Collect();
+        if(m_ownGenerationConnected && !m_framegen.SetNativeBridge({})) {
+            Log("OpenXRManager: NVIDIA consumers still pending; retaining owner for shutdown retry.\n");
+            return;
+        }
+        m_ownGenerationConnected=false;m_ownGenerationBridge.reset();
+    }
+    m_ownRetirement.Finish(); // Shutdown follows the frame-thread join; never race its asynchronous stop.
+    if(m_ownGeneration){m_ownGeneration->stop();m_ownGeneration.reset();}
+    m_ownRetirement.Reset();
+    m_ownGenerationStopping=false;
+    m_ownGenerationPolicy.reset();
     // ---- OPENXR OBJECTS, IN DEPENDENCY ORDER -----------------------------------------------------
     //
     // Swapchains and spaces are children of the session, the session is a child of the instance, and
@@ -2173,7 +2382,16 @@ void OpenXRManager::Shutdown() {
     m_framegenOverlay.Shutdown(true);
     m_settingsPanel.Shutdown();
     cvr::framegen::StopHardwareTelemetry();
+    m_worldFrameReplay.Invalidate(); // No retained layer may outlive any child quad swapchain.
     m_hudQuad.Shutdown();
+    m_editorUiQuad.Shutdown();
+    m_editorUiDisplay.reset();m_editorUiDisplayOrigin=0;
+    m_editorUiPreparedSerial=0;
+    m_editorUiDisplaySwapchain=XR_NULL_HANDLE;
+    m_editorUiLifecycleEpoch=0;
+    m_editorUiAnchor.Reset();
+    cvr::menu_preview::ClearEditorUiSurfaces();
+    cvr::menu_preview::ClearEditorSceneImages();
     m_interactionQuad.Shutdown();
     m_basiliskQuad.Shutdown();
     m_surveillanceQuad.Shutdown();
@@ -2193,6 +2411,7 @@ void OpenXRManager::Shutdown() {
             eye.depthHandle = XR_NULL_HANDLE;
         }
     }
+    m_worldFrameReplay.Invalidate();
     m_eyeSwapchains.clear();
 
     for (int i = 0; i < 2; ++i) {
@@ -2233,6 +2452,10 @@ void OpenXRManager::Shutdown() {
     m_primaryButtonAction = XR_NULL_HANDLE;
     m_secondaryButtonAction = XR_NULL_HANDLE;
     m_menuButtonAction = XR_NULL_HANDLE;
+    m_rightThumbrestAction = XR_NULL_HANDLE;
+    m_oculusTouchProfilePath = XR_NULL_PATH;
+    m_rightThumbrestProfileKnown.store(false, std::memory_order_relaxed);
+    m_rightThumbrestAvailable.store(false, std::memory_order_relaxed);
     m_steamFrameActions = {};
 
     m_views.clear();
@@ -2243,9 +2466,10 @@ void OpenXRManager::Shutdown() {
         CloseHandle(m_fenceEvent);
         m_fenceEvent = nullptr;
     }
-    if (m_fence) {
-        m_fence->Release();
-        m_fence = nullptr;
+    {
+        std::lock_guard lock(m_presentMutex);
+        if(!m_submitFenceRetirement.RetireFence(m_fenceValue))return;
+        if (m_fence) {m_fence->Release();m_fence = nullptr;}
     }
     for (int i = 0; i < 3; ++i) {
         if (m_cmdLists[i]) {
@@ -2269,9 +2493,15 @@ void OpenXRManager::Shutdown() {
         CloseHandle(m_frameSyncEvent);
         m_frameSyncEvent = nullptr;
     }
+    {
+        std::lock_guard<std::mutex> lock(m_presentMutex);
+        m_monoCapturedFrame.colorCompletion = {};
+        m_monoCapturedFrame.nativeStamp = {};
+    }
     if (m_captureFence) {
         m_captureFence->Release();
         m_captureFence = nullptr;
+        m_captureContextFences.Cleared();
     }
     for (int i = 0; i < 3; ++i) {
         if (m_captureCmdAllocators[i]) {
@@ -2295,9 +2525,14 @@ void OpenXRManager::Shutdown() {
         m_colorBlit->Shutdown();
         m_colorBlit.reset();
     }
-    if (m_monoCapturedFrame.texture) {
-        m_monoCapturedFrame.texture->Release();
-        m_monoCapturedFrame.texture = nullptr;
+    {
+        std::lock_guard lock(m_presentMutex);
+        // texture is a borrowed alias of one pool cell, not an extra reference.
+        m_monoCapturedFrame={};
+        m_mainCaptureCatalogue.Reset(0,{});
+        for(auto*& resource:m_monoPool){if(resource)resource->Release();resource=nullptr;}
+        m_monoPoolCount=0;m_monoPoolSlot=0;
+        m_mainPoolProducer={};
     }
     if (m_depthSnapshot) {
         m_depthSnapshot->Release();
@@ -2356,6 +2591,7 @@ void OpenXRManager::Shutdown() {
     if (m_instance != XR_NULL_HANDLE) {
         xrDestroyInstance(m_instance);
         m_instance = XR_NULL_HANDLE;
+        m_sourceTimeConverter=nullptr;
     }
     m_initialized = false;
     m_poseValid.store(false, std::memory_order_relaxed);

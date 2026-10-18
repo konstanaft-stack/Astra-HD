@@ -28,6 +28,11 @@ struct Snapshot {
 };
 struct Frame {
     Microsoft::WRL::ComPtr<ID3D12Resource> canvas;
+    // Optional external producer lease; the copy slot retains this exact owner.
+    std::shared_ptr<const void> retainedOwner;
+    Microsoft::WRL::ComPtr<ID3D12Fence> producerFence;
+    uint64_t producerValue = 0;
+    D3D12_RESOURCE_STATES restingState = D3D12_RESOURCE_STATE_COPY_SOURCE;
     uint64_t stamp = 0, generation = 0, serial = 0;
     bool masked = false;
     bool lootVisible = false;

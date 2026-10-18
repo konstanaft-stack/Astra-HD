@@ -2,6 +2,13 @@
 #include "Stereo/RenderParity.hpp"
 #include "Stereo/FrameGraphFeatures.hpp"
 #include "Stereo/VrcamViewport.hpp"
+#include "Stereo/VrcamResizeState.hpp"
+#include "Framegen/Framegen.hpp"
+#include "Overlay/PpdNativeApply.hpp"
+#include "MenuPreview/Scope.hpp"
+#include "MenuPreview/ProducerRoute.hpp"
+#include "Render/DynamicTextureViewport.hpp"
+#include <RED4ext/Scripting/Natives/Generated/ent/RenderToTextureCameraComponent.hpp>
 // FrameGraph -- what the engine's frame graph decides for each view, and the RTT view it decides it for.
 //
 // The graph is rebuilt (fully, or incrementally) and for each view it computes a set of FEATURE BITS
@@ -76,7 +83,7 @@ static __int64 rtt_call_orig(__int64 a1, __int64 a2) {
     return r;
 }
 
-static __int64 __fastcall Detour_RTTViewCreate(__int64 a1, __int64 a2) {
+static __int64 RTTViewCreateImpl(__int64 a1, __int64 a2) {
     if (a1) {
         __try {
             uint64_t vt = *reinterpret_cast<uint64_t*>(a1);
@@ -185,6 +192,69 @@ static __int64 __fastcall Detour_RTTViewCreate(__int64 a1, __int64 a2) {
         } __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
     return rtt_call_orig(a1, a2);
+}
+
+// Keep SDK lifetime objects outside the SEH-containing existing implementation.
+// A resource pointer here is the native RTT backing identity, not GPU completion.
+struct PreviewRttFields {uint32_t width{},height{};uint64_t name{};uintptr_t resource{};};
+static bool ReadPreviewRttFields(uintptr_t component,PreviewRttFields* output) {
+    __try {
+        if(!component || !output)return false;
+        output->width=*reinterpret_cast<const uint32_t*>(component+0x258);
+        output->height=*reinterpret_cast<const uint32_t*>(component+0x25C);
+        output->name=*reinterpret_cast<const uint64_t*>(component+0x260);
+        output->resource=*reinterpret_cast<const uintptr_t*>(component+0x1E8);
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER){return false;}
+}
+static bool RequestPreviewRttDirty(uintptr_t component){
+    __try {*reinterpret_cast<volatile int32_t*>(component+0xA00)=1;return true;}
+    __except(EXCEPTION_EXECUTE_HANDLER){return false;}
+}
+static __int64 __fastcall Detour_RTTViewCreate(__int64 a1,__int64 a2) {
+    cvr::menu_preview::Lease preview;
+    const bool acquired=cvr::menu_preview::TryAcquireForComponent(uintptr_t(a1),preview);
+    static std::mutex probeMutex;
+    static uint32_t emitted{},lastEpoch{},lastSetup{};
+    static uint64_t lastTick{};
+    bool emit=false;
+    if(acquired) {
+        const uint64_t now=GetTickCount64();
+        std::lock_guard probeLock(probeMutex);
+        const bool changed=preview.metadata.screenEpoch!=lastEpoch || preview.metadata.setupID!=lastSetup;
+        if(emitted<32 && (!emitted || changed || now-lastTick>=500)) {
+            ++emitted;lastTick=now;lastEpoch=preview.metadata.screenEpoch;lastSetup=preview.metadata.setupID;emit=true;
+        }
+    }
+    const auto caller=reinterpret_cast<uintptr_t>(_ReturnAddress());
+    PreviewRttFields before{},after{};
+    const bool beforeRead=emit && ReadPreviewRttFields(uintptr_t(a1),&before);
+    if(emit)log("[MenuPreview] rtt-view-begin component=%llx epoch=%u setup=%u virtual=%llx name=%llx dims=%ux%u resource=%llx readable=%u caller=%llx callerRva=%llx arg2=%llx; observation only",
+        uint64_t(a1),preview.metadata.screenEpoch,preview.metadata.setupID,preview.metadata.virtualCameraNameHash,
+        before.name,before.width,before.height,before.resource,unsigned(beforeRead),caller,
+        caller>=uintptr_t(g_exe_base)?caller-uintptr_t(g_exe_base):0,uint64_t(a2));
+    const auto result=RTTViewCreateImpl(a1,a2);
+    static const auto testMode=[] {char value[24]{},local[24]{};const auto n=GetEnvironmentVariableA("CPVR_MENU_STEREO_CAMERA_TEST",value,sizeof(value));
+        const auto l=GetEnvironmentVariableA("CPVR_MENU_LOCAL_CAMERA_TEST",local,sizeof(local));
+        if((l==4 && std::strcmp(local,"left")==0)||(l==5 && std::strcmp(local,"right")==0))return cvr::menu_preview::CameraTestMode::Off;
+        return n && n<sizeof(value)?cvr::menu_preview::ParseCameraTestMode(value):cvr::menu_preview::CameraTestMode::Off;}();
+    if(testMode!=cvr::menu_preview::CameraTestMode::Off){
+        cvr::menu_preview::Lease current;PreviewRttFields fields{};
+        if(cvr::menu_preview::TryAcquireForComponent(uintptr_t(a1),current) &&
+           ReadPreviewRttFields(uintptr_t(a1),&fields) && fields.resource && fields.name==current.metadata.virtualCameraNameHash){
+            static std::mutex budgetMutex;static cvr::menu_preview::DirtyRequestBudget budget;
+            bool requested=false;uint32_t count{};
+            {std::lock_guard lock(budgetMutex);if(budget.Take()){count=budget.Count();requested=RequestPreviewRttDirty(uintptr_t(a1));}}
+            if(count==1 || count==96)log("[MenuPreview] next-driver-dirty component=%llx epoch=%u setup=%u request=%u wrote=%u limit=96; after original native callback, no synchronous wrapper",
+                uint64_t(a1),current.metadata.screenEpoch,current.metadata.setupID,count,unsigned(requested));
+            if(count==96)log("[MenuPreview] next-driver-dirty diagnostic request limit reached; subsequent cached eye must retain actual producer label");
+        }
+    }
+    const bool afterRead=emit && ReadPreviewRttFields(uintptr_t(a1),&after);
+    if(emit)log("[MenuPreview] rtt-view-return component=%llx epoch=%u setup=%u name=%llx dims=%ux%u resource=%llx readable=%u nativeResult=%llx; result is opaque, not GPU completion",
+        uint64_t(a1),preview.metadata.screenEpoch,preview.metadata.setupID,after.name,after.width,after.height,
+        after.resource,unsigned(afterRead),uint64_t(result));
+    return result;
 }
 
 // --- DIAGNOSTIC (phase 1): where does the eye go in sub_140219730's per-view loop? ---
@@ -827,49 +897,98 @@ static void water_mirror_apply(uintptr_t view) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
-// Resolve the render texture-manager: texMgr = *(*(exe+0x3427C00)+0x70).
-static void* resolve_texmgr() {
+// Pinned CP2077 2.31 A7DE...0991: DynamicTexture's own viewport setter.
+// RTTViewCreate calls it at RVA 0x1E99471. It takes the RESOURCE (comp+1E8),
+// acquires resource+57's lock, updates viewport dimensions +4C/+50, and calls
+// 0x821680 to rebuild its internal backing if present. It is void.
+// ResizeDynamicTexture 0x291A4D4 instead takes an INTERNAL render-texture
+// handle (+8 refcount): passing the resource directly to that API is invalid.
+static constexpr uintptr_t kDynamicTextureViewportRva=0x821828;
+static bool dynamic_viewport_api_supported() {
     __try {
-        uintptr_t renderer = *reinterpret_cast<uintptr_t*>(g_exe_base + RVA_RENDERER_GLOBAL);
-        if (!renderer) return nullptr;
-        return *reinterpret_cast<void**>(renderer + 0x70);
-    } __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+        if(!g_exe_base)return false;
+        const auto* base=reinterpret_cast<const uint8_t*>(g_exe_base);
+        const auto* dos=reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+        if(dos->e_magic!=IMAGE_DOS_SIGNATURE||dos->e_lfanew<0||dos->e_lfanew>0x1000)return false;
+        const auto* nt=reinterpret_cast<const IMAGE_NT_HEADERS64*>(base+dos->e_lfanew);
+        if(nt->Signature!=IMAGE_NT_SIGNATURE||nt->FileHeader.Machine!=IMAGE_FILE_MACHINE_AMD64||
+           nt->FileHeader.TimeDateStamp!=0x68AF45EA||nt->OptionalHeader.SizeOfImage!=0x4EFC000)return false;
+        static constexpr uint8_t expected[]={
+            0x48,0x8B,0xC4,0x48,0x89,0x58,0x08,0x48,0x89,0x68,0x10,0x48,0x89,0x70,0x18,
+            0x48,0x89,0x78,0x20,0x41,0x56,0x48,0x83,0xEC,0x20,0x33,0xF6,0x41,0x8B,0xE8,
+            0x44,0x8B,0xF2,0x48,0x8B,0xF9,0x39,0x71,0x40};
+        return std::memcmp(base+kDynamicTextureViewportRva,expected,sizeof(expected))==0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {return false;}
 }
 
-// Resize the RTT output DynamicTexture (*(comp+0x1E8)) to the target so the vrcam
-// render matches. Target = explicit RttResizeW/H, else MAIN dims (g_main_ctx+0x44/
-// +0x4C). No-op when already correct. Marshaled/thread-safe. SEH-guarded.
-static void maybe_resize_rtt(uintptr_t comp) {
-    if (!CyberpunkVR_RttResizeMatchMain || !comp) return;
+static bool set_dynamic_viewport_checked(void* resource,uint32_t width,uint32_t height) {
+    using SetViewportFn=void(__fastcall*)(void*,uint32_t,uint32_t);
     __try {
+        reinterpret_cast<SetViewportFn>(g_exe_base+kDynamicTextureViewportRva)(resource,width,height);
+        return true; // dispatch only; NOT completion/Applied
+    } __except (EXCEPTION_EXECUTE_HANDLER) {return false;}
+}
+
+// Called only with the live component supplied by this engine driver callback.
+// No cached engine handle survives it. The mode owner controls world epochs;
+// accepted presentation, not this void setter, owns the final Applied ack.
+static void maybe_resize_rtt(uintptr_t comp) {
+    if(!comp)return;
+    const auto pending=ppd::g_vrcamResizeState.Read();
+    if(pending.phase!=ppd::VrcamResizePhase::Idle && pending.phase!=ppd::VrcamResizePhase::Requested)return;
+    const bool pairedReference=!cvr::framegen::GetSettings().aerV2 && bool(cvr::ppd::ReadNativeRequestedSize());
+    if(pending.phase==ppd::VrcamResizePhase::Idle && !CyberpunkVR_RttResizeMatchMain && !pairedReference)return;
+    const bool apiSupported=dynamic_viewport_api_supported();
+    __try {
+        const uint64_t cameraKey=*reinterpret_cast<const uint64_t*>(comp+0x260);
+        if(cameraKey!=g_vrcam_ctx_key.load(std::memory_order_acquire))return;
         void* dtex = *reinterpret_cast<void**>(comp + 0x1E8);
         if (!dtex) return;
-        uint8_t* d = reinterpret_cast<uint8_t*>(dtex);
-        uint32_t cw = *reinterpret_cast<uint32_t*>(d + 0x40);
-        uint32_t ch = *reinterpret_cast<uint32_t*>(d + 0x44);
-        CyberpunkVR_DebugRttDtexW = cw;
-        CyberpunkVR_DebugRttDtexH = ch;
+        const auto* d=reinterpret_cast<const uint8_t*>(dtex);
+        const bool scaleToViewport=*(d+0x48)==1;
+        if(pending.phase!=ppd::VrcamResizePhase::Idle){
+            if(ppd::DispatchVrcamResize(ppd::g_vrcamResizeState,
+                                      {cameraKey,dtex,scaleToViewport,apiSupported},set_dynamic_viewport_checked))
+                CVR_DIAGNOSTIC(++CyberpunkVR_DebugRttResizeHits);
+            return;
+        }
+        // Retain the existing default-OFF diagnostic control through the same
+        // correct resource API. These CPU viewport fields are NOT GPU evidence.
+        if(!apiSupported||!scaleToViewport)return;
+        const uint32_t cw=*reinterpret_cast<const uint32_t*>(d+0x4C);
+        const uint32_t ch=*reinterpret_cast<const uint32_t*>(d+0x50);
+        CyberpunkVR_DebugRttDtexW=cw;CyberpunkVR_DebugRttDtexH=ch;
         uint32_t tw = CyberpunkVR_RttResizeW, th = CyberpunkVR_RttResizeH;
+        if(pairedReference){tw=th=0;
+            if(const auto native=cvr::ppd::ReadNativeRequestedSize()){tw=native->size.width;th=native->size.height;}}
         if (!tw || !th) {                 // no explicit target -> match MAIN
             if (!g_main_ctx) return;
             tw = *reinterpret_cast<uint32_t*>(g_main_ctx + 0x44);
             th = *reinterpret_cast<uint32_t*>(g_main_ctx + 0x4C);
         }
         if (!tw || !th || tw > 8192 || th > 8192) return;
+        if(pairedReference){
+            // Actual RTT projection input from the game's reflected component,
+            // not merely SL metadata or a post-render stretch of the image.
+            static_assert(offsetof(RED4ext::ent::RenderToTextureCameraComponent,aspectRatio)==0x9E8);
+            static_assert(offsetof(RED4ext::ent::RenderToTextureCameraComponent,resolutionWidth)==0x258);
+            static_assert(offsetof(RED4ext::ent::RenderToTextureCameraComponent,resolutionHeight)==0x25C);
+            auto* camera=reinterpret_cast<RED4ext::ent::RenderToTextureCameraComponent*>(comp);
+            const float aspect=float(tw)/float(th),oldAspect=camera->aspectRatio;
+            if(!(oldAspect>.1f&&oldAspect<10.f))return;
+            if(std::abs(oldAspect-aspect)>1e-6f||camera->resolutionWidth!=tw||camera->resolutionHeight!=th){
+                camera->aspectRatio=aspect;camera->resolutionWidth=tw;camera->resolutionHeight=th;
+                // Existing proven RTT-driver dirty flag: rebuild native camera
+                // projection/culling together with its resized texture.
+                *reinterpret_cast<volatile int32_t*>(comp+0xA00)=1;
+                log("[paired-optics] RTT aspect %.9g -> %.9g for %ux%u",double(oldAspect),double(aspect),tw,th);}
+        }
         if (cw == tw && ch == th) return; // already correct
-        if (!g_resize_dyntex)
-            g_resize_dyntex = reinterpret_cast<ResizeDynTexFn>(g_exe_base + RESIZE_DYNTEX_RVA);
-        void* texMgr = resolve_texmgr();
-        if (!texMgr) return;
-        void* holder = dtex;              // proven-safe pattern: &localHolder
-        g_resize_dyntex(texMgr, &holder, tw, th, 1);
-        // Align the OUTPUT texture's own CPU dims + disable scaleToViewport so the
-        // FINAL output resource follows the target too (not just the render RTs).
-        *reinterpret_cast<uint32_t*>(d + 0x40) = tw;   // width
-        *reinterpret_cast<uint32_t*>(d + 0x44) = th;   // height
-        *reinterpret_cast<uint32_t*>(d + 0x48) = 0;    // scaleToViewport off
-        CVR_DIAGNOSTIC(++CyberpunkVR_DebugRttResizeHits);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        if(set_dynamic_viewport_checked(dtex,tw,th))
+            CVR_DIAGNOSTIC(++CyberpunkVR_DebugRttResizeHits);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        ppd::g_vrcamResizeState.Fail(pending.request.id,ppd::VrcamResizeError::EngineException);
+    }
 }
 
 // Bridges the FlagCompute hook to the RectCompute hook within a single per-view
@@ -1171,3 +1290,11 @@ CVR_DETOUR("[rtt] view-create sub_1404FBAFC", RTT_VIEWCREATE_RVA, Detour_RTTView
 
 }  // namespace detail
 }  // namespace cvr
+
+bool cvr::render::RequestDynamicTextureViewport(void* resource,uint32_t width,uint32_t height)noexcept {
+    if(!resource||width<128||height<128||width>8192||height>8192||!cvr::detail::dynamic_viewport_api_supported())return false;
+    __try {
+        if(*(reinterpret_cast<const uint8_t*>(resource)+0x48)!=1)return false;
+        return cvr::detail::set_dynamic_viewport_checked(resource,width,height);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {return false;}
+}

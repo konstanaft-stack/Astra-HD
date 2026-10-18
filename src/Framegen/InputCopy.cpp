@@ -18,9 +18,8 @@ void Barrier(ID3D12GraphicsCommandList* list,ID3D12Resource* resource,D3D12_RESO
     v.Transition={resource,D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,a,b};list->ResourceBarrier(1,&v);
 }
 }
-bool CopyInput(ID3D12GraphicsCommandList* list,const InputTag& tag,Inputs& out) {
-    if(!list || !tag.resource || tag.type>1)return false;
-    const auto desc=tag.resource->GetDesc();
+bool InspectInputDescription(const D3D12_RESOURCE_DESC& desc,const InputTag& tag,InputExtent& out) {
+    if(tag.type>1)return false;
     if(desc.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count!=1 || desc.DepthOrArraySize!=1)return false;
     const uint32_t width=tag.width ? tag.width : uint32_t(desc.Width),height=tag.height ? tag.height : desc.Height;
     if(!width || !height || width>16384 || height>16384 || uint64_t(tag.x)+width>desc.Width || uint64_t(tag.y)+height>desc.Height)return false;
@@ -33,6 +32,14 @@ bool CopyInput(ID3D12GraphicsCommandList* list,const InputTag& tag,Inputs& out) 
             default:return false;
         }
     } else if(!MotionPixelBytes(format))return false;
+    out={width,height,format};return true;
+}
+bool InspectInputTag(const InputTag& tag,InputExtent& out) {
+    return tag.resource&&InspectInputDescription(tag.resource->GetDesc(),tag,out);
+}
+bool CopyInput(ID3D12GraphicsCommandList* list,const InputTag& tag,Inputs& out) {
+    InputExtent extent;if(!list || !InspectInputTag(tag,extent))return false;
+    const auto width=extent.width,height=extent.height;const auto format=extent.format;
     auto& target=tag.type==0 ? out.depth : out.motion;
     if(target) {
         ComPtr<ID3D12Device> sourceDevice,targetDevice;

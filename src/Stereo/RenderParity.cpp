@@ -1,4 +1,5 @@
 #include "Stereo/RenderParity.hpp"
+#include "MenuPreview/UiConsumer.hpp"
 #include "Stereo/FogHistory.hpp"
 #include "Stereo/StereoInternal.hpp"
 #include "Stereo/EngineRvas.hpp"
@@ -172,6 +173,11 @@ bool BindFogCamera(const FogCamera& camera) {
 
 using FogSrvFn=int64_t(__fastcall*)(uint32_t,uint32_t*,uintptr_t,uint32_t,uint8_t);
 FogSrvFn originalFogSrv{};
+int64_t ObservedFogSrv(uint32_t slot,uint32_t* handle,uintptr_t unused,uint32_t mip,uint8_t stage,uintptr_t caller){
+    const auto result=originalFogSrv(slot,handle,unused,mip,stage);
+    if(cvr::menu_preview::UiConsumerEnabled()){uint32_t copied{};if(handle)ReadU32Safe(reinterpret_cast<uintptr_t>(handle),&copied);cvr::menu_preview::ObserveUiNativeBinding(copied,slot,mip,stage,caller);}
+    return result;
+}
 int64_t __fastcall BindFogHistory(uint32_t slot,uint32_t* handle,uintptr_t unused,uint32_t mip,uint8_t stage) {
     const auto caller=reinterpret_cast<uintptr_t>(_ReturnAddress());
     const auto base=reinterpret_cast<uintptr_t>(g_exe_base);
@@ -180,17 +186,17 @@ int64_t __fastcall BindFogHistory(uint32_t slot,uint32_t* handle,uintptr_t unuse
     if(!CyberpunkVR_FogHistorySync || caller!=base+0x61CB68 || slot!=1 || mip || stage!=2 ||
        t_current_node_work!=base+VOLUMETRIC_FOG_NODE_RVA || t_view_side!=1 || !handle || !*handle ||
        !fogWorkContext || !fogWork.cameraValid)
-        return originalFogSrv(slot,handle,unused,mip,stage);
+        return ObservedFogSrv(slot,handle,unused,mip,stage,caller);
     RenderOwner owner{};uint32_t frame{};uintptr_t registryPointer{},registry{};
     const auto pose=cvr::camera::CurrentNodePoseIdentity();
     if(!Owner(owner,frame) || owner!=fogWork.owner || frame!=fogWork.frame || !pose ||
        pose.poseId!=fogWork.pose || !ReadPtrSafe(fogWorkContext+8,&registryPointer) || !registryPointer ||
-       !ReadPtrSafe(registryPointer,&registry))return originalFogSrv(slot,handle,unused,mip,stage);
+       !ReadPtrSafe(registryPointer,&registry))return ObservedFogSrv(slot,handle,unused,mip,stage,caller);
     FogSource source;FogGridSample grid;
     {std::lock_guard lock(fogMutex);source=mainFog;grid=fogGrids[1];}
     if(!source.valid || !grid.valid || grid.owner!=owner || grid.frame!=frame) {
         CVR_PARITY_DIAGNOSTIC(++CyberpunkVR_FogReprojectionCounters[2]);
-        return originalFogSrv(slot,handle,unused,mip,stage);
+        return ObservedFogSrv(slot,handle,unused,mip,stage,caller);
     }
     FogAllocation live{},scattering{},integrated{};
     FogCamera patched{};
@@ -199,15 +205,15 @@ int64_t __fastcall BindFogHistory(uint32_t slot,uint32_t* handle,uintptr_t unuse
        !CanBorrowFog(source.sample,owner,registry,frame,pose.poseId,XrDiagNowUs(),live,scattering,integrated,source.grid,grid.grid) ||
        !ApplyFogHistoryProjection(fogWork.camera,source.projection,patched)) {
         CVR_PARITY_DIAGNOSTIC(++CyberpunkVR_FogReprojectionCounters[3]);
-        return originalFogSrv(slot,handle,unused,mip,stage);
+        return ObservedFogSrv(slot,handle,unused,mip,stage,caller);
     }
     if(!BindFogCamera(patched)) {
         CVR_PARITY_DIAGNOSTIC(++CyberpunkVR_FogReprojectionCounters[4]);
-        return originalFogSrv(slot,handle,unused,mip,stage);
+        return ObservedFogSrv(slot,handle,unused,mip,stage,caller);
     }
     auto borrowed=source.sample.handle;
     CVR_PARITY_DIAGNOSTIC(++CyberpunkVR_FogReprojectionCounters[1];++CyberpunkVR_RenderParityCounters[5]);
-    return originalFogSrv(slot,&borrowed,unused,mip,stage);
+    return ObservedFogSrv(slot,&borrowed,unused,mip,stage,caller);
 }
 CVR_DETOUR("[render-parity] reproject MAIN fog history",0x1FABD0,BindFogHistory,originalFogSrv);
 }

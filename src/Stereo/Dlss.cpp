@@ -1,6 +1,14 @@
+#include "MenuPreview/UiConsumer.hpp"
+#include "MenuPreview/PixelReadback.hpp"
 #include "Utils/DebugGate.hpp"
+#include "Framegen/SrHistoryIntegration.hpp"
+#include "Framegen/SrIdentityDiagnostics.hpp"
 #include "Render/NativeStereoProbe.hpp"
+#include "Render/StereoSceneState.hpp"
 #include "Render/CommandResources.hpp"
+#include "Render/NativeColorSource.hpp"
+#include "MenuPreview/ImageLineage.hpp"
+#include "Framegen/NativeFgObservation.hpp"
 // Dlss -- Streamline and DLSS, made to agree about two views.
 //
 // Five detours: the Streamline constant upload, the DLSS constants, the evaluate call, the apply, and
@@ -13,6 +21,8 @@
 // appears in this module's history at all.
 
 #include "Stereo/SyncStereo.hpp"
+#include "Stereo/NativeSlFrameTimeline.hpp"
+#include "Framegen/Framegen.hpp"
 #include "Framegen/Inputs.hpp"
 #include "Camera/ImagePoseIdentity.hpp"
 #include "Utils/StereoLog.hpp"
@@ -44,8 +54,36 @@
 
 namespace cvr {
 namespace detail {
+// The native constants object is shared by MAIN/VRCAM. Its camera writer and
+// frame-deduplication field must be one serialized transaction per view.
+static std::recursive_mutex s_cameraConstantsMutex;
+static uintptr_t s_vrcamConstantsOwner{};
+static uint64_t s_vrcamConstantsFrame=UINT64_MAX;
+static std::mutex s_slTimelineMutex;
+static cvr::stereo::NativeSlFrameTimeline s_slTimeline;
+static thread_local bool s_vrcamSlEvaluation{};
+bool read_sl_render_clock(uintptr_t* owner,uint32_t* frame) {
+    __try {
+        if(!owner || !frame || !g_exe_base)return false;
+        const auto p=*reinterpret_cast<const uintptr_t*>(g_exe_base+RENDERER_GLOBAL_RVA);
+        if(!p)return false;*owner=p;*frame=*reinterpret_cast<const uint32_t*>(p+0x4CA4);return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER){return false;}
+}
+void publish_main_sl_frame(uintptr_t owner,uint32_t frame,uint32_t index) {
+    std::lock_guard lock(s_slTimelineMutex);s_slTimeline.Publish(owner,frame,index);
+}
+bool paired_sl_frame_index(uint32_t* index) {
+    if(!index || !CyberpunkVR_VrcamDlss || !(t_vrcam_sl_active || s_vrcamSlEvaluation) ||
+       cvr::framegen::GetSettings().aerV2)return false;
+    uintptr_t owner{};uint32_t frame{};
+    if(!read_sl_render_clock(&owner,&frame))return false;
+    const auto pose=cvr::camera::CurrentNodePoseIdentity();
+    if(pose && (pose.view!=2 || (pose.hasRenderFrameId && pose.renderFrameId!=frame)))return false;
+    std::lock_guard lock(s_slTimelineMutex);const auto value=s_slTimeline.Resolve(owner,frame);
+    if(!value)return false;*index=*value;return true;
+}
 
-static __int64 __fastcall Detour_SlConstants(void* a1, void* a2, void* a3) {
+static __int64 __fastcall SlConstantsImpl(void* a1, void* a2, void* a3) {
     // MAIN identity, step 2: this writer is the only place that sees the view OBJECT and the
     // view CTX for the same view, so it is where the object recorded from MAIN-only nodes
     // becomes a ctx pointer every other hook can compare against. Re-pinned every frame, so a
@@ -197,19 +235,53 @@ static __int64 __fastcall Detour_SlConstants(void* a1, void* a2, void* a3) {
             t_vrcam_sl_active = ctx && *reinterpret_cast<uint64_t*>(ctx + 0x28) == g_vrcam_ctx_key;
         } __except (EXCEPTION_EXECUTE_HANDLER) { t_vrcam_sl_active = false; }
     }
+    if(cvr::framegen::SrIdentityTraceRequested() && a2){
+        __try {
+            const auto pose=cvr::camera::CurrentNodePoseIdentity();
+            static std::atomic<uint64_t> calls[3]{};
+            const auto side=pose.view<=2 ? pose.view : 0;
+            const auto n=++calls[side];
+            if(n<=12 || n%240==0){
+                const auto object=sl_view_obj(a2);
+                if(object)log("[sl-view-consume] view=%u object=%p index=%u native=%u known=%d",
+                    side,reinterpret_cast<void*>(object),*reinterpret_cast<const uint32_t*>(object+0x1A0),
+                    pose.renderFrameId,int(pose.hasRenderFrameId));
+            }
+        } __except(EXCEPTION_EXECUTE_HANDLER){log("[sl-view-consume] unavailable");}
+    }
     __int64 sl_ret = g_orig_sl_const(a1, a2, a3);
     t_vrcam_sl_active = prev_sl_active;
     return sl_ret;
 }
 
+static __int64 __fastcall Detour_SlConstants(void* a1,void* a2,void* a3){
+    std::lock_guard lock(s_cameraConstantsMutex);return SlConstantsImpl(a1,a2,a3);
+}
 // DLSS constants driver (sub_14078933C -> slSetConstants). Flip to vrcam's SL
 // viewport while the camera writer is processing the vrcam view.
-static __int64 __fastcall Detour_DlssConst(void* a1, unsigned int a2) {
+static __int64 __fastcall DlssConstImpl(void* a1, unsigned int a2) {
     bool flipped = false; int32_t saved = 0;
+    bool frameFlipped=false;uint64_t savedFrame{};const unsigned suppliedFrame=a2;
+    const auto pose=cvr::camera::CurrentNodePoseIdentity();
+    const bool aer=cvr::framegen::GetSettings().aerV2;
     if (CyberpunkVR_VrcamDlss && t_vrcam_sl_active && a1) {
         __try {
             int32_t* vp = reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(a1) + DLSS_VP_OFF);
             saved = *vp; *vp = CyberpunkVR_VrcamDlssViewport; flipped = true;
+            // 2.31 native78933C compares/stores uint64 frame at +4A0 and
+            // passes its uint32 argument to slGetNewFrameToken. Native RTT's
+            // view+1A0 stays zero. The MAIN factory has supplied an exact index
+            // for this renderer frame BEFORE either view executes.
+            // In paired mode always isolate even if a stamp is missing. Keep
+            // the existing AER route unchanged; its history owner is separate.
+            const auto legacyMain=aer ? g_main_view_obj.load(std::memory_order_acquire) : 0;
+            if(!aer || (pose && pose.view==2 && pose.hasRenderFrameId && legacyMain)){
+                if(s_vrcamConstantsOwner!=uintptr_t(a1)){s_vrcamConstantsOwner=uintptr_t(a1);s_vrcamConstantsFrame=UINT64_MAX;}
+                auto* last=reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(a1)+0x4A0);
+                savedFrame=*last;*last=s_vrcamConstantsFrame;frameFlipped=true;
+                if(aer)a2=*reinterpret_cast<const uint32_t*>(legacyMain+0x1A0);
+                else {uint32_t index{};if(paired_sl_frame_index(&index))a2=index;}
+            }
             // A/B: zero the jitter the const-setter (g_orig) is about to copy into sl::Constants.
             // The camera-writer filled it just before this call; zeroing here makes DLSS treat the
             // vrcam frame as un-jittered.
@@ -222,12 +294,18 @@ static __int64 __fastcall Detour_DlssConst(void* a1, unsigned int a2) {
     }
     cvr::framegen::RecordNativeCamera(a1,t_vrcam_sl_active ? 2u : 1u);
     __int64 r = g_orig_dlss_const(a1, a2);
+    if(flipped){static uint64_t calls{};if(++calls<=6||calls%240==0)log("[paired-sl-frame] supplied=%u applied=%u nativeKnown=%d native=%u isolated=%d",suppliedFrame,a2,int(pose.hasRenderFrameId),pose.renderFrameId,int(frameFlipped));}
     if (flipped) {
         __try {
+            if(frameFlipped){auto* last=reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(a1)+0x4A0);
+                s_vrcamConstantsFrame=*last;*last=savedFrame;}
             *reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(a1) + DLSS_VP_OFF) = saved;
         } __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
     return r;
+}
+static __int64 __fastcall Detour_DlssConst(void* a1,unsigned int a2){
+    std::lock_guard lock(s_cameraConstantsMutex);return DlssConstImpl(a1,a2);
 }
 
 // DLSS tag+eval driver (sub_141D4FDC0). a2 = view spec; key at *(*(a2+0x18)+0x28).
@@ -255,7 +333,10 @@ static void __fastcall Detour_DlssEval(void* a1, void* a2, int a3, int a4, int a
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) { flipped = false; }
     }
+    const bool previousEvaluation=s_vrcamSlEvaluation;
+    s_vrcamSlEvaluation=flipped;
     g_orig_dlss_eval(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
+    s_vrcamSlEvaluation=previousEvaluation;
     if (flipped) {
         __try {
             // save vrcam's updated cache for next frame, restore main's cache into a1
@@ -376,6 +457,8 @@ void STDMETHODCALLTYPE hk_RSSetViewports(
     const CommandListVtableHook* e = command_list_hook_entry(self);
     PFN_RSSetViewports orig = e ? e->viewports_original : nullptr;
     if (orig) orig(self, count, vps);
+    if(cvr::menu_preview::PreviewPixelsRequested())cvr::menu_preview::PreviewPixelViewports(self,count,orig?vps:nullptr);
+    if(cvr::menu_preview::UiRasterDiagnosticsEnabled())cvr::menu_preview::UiRasterViewports(self,count,vps);
     if(CyberpunkVR_NativeStereoProbeState.load(std::memory_order_relaxed)==1)cvr::stereo::native_probe::Viewports(self,count,vps);
 }
  void STDMETHODCALLTYPE hk_RSSetScissorRects(
@@ -384,11 +467,20 @@ void STDMETHODCALLTYPE hk_RSSetViewports(
     const CommandListVtableHook* e = command_list_hook_entry(self);
     PFN_RSSetScissorRects orig = e ? e->scissor_original : nullptr;
     if (orig) orig(self, count, rects);
+    if(cvr::menu_preview::PreviewPixelsRequested())cvr::menu_preview::PreviewPixelScissors(self,count,orig?rects:nullptr);
+    if(cvr::menu_preview::UiRasterDiagnosticsEnabled())cvr::menu_preview::UiRasterScissors(self,count,rects);
     if(CyberpunkVR_NativeStereoProbeState.load(std::memory_order_relaxed)==1)cvr::stereo::native_probe::Scissors(self,count,rects);
 }
  HRESULT STDMETHODCALLTYPE hk_GfxReset(
         ID3D12GraphicsCommandList* self, ID3D12CommandAllocator* alloc,
         ID3D12PipelineState* pso) {
+    if(cvr::menu_preview::EditorUiPrivateCommands()){
+        const auto* e=command_list_hook_entry(self);
+        if(!e||!e->reset_original)return E_FAIL;
+        const auto result=e->reset_original(self,alloc,pso);
+        if(SUCCEEDED(result))cvr::gpu::ResetCommandResources(self);
+        return result;
+    }
     t_vrcam_dlss_post = false;
     t_cur_rt_w = 0; t_cur_rt_h = 0;   // stale RT cleared at frame-start recording
     // A reset ends the recording that owned any pending HUD bind. Dropping it here means the
@@ -405,14 +497,26 @@ void STDMETHODCALLTYPE hk_RSSetViewports(
     vision_swap_list_reset();
     const CommandListVtableHook* e = command_list_hook_entry(self);
     PFN_GfxReset orig = e ? e->reset_original : nullptr;
+    const bool pixelLifecycle=cvr::menu_preview::LockPreviewPixelLifecycle();
     const HRESULT result=orig ? orig(self,alloc,pso) : S_OK;
     if(orig && SUCCEEDED(result)) {
         if(CyberpunkVR_NativeStereoProbeState.load(std::memory_order_relaxed)==1)
             cvr::stereo::native_probe::Reset(self,pso,e->shading_state_known);
+        else if(cvr::menu_preview::UiConsumerEnabled())cvr::stereo::scene_state::Reset(self);
         cvr::gpu::ResetCommandResources(self);
         cvr::camera::ResetImagePoseList(self);
+        cvr::menu_preview::ResetPreviewImageList(self);
+        cvr::menu_preview::UiResetList(self);
+        cvr::menu_preview::ResetEditorUiList(self);
+        cvr::menu_preview::UiPipelineState(self,pso);
+        cvr::render::NativeColorReset(self);
+        cvr::framegen::ResetNativeFgObservation(self);
+        ColorPathAuditReset(self);
         cvr::framegen::ResetList(self);
+        cvr::framegen::SrResetList(self);
     }
+    if(orig&&FAILED(result))cvr::menu_preview::ClosePreviewPixelList(self,false);
+    cvr::menu_preview::UnlockPreviewPixelLifecycle(pixelLifecycle);
     return result;
 }
 
@@ -636,3 +740,4 @@ volatile int32_t g_vrcam_dlss_ow = 0, g_vrcam_dlss_oh = 0;  // vrcam output dims
 
 }  // namespace detail
 }  // namespace cvr
+#include "MenuPreview/EditorUiSurface.hpp"

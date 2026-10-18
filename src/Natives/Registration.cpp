@@ -5,13 +5,82 @@
 // living beside any one family.
 
 #include "Natives/NativeFunctions.hpp"
+#include "Framegen/SourceFrameSystem.hpp"
+#include "Framegen/AerModeOwner.hpp"
+#include "Framegen/GameGenerationOwner.hpp"
 
 #include <RED4ext/RED4ext.hpp>
 #include <RED4ext/Scripting/Functions.hpp>
 
+extern void SetCetOverlayVisible(bool visible);
+
+static void PublishVRGameFrameGeneration(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, int32_t* aOut, int64_t a4) {
+    RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
+    int32_t provider=0, multiplier=0;
+    RED4ext::GetParameter(aFrame,&provider); RED4ext::GetParameter(aFrame,&multiplier);
+    aFrame->code++;
+    cvr::framegen::PublishGameGenerationChoice(unsigned(provider),unsigned(multiplier));
+    if(aOut)*aOut=1;
+}
+
+static void SetVRCetOverlayVisible(RED4ext::IScriptable* aContext, RED4ext::CStackFrame* aFrame, int32_t* aOut, int64_t a4) {
+    RED4EXT_UNUSED_PARAMETER(aContext); RED4EXT_UNUSED_PARAMETER(a4);
+    int32_t visible = 0;
+    RED4ext::GetParameter(aFrame, &visible);
+    aFrame->code++;
+    SetCetOverlayVisible(visible != 0);
+    if (aOut) *aOut = visible != 0 ? 1 : 0;
+}
+
 RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterTypes() {
+    cvr::framegen::RegisterAerModeNatives();
     auto rtti = RED4ext::CRTTISystem::Get();
     RED4ext::CBaseFunction::Flags flags = {.isNative = true, .isStatic = true};
+    auto previewBegin=RED4ext::CGlobalFunction::Create("VRPreviewScopeBegin","VRPreviewScopeBegin",&VRPreviewScopeBegin);
+    previewBegin->flags=flags;previewBegin->SetReturnType("Uint32");rtti->RegisterFunction(previewBegin);
+    auto preview=RED4ext::CGlobalFunction::Create("VRPreviewScopeUpdate","VRPreviewScopeUpdate",&VRPreviewScopeUpdate);
+    preview->flags=flags;preview->AddParam("handle:gameuiPuppetPreviewGameController","controller");
+    preview->AddParam("handle:entEntity","cameraOwner");preview->AddParam("handle:entIComponent","camera");
+    preview->AddParam("Uint32","epoch");preview->AddParam("Int32","screen");preview->AddParam("Bool","ready");
+    preview->SetReturnType("Bool");rtti->RegisterFunction(preview);
+    auto actorAnchor=RED4ext::CGlobalFunction::Create("VRPreviewEditorActorAnchor","VRPreviewEditorActorAnchor",&VRPreviewEditorActorAnchor);
+    actorAnchor->flags=flags;actorAnchor->AddParam("handle:gameuiPuppetPreviewGameController","controller");
+    actorAnchor->AddParam("handle:entEntity","actor");actorAnchor->AddParam("handle:entEntity","player");actorAnchor->AddParam("handle:entEntity","cameraOwner");
+    actorAnchor->AddParam("Uint32","epoch");actorAnchor->AddParam("Vector4","position");actorAnchor->AddParam("Quaternion","orientation");actorAnchor->AddParam("Vector4","staging");
+    actorAnchor->SetReturnType("Bool");rtti->RegisterFunction(actorAnchor);
+    auto previewClear=RED4ext::CGlobalFunction::Create("VRPreviewScopeClear","VRPreviewScopeClear",&VRPreviewScopeClear);
+    previewClear->flags=flags;previewClear->AddParam("Uint32","epoch");previewClear->SetReturnType("Bool");rtti->RegisterFunction(previewClear);
+    auto localHalf=RED4ext::CGlobalFunction::Create("VRPreviewLocalHalfIpd","VRPreviewLocalHalfIpd",&VRPreviewLocalHalfIpd);
+    localHalf->flags=flags;localHalf->SetReturnType("Float");rtti->RegisterFunction(localHalf);
+    auto menuStereo=RED4ext::CGlobalFunction::Create("VRPreviewStereoUiEnabled","VRPreviewStereoUiEnabled",&VRPreviewStereoUiEnabled);
+    menuStereo->flags=flags;menuStereo->SetReturnType("Bool");rtti->RegisterFunction(menuStereo);
+    auto menuPairReady=RED4ext::CGlobalFunction::Create("VRPreviewStereoUiPairSubmitted","VRPreviewStereoUiPairSubmitted",&VRPreviewStereoUiPairSubmitted);
+    menuPairReady->flags=flags;menuPairReady->AddParam("Uint32","epoch");menuPairReady->SetReturnType("Bool");rtti->RegisterFunction(menuPairReady);
+    auto menuAdvance=RED4ext::CGlobalFunction::Create("VRPreviewStereoUiCanAdvance","VRPreviewStereoUiCanAdvance",&VRPreviewStereoUiCanAdvance);
+    menuAdvance->flags=flags;menuAdvance->AddParam("Uint32","epoch");menuAdvance->AddParam("Int32","eye");menuAdvance->SetReturnType("Bool");rtti->RegisterFunction(menuAdvance);
+    auto localClock=RED4ext::CGlobalFunction::Create("VRPreviewLocalClock","VRPreviewLocalClock",&VRPreviewLocalClock);
+    localClock->flags=flags;localClock->SetReturnType("Float");rtti->RegisterFunction(localClock);
+    auto localPrepare=RED4ext::CGlobalFunction::Create("VRPreviewLocalPrepare","VRPreviewLocalPrepare",&VRPreviewLocalPrepare);
+    localPrepare->flags=flags;localPrepare->AddParam("handle:gameuiPuppetPreviewGameController","controller");
+    localPrepare->AddParam("Uint32","epoch");localPrepare->AddParam("Int32","setup");localPrepare->SetReturnType("Bool");rtti->RegisterFunction(localPrepare);
+    auto localPublish=RED4ext::CGlobalFunction::Create("VRPreviewLocalPublish","VRPreviewLocalPublish",&VRPreviewLocalPublish);
+    localPublish->flags=flags;localPublish->AddParam("handle:gameuiPuppetPreviewGameController","controller");
+    localPublish->AddParam("Uint32","epoch");localPublish->AddParam("Int32","setup");localPublish->AddParam("Int32","eye");localPublish->SetReturnType("Bool");rtti->RegisterFunction(localPublish);
+    auto localReset=RED4ext::CGlobalFunction::Create("VRPreviewLocalReset","VRPreviewLocalReset",&VRPreviewLocalReset);
+    localReset->flags=flags;localReset->AddParam("Uint32","epoch");localReset->SetReturnType("Bool");rtti->RegisterFunction(localReset);
+    auto widgetEnabled=RED4ext::CGlobalFunction::Create("VRPreviewWidgetAliasEnabled","VRPreviewWidgetAliasEnabled",&VRPreviewWidgetAliasEnabled);
+    widgetEnabled->flags=flags;widgetEnabled->SetReturnType("Bool");rtti->RegisterFunction(widgetEnabled);
+    auto widgetAlias=RED4ext::CGlobalFunction::Create("VRPreviewObserveTypedImage","VRPreviewObserveTypedImage",&VRPreviewObserveTypedImage);
+    widgetAlias->flags=flags;widgetAlias->AddParam("handle:gameuiPuppetPreviewGameController","controller");
+    widgetAlias->AddParam("Uint32","epoch");widgetAlias->AddParam("handle:inkImageWidget","image");
+    widgetAlias->SetReturnType("Bool");rtti->RegisterFunction(widgetAlias);
+    auto localCamera=RED4ext::CGlobalFunction::Create("VRPreviewLocalCamera","VRPreviewLocalCamera",&VRPreviewLocalCamera);
+    localCamera->flags=flags;localCamera->AddParam("handle:gameuiPuppetPreviewGameController","controller");
+    localCamera->AddParam("Uint32","epoch");localCamera->AddParam("Int32","setup");
+    localCamera->SetReturnType("handle:entIPlacedComponent");rtti->RegisterFunction(localCamera);
+    auto gameGeneration=RED4ext::CGlobalFunction::Create("PublishVRGameFrameGeneration","PublishVRGameFrameGeneration",&PublishVRGameFrameGeneration);
+    gameGeneration->flags=flags;gameGeneration->AddParam("Int32","provider");gameGeneration->AddParam("Int32","multiplier");
+    gameGeneration->SetReturnType("Int32");rtti->RegisterFunction(gameGeneration);
     auto reflexTiming=RED4ext::CGlobalFunction::Create("VRReflexTiming","VRReflexTiming",&VRReflexTiming);
     reflexTiming->flags=flags;reflexTiming->AddParam("Bool","request");reflexTiming->SetReturnType("String");rtti->RegisterFunction(reflexTiming);
     auto mouseY=RED4ext::CGlobalFunction::Create("GetVRMouseYDisabled","GetVRMouseYDisabled",&GetVRMouseYDisabled);
@@ -23,6 +92,8 @@ RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterTypes() {
     auto wheelProfile=RED4ext::CGlobalFunction::Create("SetVRWheelGamepadProfile","SetVRWheelGamepadProfile",&SetVRWheelGamepadProfile);
     wheelProfile->flags=flags;wheelProfile->AddParam("Float","inner");wheelProfile->AddParam("Float","outer");
     wheelProfile->SetReturnType("Bool");rtti->RegisterFunction(wheelProfile);
+    auto gripRoute=RED4ext::CGlobalFunction::Create("SetVRRightGripRoute","SetVRRightGripRoute",&SetVRRightGripRoute);
+    gripRoute->flags=flags;gripRoute->AddParam("Int32","route");gripRoute->SetReturnType("Int32");rtti->RegisterFunction(gripRoute);
     auto uiCommand=RED4ext::CGlobalFunction::Create("VROverlayCommand","VROverlayCommand",&VROverlayCommand);
     uiCommand->flags=flags;uiCommand->SetReturnType("Int32");rtti->RegisterFunction(uiCommand);
     auto uiMenu=RED4ext::CGlobalFunction::Create("VROverlayMenu","VROverlayMenu",&VROverlayMenu);
@@ -34,6 +105,9 @@ RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterTypes() {
     fHudPanel->flags=flags; fHudPanel->AddParam("handle:inkWidget","root");
     fHudPanel->AddParam("Bool","lootVisible");
     fHudPanel->SetReturnType("Int32"); rtti->RegisterFunction(fHudPanel);
+
+    auto cetOverlay = RED4ext::CGlobalFunction::Create("SetVRCetOverlayVisible", "SetVRCetOverlayVisible", &SetVRCetOverlayVisible);
+    cetOverlay->flags = flags; cetOverlay->SetReturnType("Int32"); cetOverlay->AddParam("Int32", "visible"); rtti->RegisterFunction(cetOverlay);
 
     auto f1 = RED4ext::CGlobalFunction::Create("GetLeftVRHandValid", "GetLeftVRHandValid", &GetLeftVRHandValid);
     f1->flags = flags; f1->SetReturnType("Bool"); rtti->RegisterFunction(f1);
@@ -797,6 +871,32 @@ RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterTypes() {
     fMuzP->flags = flags;
     fMuzP->AddParam("Float", "x"); fMuzP->AddParam("Float", "y"); fMuzP->AddParam("Float", "z");
     rtti->RegisterFunction(fMuzP);
+    auto fSightOrigin = RED4ext::CGlobalFunction::Create(
+        "SetVRSightOrigin", "SetVRSightOrigin", &SetVRSightOrigin);
+    fSightOrigin->flags = flags;
+    fSightOrigin->AddParam("Float", "x");
+    fSightOrigin->AddParam("Float", "y");
+    fSightOrigin->AddParam("Float", "z");
+    fSightOrigin->AddParam("Int32", "valid");
+    rtti->RegisterFunction(fSightOrigin);
+    auto fBarrelRay = RED4ext::CGlobalFunction::Create(
+        "SetVRBarrelRayHit", "SetVRBarrelRayHit", &SetVRBarrelRayHit);
+    fBarrelRay->flags = flags;
+    fBarrelRay->AddParam("Float", "x");
+    fBarrelRay->AddParam("Float", "y");
+    fBarrelRay->AddParam("Float", "z");
+    fBarrelRay->AddParam("Int32", "valid");
+    fBarrelRay->AddParam("Int32", "mainVisible");
+    fBarrelRay->AddParam("Int32", "secondVisible");
+    rtti->RegisterFunction(fBarrelRay);
+    auto fNpcSurface = RED4ext::CGlobalFunction::Create(
+        "QueryVRNpcHitSurface", "QueryVRNpcHitSurface", &QueryVRNpcHitSurface);
+    fNpcSurface->flags = flags;
+    fNpcSurface->AddParam("handle:GameObject", "entity");
+    fNpcSurface->AddParam("Vector4", "from");
+    fNpcSurface->AddParam("Vector4", "to");
+    fNpcSurface->SetReturnType("Vector4");
+    rtti->RegisterFunction(fNpcSurface);
 
     auto fCarryL = RED4ext::CGlobalFunction::Create("SetVRCarryLeft", "SetVRCarryLeft", &SetVRCarryLeft);
     fCarryL->flags = flags; fCarryL->AddParam("Int32", "on"); rtti->RegisterFunction(fCarryL);
@@ -882,6 +982,11 @@ RED4EXT_C_EXPORT void RED4EXT_CALL PostRegisterTypes() {
     rtti->RegisterFunction(fWeaponRaise);
     auto fMeleeFire = RED4ext::CGlobalFunction::Create("SetVRMeleeFire", "SetVRMeleeFire", &SetVRMeleeFire);
     fMeleeFire->flags = flags; fMeleeFire->AddParam("Int32","fire"); rtti->RegisterFunction(fMeleeFire);
+    auto fLaserRangedWeaponState = RED4ext::CGlobalFunction::Create(
+        "SetVRLaserRangedWeaponState", "SetVRLaserRangedWeaponState", &SetVRLaserRangedWeaponState);
+    fLaserRangedWeaponState->flags = flags;
+    fLaserRangedWeaponState->AddParam("Int32", "ranged");
+    rtti->RegisterFunction(fLaserRangedWeaponState);
     auto fTrgMode = RED4ext::CGlobalFunction::Create("SetVRTriggerMode", "SetVRTriggerMode", &SetVRTriggerMode);
     fTrgMode->flags = flags; fTrgMode->AddParam("Int32","mode"); rtti->RegisterFunction(fTrgMode);
     auto fCamFreeze = RED4ext::CGlobalFunction::Create("SetVRCamBoneFreeze", "SetVRCamBoneFreeze", &SetVRCamBoneFreeze);
@@ -1061,4 +1166,5 @@ void CyberpunkVR_RegisterHandsNatives() {
     auto rtti = RED4ext::CRTTISystem::Get();
     rtti->AddRegisterCallback(RegisterTypes);
     rtti->AddPostRegisterCallback(PostRegisterTypes);
+    cvr::framegen::RegisterSourceFrameSystem();
 }
