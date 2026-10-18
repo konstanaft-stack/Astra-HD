@@ -1,5 +1,7 @@
 # Astra HD r29 + VR-центр Center04 — экспериментальный выпуск
 
+> **Блокирующий дефект r29 — новая игра (19.10.2026):** при создании нового персонажа на мониторе есть изображение, а в шлеме остаётся чёрный экран. Подтверждено в Test3 и VR Night City. Исправление ещё не входит в опубликованные ZIP; для начала новой игры текущий выпуск пока не подходит. Принятый ранее результат относится к редактору через зеркало.
+
 Два согласованных runtime-архива для Cyberpunk2077 2.31 на Windows x64:
 
 - [Astra-HD-r29-native-base-20261018-experimental.zip](https://github.com/konstanaft-stack/Astra-HD/releases/download/astra-hd-r29-experimental-20261018/Astra-HD-r29-native-base-20261018-experimental.zip)
