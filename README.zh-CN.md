@@ -1,18 +1,18 @@
 # Astra HD
 
-[![Русский](https://img.shields.io/badge/Русский-2563eb?style=for-the-badge)](README.ru.md)
-[![English](https://img.shields.io/badge/English-2563eb?style=for-the-badge)](README.md)
-[![中文](https://img.shields.io/badge/中文-2563eb?style=for-the-badge)](README.zh-CN.md)
+这是一套尚未完成的实验性组合，不是已经完成的稳定 VR 移植。Astra HD 将游戏画面送入头显，VR-CENTR 管理安装内容和配置档。之所以开发配置档，是因为反复测试 VR、模组和图形库后，曾留下混杂且无法工作的文件组合。它们用于重复测试并恢复选定状态，避免每次测试后手动删除多个游戏目录、通过 Steam 重新下载或重装。
 
 没有任何模式被宣布为已完成。功能、操作和架构可能根据测试改变或移除；这里不是承诺的路线图或完整功能清单。
-
-## VR-CENTR 与 Astra HD：配合安装和使用
 
 ### 开发目标
 
 我们希望让Cyberpunk 2077成为完整的VR体验：从空间菜单和角色编辑器，到舒适易读的HUD及与游戏世界的交互。基础是优质立体画面、稳定帧率，以及神经渲染与帧生成的协调工作。界面应适合头显和VR控制器。这是开发目标，不是已经完成的功能清单。
 
-这是一套尚未完成的实验性组合，不是已经完成的稳定 VR 移植。Astra HD 将游戏画面送入头显，VR-CENTR 管理安装内容和配置档。之所以开发配置档，是因为反复测试 VR、模组和图形库后，曾留下混杂且无法工作的文件组合。它们用于重复测试并恢复选定状态，避免每次测试后手动删除多个游戏目录、通过 Steam 重新下载或重装。
+[![Русский](https://img.shields.io/badge/Русский-2563eb?style=for-the-badge)](README.ru.md)
+[![English](https://img.shields.io/badge/English-2563eb?style=for-the-badge)](README.md)
+[![中文](https://img.shields.io/badge/中文-2563eb?style=for-the-badge)](README.zh-CN.md)
+
+## VR-CENTR 与 Astra HD：配合安装和使用
 
 **目前尚无可直接安装的组合压缩包。** [Astra HD Releases](https://github.com/konstanaft-stack/Astra-HD/releases) 是今后的下载位置。自动生成的 Source ZIP 只是源代码，不是安装程序；仅克隆源码不能恢复可用安装。
 
