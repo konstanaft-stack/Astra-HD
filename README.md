@@ -1,18 +1,18 @@
 # Astra HD
 
-[![Русский](https://img.shields.io/badge/Русский-2563eb?style=for-the-badge)](README.ru.md)
-[![English](https://img.shields.io/badge/English-2563eb?style=for-the-badge)](README.md)
-[![中文](https://img.shields.io/badge/中文-2563eb?style=for-the-badge)](README.zh-CN.md)
+This is an unfinished experimental combination, not a finished stable VR port. Astra HD sends the game to the headset; VR-CENTR manages installation contents and profiles. Profiles were created because repeated VR, mod and library tests left mixed, nonworking file combinations. They support repeatable tests and restoring a chosen state without manually deleting several game folders, downloading the game again through Steam or reinstalling after each test. 
 
 No mode is declared finished. Features, controls and architecture may change or disappear following testing; this is not a promised roadmap or complete feature list.
-
-## VR-CENTR + Astra HD: install and use together
 
 ### Development goal
 
 We want Cyberpunk 2077 to become a complete VR experience: from spatial menus and the character editor to a comfortable, readable HUD and interaction with the game world. The foundation is high-quality stereo, stable FPS and coherent neural rendering with frame generation. The interface should suit headsets and VR controllers. This is our development goal, not a list of finished features.
 
-This is an unfinished experimental combination, not a finished stable VR port. Astra HD sends the game to the headset; VR-CENTR manages installation contents and profiles. Profiles were created because repeated VR, mod and library tests left mixed, nonworking file combinations. They support repeatable tests and restoring a chosen state without manually deleting several game folders, downloading the game again through Steam or reinstalling after each test. 
+[![Русский](https://img.shields.io/badge/Русский-2563eb?style=for-the-badge)](README.ru.md)
+[![English](https://img.shields.io/badge/English-2563eb?style=for-the-badge)](README.md)
+[![中文](https://img.shields.io/badge/中文-2563eb?style=for-the-badge)](README.zh-CN.md)
+
+## VR-CENTR + Astra HD: install and use together
 
 **No ready combined installation archive is available yet.** [Astra HD Releases](https://github.com/konstanaft-stack/Astra-HD/releases) is the future download location. The automatic Source ZIP contains source code, not an installer; a checkout alone does not restore a working installation.
 
