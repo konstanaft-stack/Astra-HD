@@ -17,6 +17,8 @@ public:
         double frameMs,bool reset,uint64_t frameId,bool* interpolated=nullptr);
     ID3D12Resource* Output(unsigned eye) const;
     void ConsumerFence(ID3D12Fence*,uint64_t);
+    // Nonblocking, generator-owner-thread retirement; preserves SDK history.
+    void CollectCompletedInputs();
     bool Idle() const;
     // Nonblocking retirement: false means a previous GPU consumer still owns it.
     bool Reset();

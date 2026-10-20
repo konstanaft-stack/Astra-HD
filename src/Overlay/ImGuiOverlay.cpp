@@ -2,6 +2,8 @@
 #include "Overlay/ImGuiOverlay.hpp"
 #include "Overlay/DrawWork.hpp"
 #include "Overlay/LiveControlsUi.hpp"
+#include "Overlay/XrHotkeyPolicy.hpp"
+#include "Framegen/SrNativeApi.hpp"
 #include "Overlay/VrPanel.hpp"
 #include "Overlay/VrDraw.hpp"
 #include "Overlay/VrImGuiInput.hpp"
@@ -35,6 +37,57 @@ extern void SyncCetVirtualCursorFromPhysicalClient(LPARAM lParam);
 extern void UpdateCetVirtualCursorFromRawInput(LPARAM lParam);
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
+namespace {
+struct ProcessHotkeyOwners { bool framegen{}, optiMenu{}; };
+const ProcessHotkeyOwners& HotkeyOwners() {
+    static const ProcessHotkeyOwners owners = [] {
+        const auto exact = [](const char* name) {
+            char value[2]{};
+            return GetEnvironmentVariableA(name, value, sizeof(value)) == 1 &&
+                cvr::overlay_hotkeys::ExactOwner(std::string_view(value, 1));
+        };
+        return ProcessHotkeyOwners{exact("CPVR_XR_FG_HOTKEY_OWNER"), exact("CPVR_OPTISCALER_MENU_OWNER")};
+    }();
+    return owners;
+}
+std::atomic<unsigned> pendingFramegenToggle{};
+
+cvr::overlay_hotkeys::Context FramegenHotkeyContext(HWND window) {
+    cvr::overlay_hotkeys::Context state{};
+    state.fgOwner = HotkeyOwners().framegen;
+    state.optiMenuOwner = HotkeyOwners().optiMenu;
+    const HWND foreground = GetForegroundWindow();
+    state.windowFocused = window && foreground &&
+        (foreground == window || GetAncestor(foreground, GA_ROOT) == window);
+    state.xrRunning = OpenXRManager::Get().IsSessionRunning();
+    // The second check runs on Present, not the Win32 message-queue thread.
+    // Use only the current-down high bit, never Async's shared pressed bit.
+    state.modified = ((GetAsyncKeyState(VK_CONTROL) | GetAsyncKeyState(VK_MENU) | GetAsyncKeyState(VK_SHIFT) |
+        GetAsyncKeyState(VK_LWIN) | GetAsyncKeyState(VK_RWIN)) & 0x8000) != 0;
+    state.nativeFgStereo = cvr::framegen::NativeFgStereoRequested();
+    state.backend = static_cast<int>(cvr::framegen::GetSettings().backend);
+    return state;
+}
+
+void ApplyPendingFramegenHotkey(HWND window) {
+    if (!(pendingFramegenToggle.exchange(0, std::memory_order_acq_rel) & 1u)) return;
+    auto context = FramegenHotkeyContext(window);
+    if (cvr::overlay_hotkeys::Resolve(VK_F12, true, false, context) !=
+        cvr::overlay_hotkeys::Action::ToggleFramegen) return;
+    // Match the existing Present/UI writer, never apply the whole UI state on
+    // the Win32 callback thread. Re-read the current backend with the snapshot.
+    LiveControlsUiState state{};
+    GetLiveControlsUiState(&state);
+    context.backend = static_cast<int>(state.framegen.backend);
+    if (cvr::overlay_hotkeys::Resolve(VK_F12, true, false, context) !=
+        cvr::overlay_hotkeys::Action::ToggleFramegen) return;
+    state.framegen.enabled = !state.framegen.enabled;
+    SetLiveControlsUiState(&state, 1);
+    Log("[XR-HOTKEY] F12 requested enabled=%d backend=%d; process owner qualified, session running/game window focused\n",
+        state.framegen.enabled ? 1 : 0, static_cast<int>(state.framegen.backend));
+}
+}
 
 // located (HMD-injected) game-world camera quaternion, defined in vr_core.cpp. Declared at GLOBAL
 // scope (NOT inside the anonymous namespace below) so it keeps external linkage.
@@ -231,6 +284,7 @@ bool OverlayIsSwapchainBackbuffer(ID3D12Resource* resource) {
 }
 
 void ShutdownOverlay() {
+    pendingFramegenToggle.store(0, std::memory_order_release);
     {std::lock_guard pointerLock(g_desktopPointerMutex);g_pointerInput={};}
     ReleaseRenderTargets();
     if (g_secondEyeWorldDrawList) {
@@ -500,6 +554,8 @@ bool IsBlockedInputMessage(UINT msg) {
 }
 
 LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_KILLFOCUS || (msg == WM_ACTIVATEAPP && !wParam))
+        pendingFramegenToggle.store(0, std::memory_order_release);
     if(!g_menuVisible&&cvr::menu_preview::HandleSpatialEditorMouse(msg,uint64_t(wParam)))return 0;
     const float clientMouseX=float((short)LOWORD(lParam)),clientMouseY=float((short)HIWORD(lParam));
     static int totalMsgCount = 0;
@@ -557,8 +613,24 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
     }
 
-    // 2. Handle menu toggle
-    if ((msg == WM_KEYUP || msg == WM_SYSKEYUP) && (wParam == VK_F10 || wParam == VK_INSERT)) {
+    // Owners are immutable process capabilities supplied only by a qualified
+    // launch. Author Opti also polls keys; swallowing this message alone is not
+    // an ownership mechanism for its frame generator.
+    const bool release = msg == WM_KEYUP || msg == WM_SYSKEYUP;
+    cvr::overlay_hotkeys::Context hotkeyContext{};
+    hotkeyContext.optiMenuOwner = HotkeyOwners().optiMenu;
+    if (release && wParam == VK_F12 && HotkeyOwners().framegen)
+        hotkeyContext = FramegenHotkeyContext(hwnd);
+    const auto hotkey = cvr::overlay_hotkeys::Resolve(static_cast<std::uint32_t>(wParam),
+        release, msg == WM_SYSKEYUP, hotkeyContext);
+    if (hotkey == cvr::overlay_hotkeys::Action::ToggleFramegen) {
+        pendingFramegenToggle.fetch_xor(1u, std::memory_order_acq_rel);
+        return 0;
+    }
+
+    // 2. Handle menu toggle. Opti menu ownership removes only port Insert;
+    // F10 keeps its existing behavior, independently of native FG ownership.
+    if (hotkey == cvr::overlay_hotkeys::Action::TogglePortMenu) {
         cvr::vrui::Toggle();
         g_menuVisible = cvr::vrui::Visible();
         SetCetVirtualCursorVisible(g_cetOverlayVisible.load(std::memory_order_relaxed) && !g_menuVisible);
@@ -668,6 +740,7 @@ void OverlaySetWindow(HWND hwnd) {
 
 void OverlayRender(IDXGISwapChain* swapChain) {
     g_drawDataSubmitted = false;
+    ApplyPendingFramegenHotkey(g_hwnd);
     if (!EnsureImGui(swapChain)) return;
 
     DXGI_SWAP_CHAIN_DESC desc{};

@@ -2258,6 +2258,10 @@ DWORD OpenXRManager::FrameThreadMain() {
                 // FG can stop while the stereo world remains active. Selection
                 // then stops polling its leases, but completed consumers must
                 // still be retired without resetting the current eye history.
+                // Current guide acquisition can also fail while completed
+                // builtin work still holds its input slots. Retire before
+                // selecting inputs, so the next producer attempt can progress.
+                m_framegen.CollectCompletedInputs();
                 m_gameFgPresenter.Collect();
                 cvr::framegen::AerRealSelection aerSelection;
                 std::optional<cvr::ppd::PpdSourceObservation> ppdObservation;

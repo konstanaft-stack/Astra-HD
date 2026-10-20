@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "C4SourceCommit": "ff3c7f2618bbd4f6754a633998f33ce838b61272",
+  "C4SourceCommit": "4980efc5c1c3d76aac16328e7b41905b8d872613",
   "nativeBackendSourceCommit": "1be5da1a6e138a3e4470ad0be5cf5381741afa49",
   "backendDLL": "CB3377753E478BDDF6208197166552FA27CD8AFA44602D06AA764032B4354F9E",
   "workerSource": "Five sources and25 headers verified against accepted full22 source-before",
@@ -58,7 +58,7 @@
     }
   ],
   "sourceBoundary": "Native own source and attribution only; proprietary NGX headers require a separately obtained applicable NVIDIA SDK/license. No vendor runtime or headers imported under MIT.",
-  "previousC4SourceCommit": "bbfa2ec325426bf26deec251a0f6c1e52b6d6679",
+  "previousC4SourceCommit": "ff3c7f2618bbd4f6754a633998f33ce838b61272",
   "rendererRootOverlay": [
     {
       "path": "src/MenuPreview/UiConsumer.cpp",
@@ -91,5 +91,13 @@
     "rendererSHA256": "FDC3A66ED3FD6991108AAE9CE64FBD0E99BB72C85CAA3FB71ADDD7CA6A321376",
     "linkReceiptSHA256": "39B967102C0CE6F51B1F2CF7374253C04E35BF27E943B37A38038EF04235B3A1",
     "boundary": "Renderer/root overlay build provenance only. Backend snapshot1be5/CB33 and external header exclusions remain unchanged."
+  },
+  "rendererR32": {
+    "version": "R32",
+    "sourceCommit": "4980efc5c1c3d76aac16328e7b41905b8d872613",
+    "rendererSHA256": "935FE5B80D63EA58E006BB729C9654FECD9B2F225BAA30DB3A65C89A13E5E945",
+    "sourceBuildReceiptSHA256": "19D0006EFCF4E7A0870A968108ED34F1D759A749F6C08BBA451452E445D2554E",
+    "previousPublicVersion": "astra-hd-editor-spatial-20261016-r30",
+    "localSourceParent": "astra-hd-editor-spatial-20261016-r31"
   }
 }

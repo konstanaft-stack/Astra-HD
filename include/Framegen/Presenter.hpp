@@ -47,6 +47,7 @@ public:
     // Programmatic owner connection; no dormant backend is added to the UI.
     // Returns false while the author's generator still has GPU consumers.
     bool SetNativeBridge(std::shared_ptr<NativeGenerationBridge>);
+    void CollectCompletedInputs() {generator.CollectCompletedInputs();}
     void Reset(const char* reason="presenter");
     bool Pending() const {return cadence.Pending()!=0;}
 private:

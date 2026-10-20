@@ -1,4 +1,5 @@
 #include "Framegen/Generator.hpp"
+#include "Framegen/CompletedInputWork.hpp"
 #include "Framegen/FfxColorRead.hpp"
 #include <FidelityFX/host/backends/dx12/ffx_dx12.h>
 #include <FidelityFX/host/ffx_frameinterpolation.h>
@@ -338,10 +339,11 @@ struct Generator::Impl {
         ID3D12CommandList* lists[]={list};queue->ExecuteCommandLists(1,lists);w.fence=++value;
         return SUCCEEDED(queue->Signal(fence.Get(),value));
     }
+    void CollectCompletedInputs() {
+        if(fence)RetireCompletedInputWork(work,fence->GetCompletedValue());
+    }
     bool Generate(ID3D12Resource* colors[2],const std::shared_ptr<const Inputs> (&inputs)[2],double frameMs,bool reset,uint64_t frameId) {
-        for(auto& old:work)if(old.fence && fence->GetCompletedValue()>=old.fence) {
-            old.inputs[0].reset();old.inputs[1].reset();
-        }
+        CollectCompletedInputs();
         auto& w=work[cursor];if(w.fence && fence->GetCompletedValue()<w.fence) {OnSkip();return false;}
         const bool timed=TimingReady();
         if(timed && w.timing) {
@@ -416,6 +418,7 @@ Generator::~Generator() {
     if(impl && !impl->Idle()) {Log("[framegen] retaining in-flight resources through shutdown\n");impl.release();}
 }
 bool Generator::Idle() const {return !impl || impl->Idle();}
+void Generator::CollectCompletedInputs() {if(impl)impl->CollectCompletedInputs();}
 bool Generator::Reset() {if(!Idle())return false;impl.reset();return true;}
 uint64_t Generator::Bytes() const {uint64_t result=0;if(impl)for(const auto& eye:impl->eyes)if(eye)result+=eye->Bytes();return result;}
 ID3D12Resource* Generator::Output(unsigned eye) const {return impl && eye<2 && impl->eyes[eye] ? impl->eyes[eye]->output.resource.Get() : nullptr;}
